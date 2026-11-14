@@ -44,37 +44,55 @@ sed -i "s/^SUBLEVEL = .*/SUBLEVEL = $TARGET_SUBLEVEL/" "$SRC/Makefile"
 sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"$TARGET_LOCALVERSION\"|" "$SRC/.config"
 sed -i "s|^CONFIG_LOCALVERSION_AUTO=.*|# CONFIG_LOCALVERSION_AUTO is not set|" "$SRC/.config"
 
-# 设备 config 里 CONFIG_UNUSED_KSYMS_WHITELIST="abi_symbollist.raw"，
-# 这个文件由 kleaf 在 GKI 正式构建时生成，AOSP 源码树里没有。
-# 本轮只测 ABI，先关掉裁剪，导出全量符号（对 ABI 测量无影响，对厂商 .ko 是超集）。
-NO_SYMBOL_LIST=0
-if [ ! -e "$SRC/abi_symbollist.raw" ]; then
-    echo "    abi_symbollist.raw 不存在，关闭 TRIM_UNUSED_KSYMS"
-    NO_SYMBOL_LIST=1
-    sed -i "s|^CONFIG_TRIM_UNUSED_KSYMS=y|# CONFIG_TRIM_UNUSED_KSYMS is not set|" "$SRC/.config"
-    sed -i "s|^CONFIG_UNUSED_KSYMS_WHITELIST=.*|CONFIG_UNUSED_KSYMS_WHITELIST=\"\"|" "$SRC/.config"
-fi
+# 设备 config 里有两个指向 kleaf 生成物的条目，AOSP 源码树里没有：
+#   CONFIG_UNUSED_KSYMS_WHITELIST="abi_symbollist.raw"
+#   CONFIG_MODULE_SIG_PROTECT_LIST="protected_module_names_list"
+# 不处理就会在 modpost 阶段报 "No rule to make target X, needed by vmlinux.symvers"。
+# 本轮只测 ABI：关掉 KSYMS 裁剪（导出全量，对厂商 .ko 是超集）、关掉受保护模块名单。
+# 两个文件（.config 与 auto.conf）都要改：make 读 auto.conf，olddefconfig 读 .config。
+drop_kleaf_file_dep() {
+    local f="$1"
+    [ -e "$f" ] || return 0
+    if [ ! -e "$SRC/abi_symbollist.raw" ]; then
+        sed -i "s|^CONFIG_TRIM_UNUSED_KSYMS=.*|# CONFIG_TRIM_UNUSED_KSYMS is not set|" "$f"
+        sed -i "s|^CONFIG_UNUSED_KSYMS_WHITELIST=.*|CONFIG_UNUSED_KSYMS_WHITELIST=\"\"|" "$f"
+    fi
+    if [ ! -e "$SRC/protected_module_names_list" ]; then
+        sed -i "s|^CONFIG_MODULE_SIG_PROTECT=.*|# CONFIG_MODULE_SIG_PROTECT is not set|" "$f"
+        sed -i "s|^CONFIG_MODULE_SIG_PROTECT_LIST=.*|CONFIG_MODULE_SIG_PROTECT_LIST=\"\"|" "$f"
+    fi
+}
+
+echo "    处理 kleaf 专属文件依赖"
+drop_kleaf_file_dep "$SRC/.config"
+
+# 顺手把 config 里所有「指向源码树内某个不存在文件」的字符串项列出来。
+# 这类条目都是 kleaf 构建时才有的生成物，缺一个就可能在编译末尾报
+# "No rule to make target"，早暴露总比等半小时好。
+echo "    扫描 config 指向的外部文件"
+{ grep -oE '^CONFIG_[A-Z0-9_]+="[^"/]*"' "$SRC/.config" || true; } | while IFS='=' read -r k v; do
+    f=$(printf '%s' "$v" | tr -d '"')
+    case "$k" in CONFIG_LOCALVERSION) continue;; esac
+    [ -z "$f" ] && continue
+    [ -e "$SRC/$f" ] || echo "    ?? $k -> $f 不存在"
+done
 
 make -C "$SRC" ARCH=arm64 LLVM="$LLVM_SUFFIX" olddefconfig
 
-# olddefconfig 不一定刷新 auto.conf，而 setlocalversion 只看 auto.conf。
+# olddefconfig 不一定刷新 auto.conf，而 setlocalversion 与 modpost 认的都是 auto.conf。
 # 注意 auto.conf 是 make 语法，字符串值不带引号（.config 才带）。
 if [ -e "$SRC/include/config/auto.conf" ]; then
     sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=$TARGET_LOCALVERSION|" \
         "$SRC/include/config/auto.conf"
     sed -i "s|^CONFIG_LOCALVERSION_AUTO=.*|# CONFIG_LOCALVERSION_AUTO is not set|" \
         "$SRC/include/config/auto.conf"
-    if [ "$NO_SYMBOL_LIST" = 1 ]; then
-        sed -i "s|^CONFIG_TRIM_UNUSED_KSYMS=.*|# CONFIG_TRIM_UNUSED_KSYMS is not set|" \
-            "$SRC/include/config/auto.conf"
-        sed -i "s|^CONFIG_UNUSED_KSYMS_WHITELIST=.*|CONFIG_UNUSED_KSYMS_WHITELIST=\"\"|" \
-            "$SRC/include/config/auto.conf"
-    fi
+    drop_kleaf_file_dep "$SRC/include/config/auto.conf"
 fi
 rm -f "$SRC/include/config/kernel.release" "$SRC/include/generated/utsrelease.h"
 
 echo "    auto.conf: $(grep -c . "$SRC/include/config/auto.conf" 2>/dev/null || echo 0) 行"
-grep -E '^CONFIG_LOCALVERSION=' "$SRC/include/config/auto.conf" 2>/dev/null || true
+grep -E '^CONFIG_(LOCALVERSION|TRIM_UNUSED_KSYMS|MODULE_SIG_PROTECT)' \
+    "$SRC/include/config/auto.conf" 2>/dev/null || true
 
 ACTUAL_RELEASE=$(make -s -C "$SRC" ARCH=arm64 LLVM="$LLVM_SUFFIX" kernelrelease)
 echo "    kernelrelease = $ACTUAL_RELEASE"
