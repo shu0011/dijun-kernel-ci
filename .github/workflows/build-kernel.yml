@@ -19,22 +19,33 @@ jobs:
 
       - name: 安装构建依赖
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
             build-essential bc bison flex libelf-dev libssl-dev libdwarf-dev \
             dwarves cpio kmod lz4 xz-utils python3 \
             clang-18 lld-18 llvm-18
+          # Debian 系有些版本把 dwarf.h 放在 libdwarf/ 子目录，内核却按 <dwarf.h> 引用
+          if [ ! -e /usr/include/dwarf.h ] && [ -e /usr/include/libdwarf/dwarf.h ]; then
+            sudo ln -s /usr/include/libdwarf/dwarf.h /usr/include/dwarf.h
+          fi
+          ls -la /usr/include/dwarf.h /usr/include/openssl/opensslv.h
+          clang-18 --version | head -1
 
       - name: 拉取 android17-6.18 源码
-        run: bash ci/fetch-kernel.sh 2>&1 | tee kernel-fetch.log
+        run: |
+          set -o pipefail
+          bash ci/fetch-kernel.sh 2>&1 | tee kernel-fetch.log
 
       - name: 编译 Image 并抽取 BTF
         run: |
+          set -o pipefail
           mkdir -p out
           bash ci/build.sh 2>&1 | tee out/build.log
 
       - name: 与设备 BTF 对比 ABI
         run: |
+          set -o pipefail
           python3 tools/btf_compare.py \
             --kernel out/vmlinux.btf \
             --device config/vmlinux_os4.0.4.btf \
