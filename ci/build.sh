@@ -32,23 +32,23 @@ cp "$CFG" "$SRC/arch/arm64/configs/dijun_defconfig"
 make -C "$SRC" ARCH=arm64 LLVM="$LLVM_SUFFIX" dijun_defconfig
 
 echo "==> 2 对齐版本字符串 -> $TARGET_RELEASE"
-# SUBLEVEL 来自顶 Makefile；LOCALVERSION 从 config 覆盖
+# SUBLEVEL 来自顶 Makefile；LOCALVERSION 直接改 .config。
+# 不能用 scripts/config：值以 '-' 开头会被 getopt 当成选项吃掉。
 sed -i "s/^SUBLEVEL = .*/SUBLEVEL = $TARGET_SUBLEVEL/" "$SRC/Makefile"
-"$SRC/scripts/config" --file "$SRC/.config" \
-    --set-str LOCALVERSION "$TARGET_LOCALVERSION" \
-    --disable LOCALVERSION_AUTO
+sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"$TARGET_LOCALVERSION\"|" "$SRC/.config"
+sed -i "s|^CONFIG_LOCALVERSION_AUTO=.*|# CONFIG_LOCALVERSION_AUTO is not set|" "$SRC/.config"
 
 # 设备 config 里 CONFIG_UNUSED_KSYMS_WHITELIST="abi_symbollist.raw"，
 # 这个文件由 kleaf 在 GKI 正式构建时生成，AOSP 源码树里没有。
 # 本轮只测 ABI，先关掉裁剪，导出全量符号（对 ABI 测量无影响，对厂商 .ko 是超集）。
 if [ ! -e "$SRC/abi_symbollist.raw" ]; then
     echo "    abi_symbollist.raw 不存在，关闭 TRIM_UNUSED_KSYMS"
-    "$SRC/scripts/config" --file "$SRC/.config" \
-        --disable TRIM_UNUSED_KSYMS \
-        --set-str UNUSED_KSYMS_WHITELIST ""
+    sed -i "s|^CONFIG_TRIM_UNUSED_KSYMS=y|# CONFIG_TRIM_UNUSED_KSYMS is not set|" "$SRC/.config"
+    sed -i "s|^CONFIG_UNUSED_KSYMS_WHITELIST=.*|CONFIG_UNUSED_KSYMS_WHITELIST=\"\"|" "$SRC/.config"
 fi
 
 make -C "$SRC" ARCH=arm64 LLVM="$LLVM_SUFFIX" olddefconfig
+grep -E '^CONFIG_LOCALVERSION=|^CONFIG_LOCALVERSION_AUTO=|^CONFIG_TRIM_UNUSED_KSYMS=' "$SRC/.config" || true
 
 ACTUAL_RELEASE=$(make -s -C "$SRC" ARCH=arm64 LLVM="$LLVM_SUFFIX" kernelrelease)
 echo "    kernelrelease = $ACTUAL_RELEASE"
