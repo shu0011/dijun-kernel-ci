@@ -39,13 +39,23 @@ jobs:
       - name: 准备 AOSP clang r584948c
         run: |
           set -euo pipefail
-          url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r584948c.tar.gz"
-          if mkdir -p /opt/aosp-clang && curl -fsSL --retry 2 --max-time 900 "$url" \
-               | tar -xz -C /opt/aosp-clang; then
+          base="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive"
+          got=0
+          # googlesource 的 archive 端点要求 ref 里的 / 转义；两种写法都试一遍
+          for ref in "refs%2Fheads%2Fmain" "main" "refs/heads/main"; do
+            url="$base/$ref/clang-r584948c.tar.gz"
+            echo "尝试 $url"
+            rm -rf /opt/aosp-clang && mkdir -p /opt/aosp-clang
+            if curl -fsSL --retry 1 --max-time 900 "$url" | tar -xz -C /opt/aosp-clang 2>/dev/null \
+               && [ -x /opt/aosp-clang/bin/clang ]; then
+              got=1; break
+            fi
+          done
+          if [ "$got" = 1 ]; then
             echo "/opt/aosp-clang/bin" >> "$GITHUB_PATH"
             /opt/aosp-clang/bin/clang --version | head -1
           else
-            echo "::warning::AOSP clang 下载失败，回落到系统 clang-18（POR_EL0 相关差异会保留）"
+            echo "::warning::AOSP clang 获取失败，回落到系统 clang-18（POR_EL0 相关差异会保留）"
           fi
 
       - name: 拉取 android17-6.18 源码

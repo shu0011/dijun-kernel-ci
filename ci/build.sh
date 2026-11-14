@@ -203,8 +203,14 @@ echo "    构建者信息与时间戳已对齐官方"
     sha256sum "$OUT/Image" | awk '{print "image_sha256="$1}'
     stat -c 'image_bytes=%s' "$OUT/Image"
     stat -c 'btf_bytes=%s' "$OUT/vmlinux.btf"
-    SYMVERS=$(ls "$OUT"/Module.symvers "$OUT"/vmlinux.symvers 2>/dev/null | head -1)
+    SYMVERS=""
+    for f in "$OUT/Module.symvers" "$OUT/vmlinux.symvers"; do
+        if [ -f "$f" ]; then SYMVERS="$f"; break; fi
+    done
     if [ -n "$SYMVERS" ]; then
         echo "exported_symbols=$(awk 'NF>=4' "$SYMVERS" | wc -l)"
+    else
+        # 两个都没有时不报错：pipefail 下 `ls 不存在的文件` 会让整块以 2 退出
+        echo "exported_symbols=unavailable"
     fi
 } | tee "$OUT/summary.txt"
