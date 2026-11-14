@@ -145,7 +145,10 @@ fi
 echo "    用 $OBJCOPY_BIN 抽 .BTF"
 "$OBJCOPY_BIN" --dump-section .BTF="$OUT/vmlinux.btf" "$SRC/vmlinux"
 cp "$SRC/System.map" "$OUT/System.map"
-cp "$SRC/Module.symvers" "$OUT/Module.symvers"
+# make Image 只产出 vmlinux.symvers，Module.symvers 要 make modules 才有
+for f in Module.symvers vmlinux.symvers; do
+    if [ -f "$SRC/$f" ]; then cp "$SRC/$f" "$OUT/$f"; fi
+done
 cp "$SRC/.config" "$OUT/config.built"
 
 # 从 Image 里回读真实版本串（内核 Image 未压缩，字符串是明文）
@@ -164,5 +167,8 @@ fi
     sha256sum "$OUT/Image" | awk '{print "image_sha256="$1}'
     stat -c 'image_bytes=%s' "$OUT/Image"
     stat -c 'btf_bytes=%s' "$OUT/vmlinux.btf"
-    echo "exported_symbols=$(awk 'NF>=4' "$OUT/Module.symvers" | wc -l)"
+    SYMVERS=$(ls "$OUT"/Module.symvers "$OUT"/vmlinux.symvers 2>/dev/null | head -1)
+    if [ -n "$SYMVERS" ]; then
+        echo "exported_symbols=$(awk 'NF>=4' "$SYMVERS" | wc -l)"
+    fi
 } | tee "$OUT/summary.txt"
