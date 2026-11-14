@@ -1,0 +1,54 @@
+name: build-dijun-kernel
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: build-dijun-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential bc bison flex libelf-dev libssl-dev libdwarf-dev \
+            dwarves cpio kmod lz4 xz-utils python3 \
+            clang-18 lld-18 llvm-18
+
+      - name: 拉取 android17-6.18 源码
+        run: bash ci/fetch-kernel.sh 2>&1 | tee kernel-fetch.log
+
+      - name: 编译 Image 并抽取 BTF
+        run: |
+          mkdir -p out
+          bash ci/build.sh 2>&1 | tee out/build.log
+
+      - name: 与设备 BTF 对比 ABI
+        run: |
+          python3 tools/btf_compare.py \
+            --kernel out/vmlinux.btf \
+            --device config/vmlinux_os4.0.4.btf \
+            --json out/btf-report.json | tee -a out/build.log
+
+      - name: 摘要
+        if: always()
+        run: python3 tools/summary.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dijun-kernel-${{ github.run_number }}
+          path: |
+            out/
+            kernel-fetch.log
+          retention-days: 14
