@@ -131,7 +131,19 @@ make -C "$SRC" ARCH=arm64 LLVM="$LLVM_SUFFIX" -j"$JOBS" Image
 
 echo "==> 5 抽取 .BTF 与产物"
 cp "$SRC/arch/arm64/boot/Image" "$OUT/Image"
-objcopy --dump-section .BTF="$OUT/vmlinux.btf" "$SRC/vmlinux"
+
+# vmlinux 是 aarch64 ELF，宿主的 x86 objcopy 认不出来
+# （objcopy: Unable to recognise the format of the input file）。用 llvm-objcopy。
+OBJCOPY_BIN=""
+for c in llvm-objcopy llvm-objcopy-18 llvm-objcopy-19 aarch64-linux-gnu-objcopy; do
+    if command -v "$c" >/dev/null 2>&1; then OBJCOPY_BIN="$c"; break; fi
+done
+if [ -z "$OBJCOPY_BIN" ]; then
+    echo "!! 找不到能处理 arm64 ELF 的 objcopy（需要 llvm-objcopy 或 aarch64-linux-gnu-objcopy）"
+    exit 1
+fi
+echo "    用 $OBJCOPY_BIN 抽 .BTF"
+"$OBJCOPY_BIN" --dump-section .BTF="$OUT/vmlinux.btf" "$SRC/vmlinux"
 cp "$SRC/System.map" "$OUT/System.map"
 cp "$SRC/Module.symvers" "$OUT/Module.symvers"
 cp "$SRC/.config" "$OUT/config.built"
