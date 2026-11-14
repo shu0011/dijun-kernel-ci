@@ -43,6 +43,24 @@ jobs:
           mkdir -p out
           bash ci/build.sh 2>&1 | tee out/build.log
 
+      - name: 失败诊断
+        if: failure()
+        run: |
+          echo "=== 工具版本 ==="
+          pahole --version || true
+          clang --version | head -2 || true
+          ld.lld --version | head -1 || true
+          echo "=== kernel/scripts/Makefile.btf 实际 flags ==="
+          grep -nE 'pahole-flags-y|btf_features|PAHOLE_FLAGS' kernel/scripts/Makefile.btf || true
+          echo "=== vmlinux 段表（找 .BTF）==="
+          if [ -f kernel/vmlinux ]; then
+            readelf -S kernel/vmlinux 2>/dev/null | grep -iE "btf|debug_info" || echo "(无 .BTF / .debug_info)"
+          else
+            echo "(kernel/vmlinux 不存在)"
+          fi
+          echo "=== 编译日志尾部 60 行 ==="
+          tail -60 out/build.log || true
+
       - name: 与设备 BTF 对比 ABI
         run: |
           set -o pipefail
