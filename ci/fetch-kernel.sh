@@ -1,59 +1,44 @@
 #!/usr/bin/env bash
-# 取得用于编译的内核源码。
+# 取得内核源码：AOSP kernel/common 的 6.18.32 快照分支。
 #
-# 事实（已实测，不是推测）：
-#   - 公开仓库 android17-6.18 的历史覆盖 2025-12-19 .. 2026-11-13（9727 个提交）
-#   - 其中包含 5a4f1906f（6.18.21, 2026-11-06）
-#   - 但不包含设备那个 284297031c53
-# 结论：小米在 AOSP 6.18.21 之上加了自己的提交，SUBLEVEL 仍是 21、hash 变了，
-# 所以公开仓库里不会有那个提交。用 5a4f1906f 作基线，差异由 BTF 比对量化。
+# 为什么用这一条：
+#   - android17-6.18（主分支）已经漂到 6.18.33 并会继续往前走，不可复现
+#   - android17-6.18-2026-09 是冻结快照，实测 SUBLEVEL = 32，正合需要
+#   - 现有的 kernelsu.ko / susfs LKM 都是 6.18.32 KMI 编的，基线一致便于对照
+#
+# 设备实际是 6.18.21（小米在其上又加了提交）。6.18 分支内 KMI 稳定，
+# 所以"6.18.32 的内核 vs 6.18.21 的设备"差多少，由 BTF 比对给出量化结论。
 set -euo pipefail
 
-BRANCH="${BRANCH:-android17-6.18}"
-BASE_COMMIT="${BASE_COMMIT:-5a4f1906ff98323c5a56a9290e43a6a1d295d699}"
-EXPECT_SUBLEVEL="${EXPECT_SUBLEVEL:-21}"
+BRANCH="${BRANCH:-android17-6.18-2026-09}"
+EXPECT_SUBLEVEL="${EXPECT_SUBLEVEL:-32}"
 DEST="${DEST:-kernel}"
-# 默认走 GitHub 镜像；它同步了 kernel/common 全部分支，但注意：曾出现过某个分支
-# 是旧快照（SUBLEVEL=0）的情况，所以下面有版本校验兜底。失败则退回 googlesource。
-# 主源用 googlesource（权威且稳定）；GitHub 镜像曾出现某分支是旧快照的情况，只作备份。
 PRIMARY="${PRIMARY:-https://android.googlesource.com/kernel/common}"
 FALLBACK="${FALLBACK:-https://github.com/aosp-mirror/kernel_common.git}"
 
 rm -rf "$DEST"
 
 clone() {
-    echo "==> clone $1 ($BRANCH, depth=2500)"
-    git clone --depth=2500 --branch "$BRANCH" "$1" "$DEST" 2>&1 | tail -2
+    echo "==> clone $1 ($BRANCH)"
+    git clone --depth=1 --branch "$BRANCH" "$1" "$DEST"
 }
 
 if ! clone "$PRIMARY"; then
-    echo "==> 主源失败，改用镜像 $FALLBACK"
+    echo "==> 主源失败，改用镜像"
     rm -rf "$DEST"
     clone "$FALLBACK"
 fi
 
 cd "$DEST"
 
-if ! git cat-file -e "${BASE_COMMIT}^{commit}" 2>/dev/null; then
-    echo "==> depth=2500 内没有基线提交，继续加深"
-    git fetch --deepen=2500 origin "$BRANCH" >/dev/null 2>&1 || true
-fi
-
-if ! git cat-file -e "${BASE_COMMIT}^{commit}" 2>/dev/null; then
-    echo "!! 取不到基线提交 $BASE_COMMIT —— 浅克隆没覆盖到，终止（不要用别的版本硬编）"
-    exit 1
-fi
-
-git checkout -q "$BASE_COMMIT"
-echo "==> 已切到基线提交 $(git rev-parse --short HEAD)  $(git log -1 --format='%ad %s' --date=short)"
-
 PATCHLEVEL=$(awk -F'= *' '/^PATCHLEVEL/{print $2}' Makefile)
 SUBLEVEL=$(awk -F'= *' '/^SUBLEVEL/{print $2}' Makefile)
-echo "==> 源码版本 6.$PATCHLEVEL.$SUBLEVEL"
+COMMIT=$(git rev-parse --short HEAD)
+echo "==> 源码 $COMMIT  版本 6.$PATCHLEVEL.$SUBLEVEL  $(git log -1 --format='%ad' --date=short)"
+
 if [ "$PATCHLEVEL" != "18" ] || [ "$SUBLEVEL" != "$EXPECT_SUBLEVEL" ]; then
-    echo "!! 期望 6.18.$EXPECT_SUBLEVEL，实际 6.$PATCHLEVEL.$SUBLEVEL —— 终止"
+    echo "!! 期望 6.18.$EXPECT_SUBLEVEL，实际 6.$PATCHLEVEL.$SUBLEVEL —— 分支不对，终止"
     exit 1
 fi
 
-echo "==> 说明：设备构建提交 284297031c53 属于小米私有分支，公开仓库不可得；"
-echo "==>      本构建基于 AOSP 6.18.21，厂商差异由 btf_compare 给出量化结果。"
+echo "==> OK"

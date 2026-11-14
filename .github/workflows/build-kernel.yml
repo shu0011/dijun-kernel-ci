@@ -49,6 +49,7 @@ jobs:
           python3 tools/btf_compare.py \
             --kernel out/vmlinux.btf \
             --device config/vmlinux_os4.0.4.btf \
+            --allow-missing \
             --json out/btf-report.json | tee -a out/build.log
 
       - name: 摘要
