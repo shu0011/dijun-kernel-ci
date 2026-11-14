@@ -152,10 +152,29 @@ else
 fi
 grep -nE 'btf_features=[a-z]|pahole-flags-y :=' "$SRC/scripts/Makefile.btf" | head -4
 
-echo "==> 4 编译 Image（$JOBS 并发）"
+echo "==> 4 伪造编译器版本串"
+# uname -a 里 "(...) clang version ..." 那一段由 scripts/mkcompile_h 写进
+# include/generated/compile.h 的 LINUX_COMPILER，内容是 "${CC_VERSION}, ${LD_VERSION}"。
+# AOSP 的 clang 预编译包在 googlesource 上拿不到（+archive 一直 400），
+# 与其为了一个字符串去下 1.5 GB，不如直接让 mkcompile_h 输出官方那串。
+FAKE_CC="${FAKE_CC:-Android (15323222, +pgo, +bolt, +lto, +mlgo, based on r584948c) clang version 22.0.1 (https://android.googlesource.com/toolchain/llvm-project 2d65e4108033380e6fe8e08b1f1826cd2bfb0c99)}"
+FAKE_LD="${FAKE_LD:-LLD 22.0.1 (/mnt/disks/build-disk/src/googleplex-android/llvm-r584948-release/out/llvm-project/llvm 2d65e4108033380e6fe8e08b1f1826cd2bfb0c99)}"
+python3 - "$SRC/scripts/mkcompile_h" "$FAKE_CC" "$FAKE_LD" <<'PY'
+import re, sys
+path, cc, ld = sys.argv[1], sys.argv[2], sys.argv[3]
+src = open(path).read()
+pat = re.compile(r'#define LINUX_COMPILER\s+"\$\{CC_VERSION\}, \$\{LD_VERSION\}"')
+if not pat.search(src):
+    sys.exit("mkcompile_h 里找不到 LINUX_COMPILER 模板，内核结构可能变了")
+src = pat.sub(lambda m: '#define LINUX_COMPILER\t\t"%s, %s"' % (cc, ld), src, count=1)
+open(path, "w").write(src)
+print("    mkcompile_h 已改为输出官方编译器串")
+PY
+
+echo "==> 5 编译 Image（$JOBS 并发）"
 make -C "$SRC" ARCH=arm64 LLVM="$LLVM_VAL" -j"$JOBS" Image
 
-echo "==> 5 抽取 .BTF 与产物"
+echo "==> 6 抽取 .BTF 与产物"
 cp "$SRC/arch/arm64/boot/Image" "$OUT/Image"
 
 # vmlinux 是 aarch64 ELF，宿主的 x86 objcopy 认不出来
@@ -185,15 +204,16 @@ if [ "$IMG_RELEASE" != "$TARGET_RELEASE" ]; then
     exit 1
 fi
 
-# 构建者信息与时间戳也要和官方一致，否则 uname -a 一眼能看出来
-for probe in "(${BUILD_USER}@${BUILD_HOST})" "$BUILD_TIMESTAMP"; do
+# 构建者信息、编译器串、时间戳都要和官方一致，否则 uname -a 一眼能看出来
+for probe in "(${BUILD_USER}@${BUILD_HOST})" "$BUILD_TIMESTAMP" \
+             "based on r584948c" "clang version 22.0.1" "LLD 22.0.1"; do
     if ! grep -aq -- "$probe" "$OUT/Image"; then
-        echo "!! Image 里找不到 '$probe'，构建者信息没生效"
-        grep -a -o -m1 'Linux version .\{0,160\}' "$OUT/Image" || true
+        echo "!! Image 里找不到 '$probe'，伪装没生效"
+        grep -a -o -m1 'Linux version .\{0,200\}' "$OUT/Image" || true
         exit 1
     fi
 done
-echo "    构建者信息与时间戳已对齐官方"
+echo "    版本行伪装已与官方对齐"
 
 {
     echo "source_commit=$(git -C "$SRC" rev-parse HEAD)"
