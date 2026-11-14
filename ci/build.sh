@@ -10,6 +10,11 @@
 #   6.18.21-android17-5-g284297031c53-abogki553682993-4k，
 #   新 Image 的 uname -r 只要差一个字符，那批模块全部拒载。
 #   SUBLEVEL 只进字符串不进 ABI，所以在同一 KMI 分支内改写它是安全的。
+#
+# 版本串由 scripts/setlocalversion 拼出来，它读的是
+#   ${KERNELVERSION} + ${file_localversion} + ${config_localversion} + ${LOCALVERSION} + ${scm_version}
+# 其中 config_localversion 取自 include/config/auto.conf（不是 .config！），
+# LOCALVERSION 未设置时会追加 -g<sha>-dirty。两头都要管住。
 set -euo pipefail
 
 SRC="${SRC:-kernel}"
@@ -26,14 +31,15 @@ TARGET_LOCALVERSION="${TARGET_LOCALVERSION:--android17-5-g284297031c53-abogki553
 mkdir -p "$OUT"
 export KBUILD_BUILD_USER=ci
 export KBUILD_BUILD_HOST=github-actions
+# 显式设为空串（"已设置"状态），setlocalversion 才不会追加 -g<sha>-dirty
+export LOCALVERSION=""
 
 echo "==> 1 用设备 config 生成 .config"
 cp "$CFG" "$SRC/arch/arm64/configs/dijun_defconfig"
 make -C "$SRC" ARCH=arm64 LLVM="$LLVM_SUFFIX" dijun_defconfig
 
 echo "==> 2 对齐版本字符串 -> $TARGET_RELEASE"
-# SUBLEVEL 来自顶 Makefile；LOCALVERSION 直接改 .config。
-# 不能用 scripts/config：值以 '-' 开头会被 getopt 当成选项吃掉。
+# SUBLEVEL 来自顶 Makefile；值以 '-' 开头，不能用 scripts/config（会被 getopt 当选项）
 sed -i "s/^SUBLEVEL = .*/SUBLEVEL = $TARGET_SUBLEVEL/" "$SRC/Makefile"
 sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"$TARGET_LOCALVERSION\"|" "$SRC/.config"
 sed -i "s|^CONFIG_LOCALVERSION_AUTO=.*|# CONFIG_LOCALVERSION_AUTO is not set|" "$SRC/.config"
@@ -41,14 +47,34 @@ sed -i "s|^CONFIG_LOCALVERSION_AUTO=.*|# CONFIG_LOCALVERSION_AUTO is not set|" "
 # 设备 config 里 CONFIG_UNUSED_KSYMS_WHITELIST="abi_symbollist.raw"，
 # 这个文件由 kleaf 在 GKI 正式构建时生成，AOSP 源码树里没有。
 # 本轮只测 ABI，先关掉裁剪，导出全量符号（对 ABI 测量无影响，对厂商 .ko 是超集）。
+NO_SYMBOL_LIST=0
 if [ ! -e "$SRC/abi_symbollist.raw" ]; then
     echo "    abi_symbollist.raw 不存在，关闭 TRIM_UNUSED_KSYMS"
+    NO_SYMBOL_LIST=1
     sed -i "s|^CONFIG_TRIM_UNUSED_KSYMS=y|# CONFIG_TRIM_UNUSED_KSYMS is not set|" "$SRC/.config"
     sed -i "s|^CONFIG_UNUSED_KSYMS_WHITELIST=.*|CONFIG_UNUSED_KSYMS_WHITELIST=\"\"|" "$SRC/.config"
 fi
 
 make -C "$SRC" ARCH=arm64 LLVM="$LLVM_SUFFIX" olddefconfig
-grep -E '^CONFIG_LOCALVERSION=|^CONFIG_LOCALVERSION_AUTO=|^CONFIG_TRIM_UNUSED_KSYMS=' "$SRC/.config" || true
+
+# olddefconfig 不一定刷新 auto.conf，而 setlocalversion 只看 auto.conf。
+# 注意 auto.conf 是 make 语法，字符串值不带引号（.config 才带）。
+if [ -e "$SRC/include/config/auto.conf" ]; then
+    sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=$TARGET_LOCALVERSION|" \
+        "$SRC/include/config/auto.conf"
+    sed -i "s|^CONFIG_LOCALVERSION_AUTO=.*|# CONFIG_LOCALVERSION_AUTO is not set|" \
+        "$SRC/include/config/auto.conf"
+    if [ "$NO_SYMBOL_LIST" = 1 ]; then
+        sed -i "s|^CONFIG_TRIM_UNUSED_KSYMS=.*|# CONFIG_TRIM_UNUSED_KSYMS is not set|" \
+            "$SRC/include/config/auto.conf"
+        sed -i "s|^CONFIG_UNUSED_KSYMS_WHITELIST=.*|CONFIG_UNUSED_KSYMS_WHITELIST=\"\"|" \
+            "$SRC/include/config/auto.conf"
+    fi
+fi
+rm -f "$SRC/include/config/kernel.release" "$SRC/include/generated/utsrelease.h"
+
+echo "    auto.conf: $(grep -c . "$SRC/include/config/auto.conf" 2>/dev/null || echo 0) 行"
+grep -E '^CONFIG_LOCALVERSION=' "$SRC/include/config/auto.conf" 2>/dev/null || true
 
 ACTUAL_RELEASE=$(make -s -C "$SRC" ARCH=arm64 LLVM="$LLVM_SUFFIX" kernelrelease)
 echo "    kernelrelease = $ACTUAL_RELEASE"
@@ -59,7 +85,7 @@ if [ "$ACTUAL_RELEASE" != "$TARGET_RELEASE" ]; then
     exit 1
 fi
 
-grep -E '^CONFIG_LOCALVERSION=|^CONFIG_LOCALVERSION_AUTO=|^CONFIG_DEBUG_INFO_BTF=|^CONFIG_GENDWARFKSYMS=|^CONFIG_CFI=|^CONFIG_MODVERSIONS=' \
+grep -E '^CONFIG_(LOCALVERSION|DEBUG_INFO_BTF|GENDWARFKSYMS|CFI|MODVERSIONS|TRIM_UNUSED_KSYMS)=' \
     "$SRC/.config" || true
 
 echo "==> 3 编译 Image（$JOBS 并发）"
@@ -71,10 +97,20 @@ objcopy --dump-section .BTF="$OUT/vmlinux.btf" "$SRC/vmlinux"
 cp "$SRC/System.map" "$OUT/System.map"
 cp "$SRC/Module.symvers" "$OUT/Module.symvers"
 cp "$SRC/.config" "$OUT/config.built"
+
+# 从 Image 里回读真实版本串（内核 Image 未压缩，字符串是明文）
+IMG_RELEASE=$(grep -a -o -m1 'Linux version [^ ]*' "$OUT/Image" | awk '{print $3}')
+echo "    Image 内 Linux version = $IMG_RELEASE"
+if [ "$IMG_RELEASE" != "$TARGET_RELEASE" ]; then
+    echo "!! 编出来的 Image 版本串与目标不一致"
+    exit 1
+fi
+
 {
     echo "source_commit=$(git -C "$SRC" rev-parse HEAD)"
     echo "release=$ACTUAL_RELEASE"
     echo "target_release=$TARGET_RELEASE"
+    echo "image_uts_release=$IMG_RELEASE"
     sha256sum "$OUT/Image" | awk '{print "image_sha256="$1}'
     stat -c 'image_bytes=%s' "$OUT/Image"
     stat -c 'btf_bytes=%s' "$OUT/vmlinux.btf"
