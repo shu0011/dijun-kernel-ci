@@ -106,10 +106,30 @@ fi
 grep -E '^CONFIG_(LOCALVERSION|DEBUG_INFO_BTF|GENDWARFKSYMS|CFI|MODVERSIONS|TRIM_UNUSED_KSYMS)=' \
     "$SRC/.config" || true
 
-echo "==> 3 编译 Image（$JOBS 并发）"
+echo "==> 3 处理 pahole 的 per-CPU 变量上限"
+# pahole 1.22~1.26 的 btf_encoder 对 per-CPU 变量有 4096 条硬上限，超了就返回 -1
+# 并且不再写 .BTF 段，resolve_btfids 随即报
+#   FAILED: load BTF from vmlinux.unstripped: Invalid argument
+# 这台机器的 distro config 编出来的 percpu 变量超过 4096，必挂。
+# 我们只需要 STRUCT/UNION 的 sizeof 与成员偏移，VAR/DATASEC 完全用不上，
+# 所以直接关掉 percpu 变量编码。（上游 2024-02 的修法是改成动态分配，1.27+ 才有。）
+PAHOLE_V=$(pahole --version 2>/dev/null | sed -nE 's/^v([0-9]+)\.([0-9]+).*/\1\2/p')
+echo "    pahole $(pahole --version 2>/dev/null || echo '(缺失)') -> 解析为 ${PAHOLE_V:-?}"
+if [ -n "${PAHOLE_V:-}" ] && [ "$PAHOLE_V" -lt 126 ]; then
+    sed -i 's|^pahole-flags-y :=$|pahole-flags-y := --skip_encoding_btf_vars|' \
+        "$SRC/scripts/Makefile.btf"
+    echo "    旧式 flags：加 --skip_encoding_btf_vars"
+else
+    sed -i 's|--btf_features=encode_force,var,float|--btf_features=encode_force,float|' \
+        "$SRC/scripts/Makefile.btf"
+    echo "    btf_features 白名单：去掉 var"
+fi
+grep -nE 'btf_features=[a-z]|pahole-flags-y :=' "$SRC/scripts/Makefile.btf" | head -4
+
+echo "==> 4 编译 Image（$JOBS 并发）"
 make -C "$SRC" ARCH=arm64 LLVM="$LLVM_SUFFIX" -j"$JOBS" Image
 
-echo "==> 4 抽取 .BTF 与产物"
+echo "==> 5 抽取 .BTF 与产物"
 cp "$SRC/arch/arm64/boot/Image" "$OUT/Image"
 objcopy --dump-section .BTF="$OUT/vmlinux.btf" "$SRC/vmlinux"
 cp "$SRC/System.map" "$OUT/System.map"
