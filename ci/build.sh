@@ -43,8 +43,20 @@ TARGET_SUBLEVEL="${TARGET_SUBLEVEL:-21}"
 TARGET_LOCALVERSION="${TARGET_LOCALVERSION:--android17-5-g284297031c53-abogki553682993-4k}"
 
 mkdir -p "$OUT"
-export KBUILD_BUILD_USER=ci
-export KBUILD_BUILD_HOST=github-actions
+# 构建者信息伪装成官方 kleaf 构建，与设备内核的 "Linux version …" 行一致：
+#   官方: 6.18.21-android17-5-g284297031c53-abogki553682993-4k (kleaf@build-host)
+#         (Android (15323222, …, based on r584948c) clang version 22.0.1 …)
+#         #1 SMP PREEMPT Mon Aug 31 02:13:04 UTC 2026
+# user/host/timestamp 三个变量决定前两段和末尾日期；编译器那段由 AOSP
+# clang r584948c 自己输出，换对工具链就一致。
+BUILD_USER="${BUILD_USER:-kleaf}"
+BUILD_HOST="${BUILD_HOST:-build-host}"
+BUILD_TIMESTAMP="${BUILD_TIMESTAMP:-Mon Aug 31 02:13:04 UTC 2026}"
+export KBUILD_BUILD_USER="$BUILD_USER"
+export KBUILD_BUILD_HOST="$BUILD_HOST"
+export KBUILD_BUILD_TIMESTAMP="$BUILD_TIMESTAMP"
+export KBUILD_BUILD_VERSION=1
+echo "==> 构建者信息: ${BUILD_USER}@${BUILD_HOST}  ${BUILD_TIMESTAMP}"
 # 显式设为空串（"已设置"状态），setlocalversion 才不会追加 -g<sha>-dirty
 export LOCALVERSION=""
 
@@ -172,6 +184,16 @@ if [ "$IMG_RELEASE" != "$TARGET_RELEASE" ]; then
     echo "!! 编出来的 Image 版本串与目标不一致"
     exit 1
 fi
+
+# 构建者信息与时间戳也要和官方一致，否则 uname -a 一眼能看出来
+for probe in "(${BUILD_USER}@${BUILD_HOST})" "$BUILD_TIMESTAMP"; do
+    if ! grep -aq -- "$probe" "$OUT/Image"; then
+        echo "!! Image 里找不到 '$probe'，构建者信息没生效"
+        grep -a -o -m1 'Linux version .\{0,160\}' "$OUT/Image" || true
+        exit 1
+    fi
+done
+echo "    构建者信息与时间戳已对齐官方"
 
 {
     echo "source_commit=$(git -C "$SRC" rev-parse HEAD)"
