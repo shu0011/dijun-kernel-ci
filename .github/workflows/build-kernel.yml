@@ -22,7 +22,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential bc bison flex libelf-dev libssl-dev libdwarf-dev \
+            build-essential bc bison flex libelf-dev libssl-dev libdw-dev libdwarf-dev \
             dwarves cpio kmod lz4 xz-utils python3 \
             clang-18 lld-18 llvm-18
           # Debian 系有些版本把 dwarf.h 放在 libdwarf/ 子目录，内核却按 <dwarf.h> 引用
