@@ -32,6 +32,22 @@ jobs:
           ls -la /usr/include/dwarf.h /usr/include/openssl/opensslv.h
           clang-18 --version | head -1
 
+      # 设备内核是 Android clang r584948c 编的，宿主 clang-18 没有 POR_EL0 支持，
+      # 会让 CONFIG_ARM64_POE 在编译器能力探测中被自动关掉 —— user_access_state
+      # 从 16 字节缩到 8 字节，BTF 比对里就多出一条假差异。
+      # 换同一版 AOSP clang 可以把这类工具链噪声消掉。
+      - name: 准备 AOSP clang r584948c
+        run: |
+          set -euo pipefail
+          url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r584948c.tar.gz"
+          if mkdir -p /opt/aosp-clang && curl -fsSL --retry 2 --max-time 900 "$url" \
+               | tar -xz -C /opt/aosp-clang; then
+            echo "/opt/aosp-clang/bin" >> "$GITHUB_PATH"
+            /opt/aosp-clang/bin/clang --version | head -1
+          else
+            echo "::warning::AOSP clang 下载失败，回落到系统 clang-18（POR_EL0 相关差异会保留）"
+          fi
+
       - name: 拉取 android17-6.18 源码
         run: |
           set -o pipefail

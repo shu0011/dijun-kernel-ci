@@ -23,6 +23,20 @@ CFG="${CFG:-config/dijun_defconfig}"
 JOBS="${JOBS:-$(nproc)}"
 LLVM_SUFFIX="${LLVM_SUFFIX:--18}"
 
+# LLVM=1 要求 PATH 里有不带后缀的 clang/ld.lld/llvm-objcopy；
+# 只有 ubuntu 的 clang-18 时要用 LLVM=-18 走带后缀的工具链。
+# AOSP 预编译 clang 自带这些名字，用 LLVM=1 才能让 POR_EL0 之类的
+# 编译器能力探测通过（决定 CONFIG_ARM64_POE 等 config）。
+LLVM_VAL="${LLVM_VAL:-}"
+if [ -z "$LLVM_VAL" ]; then
+    if clang --version 2>/dev/null | grep -q "Android"; then
+        LLVM_VAL=1
+    else
+        LLVM_VAL="$LLVM_SUFFIX"
+    fi
+fi
+echo "==> 0 工具链 LLVM=$LLVM_VAL（$(clang --version 2>/dev/null | head -1)）"
+
 # 设备真值，来源：OS4.0.4.0 OTA 的 boot.img 里 "Linux version" 字符串
 TARGET_RELEASE="${TARGET_RELEASE:-6.18.21-android17-5-g284297031c53-abogki553682993-4k}"
 TARGET_SUBLEVEL="${TARGET_SUBLEVEL:-21}"
@@ -36,7 +50,7 @@ export LOCALVERSION=""
 
 echo "==> 1 用设备 config 生成 .config"
 cp "$CFG" "$SRC/arch/arm64/configs/dijun_defconfig"
-make -C "$SRC" ARCH=arm64 LLVM="$LLVM_SUFFIX" dijun_defconfig
+make -C "$SRC" ARCH=arm64 LLVM="$LLVM_VAL" dijun_defconfig
 
 echo "==> 2 对齐版本字符串 -> $TARGET_RELEASE"
 # SUBLEVEL 来自顶 Makefile；值以 '-' 开头，不能用 scripts/config（会被 getopt 当选项）
@@ -77,7 +91,7 @@ echo "    扫描 config 指向的外部文件"
     [ -e "$SRC/$f" ] || echo "    ?? $k -> $f 不存在"
 done
 
-make -C "$SRC" ARCH=arm64 LLVM="$LLVM_SUFFIX" olddefconfig
+make -C "$SRC" ARCH=arm64 LLVM="$LLVM_VAL" olddefconfig
 
 # olddefconfig 不一定刷新 auto.conf，而 setlocalversion 与 modpost 认的都是 auto.conf。
 # 注意 auto.conf 是 make 语法，字符串值不带引号（.config 才带）。
@@ -94,7 +108,7 @@ echo "    auto.conf: $(grep -c . "$SRC/include/config/auto.conf" 2>/dev/null || 
 grep -E '^CONFIG_(LOCALVERSION|TRIM_UNUSED_KSYMS|MODULE_SIG_PROTECT)' \
     "$SRC/include/config/auto.conf" 2>/dev/null || true
 
-ACTUAL_RELEASE=$(make -s -C "$SRC" ARCH=arm64 LLVM="$LLVM_SUFFIX" kernelrelease)
+ACTUAL_RELEASE=$(make -s -C "$SRC" ARCH=arm64 LLVM="$LLVM_VAL" kernelrelease)
 echo "    kernelrelease = $ACTUAL_RELEASE"
 if [ "$ACTUAL_RELEASE" != "$TARGET_RELEASE" ]; then
     echo "!! 版本字符串与设备不一致，厂商 .ko 会全部拒载，终止"
@@ -127,7 +141,7 @@ fi
 grep -nE 'btf_features=[a-z]|pahole-flags-y :=' "$SRC/scripts/Makefile.btf" | head -4
 
 echo "==> 4 编译 Image（$JOBS 并发）"
-make -C "$SRC" ARCH=arm64 LLVM="$LLVM_SUFFIX" -j"$JOBS" Image
+make -C "$SRC" ARCH=arm64 LLVM="$LLVM_VAL" -j"$JOBS" Image
 
 echo "==> 5 抽取 .BTF 与产物"
 cp "$SRC/arch/arm64/boot/Image" "$OUT/Image"
