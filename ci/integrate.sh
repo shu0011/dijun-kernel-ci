@@ -382,6 +382,125 @@ open(hk, "w").write(t)
 print("    hooks.c: setprocattr app-uid 分支切到官方 #3981 修复")
 PYEOF
 
+echo "==> G6 把 inode_setxattr 接回官方 #3996 侧信道修复（G2 早退最后一处遗漏）"
+# enable() 的第 6 类动作 ksu_lsm_hook(&selinux_inode_setxattr_hook) 被 G2 早退跳过，
+# 官方 my_inode_setxattr（上游 5b6262e8 / #3996，11-14）同样只是编进内核、从未挂上。
+# 它和 setprocattr 是同类 live-parse 侧信道：app 写文件 security.selinux label 时，
+# my_inode_setxattr 先 security_context_to_sid_live() 校验、ksu 新 type 才查 backup，
+# 写原厂 context 时行为与真机一致。缺了它，检测软件写文件 label 即可探知 live policy
+# 被改。LKM ko 完整跑了 enable() 所以挂上了，故不过检测。
+#
+# 难点：my_inode_setxattr 用到两个运行期 kallsyms 解析的原函数指针
+# （inode_doinit_with_dentry_fn / selinux_inode_setxattr_hook.original），G2 早退把
+# selinux_hide_init_setxattr() 也跳过了 → 这俩是 NULL，直接调会崩。
+# 解法：编译期导出 wrapper，内部首次调用时 lazy 补跑官方 selinux_hide_init_setxattr()
+# 把指针解析好（该函数在 built-in 下 superblock_init 是 no-op stub，安全），再转调官方
+# my_inode_setxattr。hooks.c 侧编译期新增 handle + 替换 LSM_HOOK_INIT 挂载点，
+# app-uid + security.selinux 走 wrapper，其余走原生 selinux_inode_setxattr。
+# 全程零 kprobe、不改 write_op[]、不写只读数据、不新增功能，只是让官方已有实现生效。
+SH="$SRC/drivers/kernelsu/feature/selinux_hide.c"
+HK="$SRC/security/selinux/hooks.c"
+python3 - "$SH" "$HK" <<'PYEOF'
+import sys
+sh, hk = sys.argv[1], sys.argv[2]
+
+# --- 1) selinux_hide.c: 导出 wrapper（lazy 初始化原函数指针 -> 官方 my_inode_setxattr）---
+s = open(sh).read()
+assert "int ksu_backup_inode_setxattr(" not in s, "ksu_backup_inode_setxattr 已存在"
+assert s.count("static int selinux_hide_init_setxattr()") == 1, "init_setxattr 没匹配上"
+g6 = r"""
+/* ---- 编译期 inode_setxattr 入口（CONFIG_KSU_SUSFS=y, G6 / 上游 #3996）--------
+ * built-in + G2 早退下 ksu_lsm_hook(selinux_inode_setxattr_hook) 从未注册，
+ * 含 live-parse 修复的 my_inode_setxattr 是死代码。这里编译期导出同一实现给
+ * hooks.c 的 handle_selinux_inode_setxattr 在 app-uid 分支调用，堵住文件 label
+ * 写入侧信道。my_inode_setxattr 依赖两个 kallsyms 解析的原函数指针，G2 早退
+ * 跳过了 selinux_hide_init_setxattr() 故为 NULL —— 首次进入时 lazy 补跑官方
+ * 初始化（built-in 下 superblock_init 是 no-op stub）解析好再转调。
+ * ------------------------------------------------------------------------ */
+static bool ksu_backup_inode_setxattr_ready __read_mostly = false;
+int ksu_backup_inode_setxattr(void *idmap, struct dentry *dentry, const char *name,
+                              const void *value, size_t size, int flags)
+{
+    if (likely(!ksu_backup_inode_setxattr_ready)) {
+        if (selinux_hide_init_setxattr())
+            return -ENOENT;   /* 原函数指针解析失败：不接管，交回调用方走原生 */
+        WRITE_ONCE(ksu_backup_inode_setxattr_ready, true);
+    }
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+    return my_inode_setxattr((struct mnt_idmap *)idmap, dentry, name, value, size, flags);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+    return my_inode_setxattr((struct user_namespace *)idmap, dentry, name, value, size, flags);
+#else
+    return my_inode_setxattr(dentry, name, value, size, flags);
+#endif
+}
+"""
+s = s.rstrip() + "\n" + g6
+open(sh, "w").write(s)
+print("    selinux_hide.c: 导出 ksu_backup_inode_setxattr -> my_inode_setxattr (lazy init)")
+
+# --- 2) hooks.c: 新增 handle + 替换 inode_setxattr 挂载点 ---
+t = open(hk).read()
+anchor = "/* ---- G6: inode_setxattr 编译期 handle（CONFIG_KSU_SUSFS）---- */"
+assert anchor not in t, "G6 handle 已存在"
+
+# handle 插在 selinux_hooks[] 定义之前（用挂载点所在行做锚）
+mount = "\tLSM_HOOK_INIT(inode_setxattr, selinux_inode_setxattr),"
+assert t.count(mount) == 1, f"inode_setxattr 挂载点没匹配上: {t.count(mount)}"
+
+handle = r"""extern int ksu_backup_inode_setxattr(void *idmap, struct dentry *dentry, const char *name,
+                                      const void *value, size_t size, int flags);
+
+/* G6: app-uid 写 security.selinux 时走官方 #3996 live-parse 修复；
+   解析失败(-ENOENT)或非 app/非 SELinux xattr 则回落原生。
+   签名必须与 LSM_HOOK_INIT(inode_setxattr) 的函数指针类型完全一致。 */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+static int handle_selinux_inode_setxattr(struct mnt_idmap *idmap, struct dentry *dentry, const char *name,
+                                         const void *value, size_t size, int flags)
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+static int handle_selinux_inode_setxattr(struct user_namespace *idmap, struct dentry *dentry, const char *name,
+                                         const void *value, size_t size, int flags)
+#else
+static int handle_selinux_inode_setxattr(struct dentry *dentry, const char *name,
+                                         const void *value, size_t size, int flags)
+#endif
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+    void *vidmap = idmap;
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+    void *vidmap = idmap;
+#endif
+    if (likely(current_uid().val >= 10000 && ksu_selinux_hide_running &&
+               !strcmp(name, XATTR_NAME_SELINUX))) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+        int rc = ksu_backup_inode_setxattr(vidmap, dentry, name, value, size, flags);
+#else
+        int rc = ksu_backup_inode_setxattr(NULL, dentry, name, value, size, flags);
+#endif
+        if (rc != -ENOENT)
+            return rc;
+    }
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+    return selinux_inode_setxattr(idmap, dentry, name, value, size, flags);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 12, 0)
+    return selinux_inode_setxattr(idmap, dentry, name, value, size, flags);
+#else
+    return selinux_inode_setxattr(dentry, name, value, size, flags);
+#endif
+}
+
+"""
+# 插到 static struct security_hook_list selinux_hooks[] 之前
+hk_anchor = "static struct security_hook_list selinux_hooks[]"
+assert t.count(hk_anchor) == 1, "selinux_hooks[] 定义没匹配上"
+t = t.replace(hk_anchor, handle + hk_anchor, 1)
+
+# 替换挂载点
+t = t.replace(mount, "\tLSM_HOOK_INIT(inode_setxattr, handle_selinux_inode_setxattr),", 1)
+open(hk, "w").write(t)
+print("    hooks.c: inode_setxattr 挂载点切到 G6 handle")
+PYEOF
+
 echo "==> H 集成完成"
 echo "    KSU 分支配置文件: $(ls "$SRC/drivers/kernelsu"/Kbuild "$SRC/drivers/kernelsu"/Makefile 2>/dev/null | tr '\n' ' ')"
 echo "    SELinux 补丁命中: $(grep -c 'CONFIG_KSU_SUSFS' "$SRC/security/selinux/status.c" 2>/dev/null || echo 0) 处 status.c"

@@ -2,7 +2,8 @@
 
 > 设备：小米 15S Pro（`dijun`），HyperOS OS4.0.5.0，玄戒 O1
 > 内核基线：`6.18.21-android17-5-g284297031c53-abogki553682993-4k`（GKI / KMI `android17-6.18`）
-> 当前状态：**built-in SukiSU + 完整 SELinux 隐藏已上机验证通过**，Maple「策略属性写入」侧信道已修；AK3 公测包见 Releases
+> 当前状态：**built-in SukiSU + 完整 SELinux 隐藏已上机验证通过**，G2 早退误伤的官方隐藏动作已全部盘点并接通
+> （G4 context/access、G5 setprocattr/#3981、G6 inode_setxattr/#3996）；AK3 公测包见 Releases
 > 上游：2026-11-15 起 SukiSU-Ultra 更名为 **SukiSU-Nova**，本项目同步跟踪其 `main` 分支
 
 本仓库用 GitHub Actions 复现整套构建：AOSP `android17-6.18` 源码 + 设备原厂 `boot.img` 抽出的 config，
@@ -53,6 +54,18 @@ module 模式下这两次写入返回 `-EFAULT` 还能退到 kprobe，built-in �
    G5 用与 G4 相同的编译期手法：导出 `ksu_backup_setprocattr` 指向官方 `my_setprocattr`，
    把 `handle_selinux_setprocattr` 的 app-uid 分支改调它。**不挂 kprobe、不改 `write_op[]`、
    不写只读数据、不新增功能**，只是让官方已有实现真正生效。
+5. **G6（inode_setxattr / 文件 label 侧信道修复）**：完整盘点 `enable()` 的 6 类动作后，
+   发现 G2 早退还漏了第 6 类 `ksu_lsm_hook(&selinux_inode_setxattr_hook)` —— 官方
+   `my_inode_setxattr`（上游 `5b6262e8` / #3996，2026-11-14，与 #3981 同批 live-parse 修复）
+   同样只是编进内核、从未挂上。它管的是 app 写文件 `security.selinux` xattr 时的侧信道：
+   先用 `security_context_to_sid_live()` 校验、ksu 新 type 才查 backup，写原厂 label 的行为
+   与真机一致；缺了它，检测软件写文件 label 即可探知 live policy 被改。
+   难点是该函数依赖两个 kallsyms 解析的原函数指针，G2 早退跳过了初始化故为 NULL；
+   G6 导出 `ksu_backup_inode_setxattr` 指向官方实现、首次进入时 lazy 补跑官方
+   `selinux_hide_init_setxattr()` 解析好指针（built-in 下 `superblock_init` 是 no-op stub），
+   hooks.c 编译期新增 `handle_selinux_inode_setxattr` 替换挂载点，app-uid + SELinux xattr
+   走 wrapper、失败或非目标回落原生。同样**零 kprobe、不改 `write_op[]`、不写只读数据、
+   不新增功能**。至此 G2 早退误伤的官方隐藏动作全部接通。
 
 **版本号完全交给上游 Kbuild 自动计算**（不写死）：公式为
 `KSU_VERSION = VERSION_BASE + LOCAL_COUNT − VERSION_OFFSET`。早期 Ultra 是 `40000 + COUNT − 2815`，
@@ -66,7 +79,9 @@ module 模式下这两次写入返回 `-EFAULT` 还能退到 kprobe，built-in �
 
 - ✅ **已完成并上机验证**：GKI ABI 对齐、Rust/ASHMEM 工具链、SukiSU built-in、SELinux 隐藏（检测软件通过）、
   官方 `init_boot` 兼容、boot/AVB 打包、CI 可复现构建、AK3 打包。
-- ✅ **G5 已修复（待上机复验）**：Maple「策略属性写入特征」侧信道（G2 早退误伤了官方 #3981 修复）。
+- ✅ **G5/G6 已修复（待上机复验）**：完整盘点 G2 早退的 6 类动作——fake status、context、access、setprocattr 已接通，
+  G5 补 setprocattr（#3981，Maple「策略属性写入特征」），G6 补最后遗漏的 inode_setxattr（#3996，文件 label 侧信道）。
+  两类都是把官方已有实现在 built-in 下接通，零 kprobe、不写只读数据。
 - 🔄 **进行中**：AK3 公测分发，收集不同机器/不同槽位/不同系统版本的反馈。
 - ⚠️ **已知限制**
   - 目前只移植了 **SUSFS 的 SELinux 隐藏相关部分**，不是完整 SUSFS。
@@ -116,7 +131,8 @@ AK3 公测包请从 **Releases** 下载，在 Recovery / KernelSU 管理器里�
 
 - **SukiSU-Ultra / SukiSU-Nova 团队**：KernelSU 分支、管理器、`selinux_hide` 官方实现，
   以及 `kernel/setup.sh` 的 built-in 集成指南 —— 本项目的隐藏逻辑完全建立在官方实现之上。
-  特别感谢上游 `c836ea2c`（#3981）对 setprocattr 侧信道的修复，G5 只是把它在 built-in 下接通。
+  特别感谢上游 `c836ea2c`（#3981，setprocattr 侧信道）与 `5b6262e8`（#3996，inode_setxattr 文件 label 侧信道）
+  两个修复，G5/G6 只是把它们官方已有的实现在 built-in 下接通。
 - **KernelSU 原项目及其贡献者**：整套内核侧 root 架构的基础。
 - **SUSFS 项目（susfs4ksu 系列）**：SELinux 编译期包装与隐藏思路，本项目当前接入的补丁来源。
 - **LingLuo17 / AnyKernel3**：`dijun` 上实测可开机的 AK3 基线与打包方案，
