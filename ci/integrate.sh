@@ -87,7 +87,35 @@ cp "$HERE/patches/susfs_bridge.c" "$SRC/fs/susfs_bridge.c"
 grep -q 'susfs_bridge' "$SRC/fs/Makefile" || \
     printf '\nobj-$(CONFIG_KSU_SUSFS) += susfs_bridge.o\n' >> "$SRC/fs/Makefile"
 
-echo "==> F 集成完成"
+echo "==> F 导出 KSU selinux_hide 的状态符号"
+# SUSFS 的 hooks.c 补丁要读 KSU 自己那套 selinux hide 的状态：
+#   extern bool ksu_selinux_hide_running __read_mostly;
+# 但在 KSU 里这几个都是 static，链接时才会报 undefined symbol。
+# 去 static 让它们成为全局，函数补原型满足 -Wmissing-prototypes。
+SH="$SRC/drivers/kernelsu/feature/selinux_hide.c"
+python3 - "$SH" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+subs = [
+    ("static bool ksu_selinux_hide_running __read_mostly = false;",
+     "bool ksu_selinux_hide_running __read_mostly = false;"),
+    ("static DEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);",
+     "void initialize_fake_status(void);\nDEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);"),
+    ("static struct page *fake_status = NULL;",
+     "struct page *fake_status;"),
+    ("static void initialize_fake_status()",
+     "void initialize_fake_status(void)"),
+]
+for old, new in subs:
+    if old not in s:
+        sys.exit("selinux_hide.c 里找不到: " + old)
+    s = s.replace(old, new, 1)
+open(p, "w").write(s)
+print("    已导出 ksu_selinux_hide_running / fake_status / initialize_fake_status / fake_status_initialize_key")
+PYEOF
+
+echo "==> G 集成完成"
 grep -c 'CONFIG_KSU_SUSFS' "$SRC/security/selinux/status.c" "$SRC/security/selinux/avc.c" \
      "$SRC/security/selinux/hooks.c" "$SRC/security/selinux/selinuxfs.c" \
      "$SRC/security/selinux/ss/services.c" || true
