@@ -141,6 +141,47 @@ open(p, "w").write(s.replace(needle, patch, 1))
 print("    selinux_hide.c: 已插入 CONFIG_KSU_SUSFS 早退分支")
 PYEOF
 
+echo "==> G3 fake status 改成按需初始化（不再看 static key）"
+# KSU 的 fake_status 初始化有两处时机陷阱：
+#   1) second_stage 阶段 policy 可能还没 enforce，initialize_fake_status() 直接跳过；
+#   2) 紧接着 handle_post_fs_data() 会把 fake_status_initialize_key 关掉，
+#      于是 selinuxfs 里那段「key 开着才初始化」的代码永远不再执行。
+# 结果是：开关显示 enabled，但 fake_status 始终是 NULL，隐藏静默失效。
+python3 - "$SRC/security/selinux/selinuxfs.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+
+old_head = """\tstruct page    *status = selinux_kernel_status_page();
+
+#ifdef CONFIG_KSU_SUSFS
+\tif (likely(current_uid().val >= 10000 && ksu_selinux_hide_running)) {"""
+new_head = """\tstruct page    *status = selinux_kernel_status_page();
+
+#ifdef CONFIG_KSU_SUSFS
+\t/* 按需初始化：不依赖 second_stage 的时机，也不看 static key。
+\t   首次打开 status 时 status_page 已经存在，正好是分配 fake 页的时机。 */
+\tif (!fake_status)
+\t\tinitialize_fake_status();
+\tif (likely(current_uid().val >= 10000 && ksu_selinux_hide_running)) {"""
+assert s.count(old_head) == 1, "status open 头部没匹配上"
+s = s.replace(old_head, new_head, 1)
+
+old_key = """
+#ifdef CONFIG_KSU_SUSFS
+\tif (static_branch_unlikely(&fake_status_initialize_key)) {
+\t\tif (!fake_status)
+\t\t\tinitialize_fake_status();
+\t}
+#endif // #ifdef CONFIG_KSU_SUSFS
+"""
+assert s.count(old_key) == 1, "static key 初始化块没匹配上"
+s = s.replace(old_key, "\n", 1)
+
+open(p, "w").write(s)
+print("    selinuxfs.c: fake status 改为按需初始化")
+PYEOF
+
 echo "==> H 集成完成"
 echo "    KSU 分支配置文件: $(ls "$SRC/drivers/kernelsu"/Kbuild "$SRC/drivers/kernelsu"/Makefile 2>/dev/null | tr '\n' ' ')"
 echo "    SELinux 补丁命中: $(grep -c 'CONFIG_KSU_SUSFS' "$SRC/security/selinux/status.c" 2>/dev/null || echo 0) 处 status.c"
