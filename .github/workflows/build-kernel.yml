@@ -43,7 +43,8 @@ jobs:
           chmod +x /usr/local/bin/repo
           mkdir -p /tmp/ws && cd /tmp/ws
           repo init -u https://android.googlesource.com/kernel/manifest \
-                    -b common-android17-6.18-2026-06 --depth=1 --no-repo-verify -q
+                    -b common-android17-6.18-2026-06 --depth=1 --no-repo-verify \
+            || echo "::warning::repo init 失败"
           repo sync -c -j4 --no-tags --no-clone-bundle -q \
                     platform/prebuilts/clang/host/linux-x86 || true
 
@@ -63,21 +64,24 @@ jobs:
             git sparse-checkout set linux-x86/1.91.1 2>/dev/null || \
               git sparse-checkout set linux-x86 2>/dev/null || true
             echo "--- 可用 rust 版本 ---"
-            ls linux-x86/ 2>/dev/null | head -12
+            { ls linux-x86/ 2>/dev/null || true; } | head -12
           fi
           RC=$(ls -d /tmp/arust/linux-x86/*/bin/rustc 2>/dev/null | sort -V | tail -1)
           if [ -n "$RC" ]; then
             echo "AOSP_RUSTC=$RC" >> "$GITHUB_ENV"
-            "$RC" --version
+            "$RC" --version 2>&1 | head -2 || true
           else
             echo "::warning::没拉到 AOSP rust，CONFIG_RUST 会被关闭（camera 大概率仍崩）"
           fi
           BG=$(ls -d /tmp/ws/prebuilts/clang/host/linux-x86/clang-r*/bin/bindgen 2>/dev/null | sort -V | tail -1)
-          [ -n "$BG" ] && echo "AOSP_BINDGEN=$BG" >> "$GITHUB_ENV" && "$BG" --version
+          if [ -n "$BG" ]; then
+            echo "AOSP_BINDGEN=$BG" >> "$GITHUB_ENV"
+            { "$BG" --version 2>&1 || true; } | head -2
+          fi
           CL=$(ls -d /tmp/ws/prebuilts/clang/host/linux-x86/clang-r* 2>/dev/null | sort -V | tail -1)
           if [ -n "$CL" ] && [ -x "$CL/bin/clang" ]; then
             echo "AOSP_CLANG=$CL" >> "$GITHUB_ENV"
-            "$CL/bin/clang" --version | head -1
+            { "$CL/bin/clang" --version 2>&1 || true; } | head -1
           else
             echo "::warning::没拉到 AOSP clang，回落系统 clang-18（CRC 大概率仍然对不上）"
           fi
