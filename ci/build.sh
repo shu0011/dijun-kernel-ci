@@ -87,6 +87,18 @@ if [ -n "${AOSP_CLANG:-}" ] && [ -d "$AOSP_CLANG/lib" ]; then
     export LIBCLANG_PATH="$AOSP_CLANG/lib"
 fi
 echo "==> rust: rustc=${RUSTC:-<未设置>} bindgen=${BINDGEN:-<未设置>}"
+
+# Makefile 里 RUSTC / HOSTRUSTC / BINDGEN 都是硬赋值（第 476/550/554 行），
+# 环境变量压不过它，必须从命令行传。olddefconfig 那一步尤其关键：
+# CONFIG_RUSTC_VERSION 与 CONFIG_RUST_IS_AVAILABLE 都是在 syncconfig 时算的。
+RUST_ARGS=""
+if [ -n "${AOSP_RUSTC:-}" ] && [ -x "$AOSP_RUSTC" ]; then
+    RUST_ARGS="RUSTC=$AOSP_RUSTC HOSTRUSTC=$AOSP_RUSTC"
+fi
+if [ -n "${AOSP_BINDGEN:-}" ] && [ -x "$AOSP_BINDGEN" ]; then
+    RUST_ARGS="$RUST_ARGS BINDGEN=$AOSP_BINDGEN"
+fi
+echo "==> make 追加参数: ${RUST_ARGS:-<无>}"
 # setlocalversion 已被替换成固定输出，不再需要靠 LOCALVERSION 环境变量压制 -g<sha>-dirty；
 # 保留反而会干扰 Makefile 里 LOCALVERSION = $(CONFIG_LOCALVERSION) 的取值
 
@@ -192,7 +204,7 @@ echo "    扫描 config 指向的外部文件"
     [ -e "$SRC/$f" ] || echo "    ?? $k -> $f 不存在"
 done
 
-make -C "$SRC" ARCH=arm64 LLVM="$LLVM_VAL" olddefconfig
+make -C "$SRC" ARCH=arm64 LLVM="$LLVM_VAL" $RUST_ARGS olddefconfig
 
 # olddefconfig 不一定刷新 auto.conf，而 setlocalversion 与 modpost 认的都是 auto.conf。
 # 注意 auto.conf 是 make 语法，字符串值不带引号（.config 才带）。
@@ -269,7 +281,7 @@ print("    mkcompile_h 已改为输出官方编译器串")
 PY
 
 echo "==> 5 编译 Image（$JOBS 并发）"
-make -C "$SRC" ARCH=arm64 LLVM="$LLVM_VAL" -j"$JOBS" Image
+make -C "$SRC" ARCH=arm64 LLVM="$LLVM_VAL" $RUST_ARGS -j"$JOBS" Image
 
 echo "==> 6 抽取 .BTF 与产物"
 cp "$SRC/arch/arm64/boot/Image" "$OUT/Image"
