@@ -437,7 +437,7 @@ diff --git a/security/selinux/ss/services.c b/security/selinux/ss/services.c
 index ead4ed5c3..860e0f661 100644
 --- a/security/selinux/ss/services.c
 +++ b/security/selinux/ss/services.c
-@@ -71,6 +71,13 @@
+@@ -71,6 +71,19 @@
  
  #include <trace/hooks/selinux.h>
  
@@ -446,6 +446,12 @@ index ead4ed5c3..860e0f661 100644
 +extern bool susfs_is_sus_type_rcu(u32 sid);
 +extern void susfs_spoof_avd_allowed_rcu(u32 s_type, u32 t_type, u32 c_type, u32 *avd_allowed);
 +extern struct selinux_state selinux_state;
++/* 下面三个定义在本文件末尾，先给原型以满足 -Wmissing-prototypes */
++int susfs_security_context_to_sid(const char *scontext, u32 scontext_len,
++				  u32 *sid, gfp_t gfp);
++int susfs_security_context_str_to_sid(const char *scontext, u32 *sid, gfp_t gfp);
++void susfs_security_compute_av_user(u32 ssid, u32 tsid, u16 tclass,
++				    struct av_decision *avd);
 +#endif // #ifdef CONFIG_KSU_SUSFS
 +
  struct selinux_policy_convert_data {

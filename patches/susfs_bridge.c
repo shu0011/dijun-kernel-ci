@@ -28,18 +28,13 @@ static inline bool is_ksu_domain(void)
 #endif
 
 /* SELinux 内部接口（security/selinux/include/security.h） */
-struct av_decision;
 extern int security_context_to_sid(const char *scontext, u32 scontext_len,
 				   u32 *sid, gfp_t gfp);
-extern void security_compute_av_user(u32 ssid, u32 tsid, u16 tclass,
-				     struct av_decision *avd);
 
 /* 补丁里这些是 extern，定义在本文件；先声明再定义，避免
  * -Wmissing-prototypes 把它们当"没有原型的全局函数"报错。 */
 bool susfs_is_current_ksu_domain(void);
 bool susfs_is_sus_type_rcu(u32 sid);
-void susfs_security_compute_av_user(u32 ssid, u32 tsid, u16 tclass,
-				    struct av_decision *avd);
 void susfs_spoof_avd_allowed_rcu(u32 s_type, u32 t_type, u32 c_type,
 				 u32 *avd_allowed);
 
@@ -59,12 +54,6 @@ bool susfs_is_sus_type_rcu(u32 sid)
 {
 	(void)sid;
 	return false;
-}
-
-void susfs_security_compute_av_user(u32 ssid, u32 tsid, u16 tclass,
-				    struct av_decision *avd)
-{
-	security_compute_av_user(ssid, tsid, tclass, avd);
 }
 
 /* 没有 sus_av 规则表，avd 不需要改写 */
