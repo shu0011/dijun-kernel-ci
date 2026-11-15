@@ -32,66 +32,52 @@ jobs:
           ls -la /usr/include/dwarf.h /usr/include/openssl/opensslv.h
           clang-18 --version | head -1
 
-      - name: 准备 AOSP prebuilt clang
+      - name: 准备 AOSP prebuilt clang + rust
         run: |
           set -euo pipefail
-          # CRC 由 gendwarfksyms 按 DWARF 类型信息算，编译器版本不同结果就不同。
-          # 设备是 AOSP clang r584948c（22.0.1），Ubuntu clang-18 算出的
-          # module_layout CRC 与厂商 .ko 的 __versions 对不上，.ko 全被拒载。
-          # 用 kernel/manifest 的 repo 拉 prebuilts/clang，和作者工作流同一条路。
+          set +o pipefail          # 探测类命令允许空输出，别让 pipefail 打断
+          # 工具链必须来自 AOSP：
+          #   gendwarfksyms 的 CRC 依赖 DWARF，clang 版本要一致
+          #   rustc 的 LLVM 要匹配 clang（CONFIG_RUSTC_CLANG_LLVM_COMPATIBLE）
           curl -sL -o /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
           chmod +x /usr/local/bin/repo
           mkdir -p /tmp/ws && cd /tmp/ws
           repo init -u https://android.googlesource.com/kernel/manifest \
                     -b common-android17-6.18-2026-06 --depth=1 --no-repo-verify \
             || echo "::warning::repo init 失败"
+          # rust 在 manifest 里叫 prebuilts/rust-toolchain/linux-x86（groups=ddk）
           repo sync -c -j4 --no-tags --no-clone-bundle -q \
-                    platform/prebuilts/clang/host/linux-x86 || true
+                    platform/prebuilts/clang/host/linux-x86 \
+                    platform/prebuilts/rust-toolchain/linux-x86 \
+            || echo "::warning::repo sync 部分失败，继续探测已有内容"
 
-          # ASHMEM 的 Kconfig 是 "depends on SHMEM && RUST"，设备开了 RUST=y。
-          # 缺 rust 工具链 → CONFIG_RUST 被丢 → ASHMEM 跟着没 → camera 的
-          # AshMemManager 拿到 NULL 在 memset 里崩。
-          # kernel/manifest 里没有 rust 项目，单独 clone；rustc 的 LLVM 必须与
-          # clang 同版本（CONFIG_RUSTC_CLANG_LLVM_COMPATIBLE），所以只能用 AOSP 那份。
-          git clone --depth=1 --filter=blob:none --sparse \
-                    https://android.googlesource.com/platform/prebuilts/rust /tmp/arust 2>/dev/null || \
-            git clone --depth=1 --sparse \
-                    https://android.googlesource.com/platform/prebuilts/rust /tmp/arust 2>/dev/null || true
-          # 直接看 manifest 怎么声明 rust 的，别再猜名字
-          echo "--- manifest 里含 rust 的项目 ---"
-          { grep -i "rust" /tmp/ws/.repo/manifests/default.xml 2>/dev/null || true; } | head -6
-          echo "--- clang 包里有没有 rustc ---"
-          { ls /tmp/ws/prebuilts/clang/host/linux-x86/clang-*/bin/ 2>/dev/null || true; } | grep -iE "^rust|bindgen" | head -5
-          echo "--- 已 sync 的顶层目录 ---"
-          { ls /tmp/ws 2>/dev/null || true; } | head -12
+          echo "--- sync 结果 ---"
+          ls /tmp/ws/prebuilts 2>/dev/null | head -6
+          echo "--- rust 版本目录 ---"
+          ls /tmp/ws/prebuilts/rust-toolchain/linux-x86 2>/dev/null | head -8
 
-          if [ -d /tmp/arust/.git ]; then
-            cd /tmp/arust
-            # 设备用 rustc 1.91.1（CONFIG_RUSTC_VERSION=109101），只取这个版本；
-            # 目录名对不上就退回全量
-            git sparse-checkout set linux-x86/1.91.1 2>/dev/null || \
-              git sparse-checkout set linux-x86 2>/dev/null || true
-            echo "--- 可用 rust 版本 ---"
-            { ls linux-x86/ 2>/dev/null || true; } | head -12
-          fi
-          RC=$(ls -d /tmp/arust/linux-x86/*/bin/rustc 2>/dev/null | sort -V | tail -1)
-          if [ -n "$RC" ]; then
-            echo "AOSP_RUSTC=$RC" >> "$GITHUB_ENV"
-            "$RC" --version 2>&1 | head -2 || true
-          else
-            echo "::warning::没拉到 AOSP rust，CONFIG_RUST 会被关闭（camera 大概率仍崩）"
-          fi
-          BG=$(ls -d /tmp/ws/prebuilts/clang/host/linux-x86/clang-r*/bin/bindgen 2>/dev/null | sort -V | tail -1)
-          if [ -n "$BG" ]; then
-            echo "AOSP_BINDGEN=$BG" >> "$GITHUB_ENV"
-            { "$BG" --version 2>&1 || true; } | head -2
-          fi
           CL=$(ls -d /tmp/ws/prebuilts/clang/host/linux-x86/clang-r* 2>/dev/null | sort -V | tail -1)
           if [ -n "$CL" ] && [ -x "$CL/bin/clang" ]; then
             echo "AOSP_CLANG=$CL" >> "$GITHUB_ENV"
-            { "$CL/bin/clang" --version 2>&1 || true; } | head -1
+            "$CL/bin/clang" --version | head -1
           else
-            echo "::warning::没拉到 AOSP clang，回落系统 clang-18（CRC 大概率仍然对不上）"
+            echo "::warning::没拉到 AOSP clang"
+          fi
+
+          RC=$(ls -d /tmp/ws/prebuilts/rust-toolchain/linux-x86/*/bin/rustc 2>/dev/null | sort -V | tail -1)
+          if [ -n "$RC" ]; then
+            echo "AOSP_RUSTC=$RC" >> "$GITHUB_ENV"
+            "$RC" --version
+          else
+            echo "::warning::没拉到 AOSP rustc，CONFIG_RUST 会关，camera 大概率仍崩"
+          fi
+
+          BG=$(ls -d "$CL"/bin/bindgen 2>/dev/null | head -1)
+          if [ -n "$BG" ] && [ -x "$BG" ]; then
+            echo "AOSP_BINDGEN=$BG" >> "$GITHUB_ENV"
+            "$BG" --version | head -1
+          else
+            echo "::warning::clang 包里没有 bindgen"
           fi
 
       - name: 拉取 android17-6.18 源码
