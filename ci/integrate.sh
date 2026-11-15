@@ -36,6 +36,25 @@ sed -i "s|^KSU_VERSION_FULL := .*|KSU_VERSION_FULL := v${KSU_TAG}-${KSU_SHA}@shu
     "$SRC/drivers/kernelsu/Makefile"
 grep -n 'KSU_VERSION_FULL :=' "$SRC/drivers/kernelsu/Makefile"
 
+# built-in 时 Kbuild 用 $(srctree)/$(src) 拼 -I，kbuild 递归到子目录后这个相对
+# 路径解析不到 include/uapi/xxx.h（报 uapi/app_profile.h not found）。
+# 用 abspath 兜一条绝对路径，并把 include 情况打出来方便核对。
+cat >> "$SRC/drivers/kernelsu/Makefile" <<'EOF'
+
+# --- 本项目追加：built-in 的 -I 兜底 ---
+KSU_ABS := $(abspath $(srctree)/drivers/kernelsu)
+ccflags-y += -I$(KSU_ABS) -I$(KSU_ABS)/include
+$(info -- KSU include dirs: $(KSU_ABS) $(KSU_ABS)/include)
+EOF
+
+# KSU 源码里 #include "uapi/xxx.h" 是按 -I<根>/-I<根>/include 两种布局都能命中的
+# 写法；保险起见把 uapi 也在根下放一份，少一条路径依赖。
+if [ -d "$SRC/drivers/kernelsu/include/uapi" ]; then
+    cp -r "$SRC/drivers/kernelsu/include/uapi" "$SRC/drivers/kernelsu/uapi"
+    echo "    uapi 头文件已在 include/ 与根目录各放一份"
+fi
+ls "$SRC/drivers/kernelsu/uapi" 2>&1 | head -4
+
 # 挂进 drivers 的 Kconfig 与 Makefile（幂等）
 grep -q 'kernelsu/Kconfig' "$SRC/drivers/Kconfig" || \
     printf '\nsource "drivers/kernelsu/Kconfig"\n' >> "$SRC/drivers/Kconfig"
