@@ -72,12 +72,30 @@ jobs:
             echo "::warning::没拉到 AOSP rustc，CONFIG_RUST 会关，camera 大概率仍崩"
           fi
 
+          echo "LIBCLANG_PATH=$CL/lib" >> "$GITHUB_ENV"
+
           BG=$(ls -d "$CL"/bin/bindgen 2>/dev/null | head -1)
           if [ -n "$BG" ] && [ -x "$BG" ]; then
             echo "AOSP_BINDGEN=$BG" >> "$GITHUB_ENV"
             "$BG" --version | head -1
           else
-            echo "::warning::clang 包里没有 bindgen"
+            # clang 包里不带 bindgen，用 rustc 自带的 cargo 装一个。
+            # 版本对齐设备（CONFIG_BINDGEN_VERSION_TEXT="bindgen 0.72.1"），
+            # libclang 指向 AOSP clang，保证与 rustc 的 LLVM 一致。
+            echo "--- clang 包里没有 bindgen，用 cargo 装 ---"
+            CARGO=$(dirname "$RC")/cargo
+            if [ -x "$CARGO" ]; then
+              LIBCLANG_PATH="$CL/lib" "$CARGO" install bindgen-cli --version 0.72.1 \
+                --root /tmp/bg --quiet 2>&1 | tail -3 || true
+              if [ -x /tmp/bg/bin/bindgen ]; then
+                echo "AOSP_BINDGEN=/tmp/bg/bin/bindgen" >> "$GITHUB_ENV"
+                /tmp/bg/bin/bindgen --version | head -1
+              else
+                echo "::warning::bindgen 安装失败"
+              fi
+            else
+              echo "::warning::没找到 cargo"
+            fi
           fi
 
       - name: 拉取 android17-6.18 源码

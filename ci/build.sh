@@ -82,6 +82,10 @@ fi
 if [ -n "${AOSP_BINDGEN:-}" ] && [ -x "$AOSP_BINDGEN" ]; then
     export BINDGEN="$AOSP_BINDGEN"
 fi
+# bindgen 通过 libclang 解析头文件，必须指向 AOSP clang，否则版本不匹配
+if [ -n "${AOSP_CLANG:-}" ] && [ -d "$AOSP_CLANG/lib" ]; then
+    export LIBCLANG_PATH="$AOSP_CLANG/lib"
+fi
 echo "==> rust: rustc=${RUSTC:-<未设置>} bindgen=${BINDGEN:-<未设置>}"
 # setlocalversion 已被替换成固定输出，不再需要靠 LOCALVERSION 环境变量压制 -g<sha>-dirty；
 # 保留反而会干扰 Makefile 里 LOCALVERSION = $(CONFIG_LOCALVERSION) 的取值
