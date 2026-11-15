@@ -184,6 +184,14 @@ for k in KSU KSU_SUSFS MODULE_SCMVERSION RUST ASHMEM; do
     enable_cfg "$k" "$SRC/.config"
 done
 
+# 诊断开关：DIAG_NO_PANIC=1 时关掉 CONFIG_PANIC_ON_OOPS。
+# 默认配置下 oops 会立刻 panic 并重启，日志来不及落地；关掉后内核带伤活着，
+# 可以从 adb 把完整栈拉出来。只用于定位，不要用于交付。
+if [ "${DIAG_NO_PANIC:-0}" = "1" ]; then
+    echo "    !! 诊断模式：关闭 CONFIG_PANIC_ON_OOPS"
+    disable_cfg PANIC_ON_OOPS "$SRC/.config"
+fi
+
 # MODVERSIONS 必须保持 y。
 # 关掉它不只是"跳过 CRC 校验"，还会让 kernel/module/Makefile 里的
 #   obj-$(CONFIG_MODVERSIONS) += version.o
@@ -206,6 +214,10 @@ done
 
 make -C "$SRC" ARCH=arm64 LLVM="$LLVM_VAL" $RUST_ARGS olddefconfig
 
+if [ "${DIAG_NO_PANIC:-0}" = "1" ]; then
+    disable_cfg PANIC_ON_OOPS "$SRC/.config"
+fi
+
 # olddefconfig 不一定刷新 auto.conf，而 setlocalversion 与 modpost 认的都是 auto.conf。
 # 注意 auto.conf 是 make 语法，字符串值不带引号（.config 才带）。
 if [ -e "$SRC/include/config/auto.conf" ]; then
@@ -221,6 +233,9 @@ if [ -e "$SRC/include/config/auto.conf" ]; then
     for k in KSU KSU_SUSFS MODULE_SCMVERSION RUST ASHMEM; do
         enable_cfg "$k" "$SRC/include/config/auto.conf"
     done
+    if [ "${DIAG_NO_PANIC:-0}" = "1" ]; then
+        disable_cfg PANIC_ON_OOPS "$SRC/include/config/auto.conf"
+    fi
 
 fi
 rm -f "$SRC/include/config/kernel.release" "$SRC/include/generated/utsrelease.h"

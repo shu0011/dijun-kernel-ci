@@ -13,6 +13,9 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
+    env:
+      # 诊断构建：关掉 CONFIG_PANIC_ON_OOPS，崩溃后不重启，便于抓栈
+      DIAG_NO_PANIC: "1"
 
     steps:
       - uses: actions/checkout@v4
