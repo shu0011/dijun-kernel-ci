@@ -80,10 +80,17 @@ sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"-4k\"|" "$SRC/.config"
 sed -i "s|^# CONFIG_LOCALVERSION_AUTO is not set|CONFIG_LOCALVERSION_AUTO=y|" "$SRC/.config"
 sed -i "s|^CONFIG_LOCALVERSION_AUTO=.*|CONFIG_LOCALVERSION_AUTO=y|" "$SRC/.config"
 
-cat > "$SRC/scripts/setlocalversion" <<'SLV'
+# 关键：Makefile 里
+#   ifeq ($(origin KERNELRELEASE),file)
+#   filechk_kernel.release = $(srctree)/scripts/setlocalversion $(srctree)
+#   else
+#   filechk_kernel.release = echo $(KERNELRELEASE)
+# 第一次生成 kernel.release 后它就存在了，之后 KERNELRELEASE 的来源变成 file，
+# 内核**完全用这个脚本的输出**做 UTS_RELEASE，不再拼 KERNELVERSION 和
+# CONFIG_LOCALVERSION。所以这里必须给完整串。
+cat > "$SRC/scripts/setlocalversion" <<SLV
 #!/bin/sh
-# 固定输出，使 UTS_RELEASE 与设备逐字节一致
-echo "-android17-5-g284297031c53-abogki553682993"
+echo "6.18.${TARGET_SUBLEVEL}-android17-5-g284297031c53-abogki553682993-4k"
 exit 0
 SLV
 chmod +x "$SRC/scripts/setlocalversion"
