@@ -21,13 +21,20 @@ rm -rf "$SRC/drivers/kernelsu"
 mkdir -p "$SRC/drivers/kernelsu"
 cp -a /tmp/ksu-src/kernel/. "$SRC/drivers/kernelsu/"
 
-# 原 kernel/Makefile 是外部模块编译驱动（make -C $KDIR M=...），
-# built-in 要求子目录 Makefile 只列 obj；kernelsu-objs 的清单在 Kbuild 里。
+# 原 kernel/Makefile 是外部模块编译驱动（make -C $KDIR M=...），built-in 用不上。
+# Kbuild 里已经自带 "obj-$(CONFIG_KSU) += kernelsu.o" 和全部 kernelsu-objs 清单，
+# 直接把它当子目录 Makefile 即可 —— 再补一行 obj- 会导致 kernelsu.o 重复链接。
 rm -f "$SRC/drivers/kernelsu/Makefile"
-{
-    echo 'obj-$(CONFIG_KSU) += kernelsu.o'
-    cat /tmp/ksu-src/kernel/Kbuild
-} > "$SRC/drivers/kernelsu/Makefile"
+cp /tmp/ksu-src/kernel/Kbuild "$SRC/drivers/kernelsu/Makefile"
+
+# 版本串：Kbuild 靠 `cd $(KSU_SRC) && git rev-parse` 取 sha/branch，而拷进来的
+# 目录没有 .git，会降级成 v4.3.0-r2-SukiSU-Ultra-unknown@unknown。
+# 用 clone 时拿到的 sha 和用户要的 @shushu 直接写死。
+KSU_SHA=$(git -C /tmp/ksu-src rev-parse --short=8 HEAD)
+KSU_TAG="${KSU_REF#v}"
+sed -i "s|^KSU_VERSION_FULL := .*|KSU_VERSION_FULL := v${KSU_TAG}-${KSU_SHA}@shushu|" \
+    "$SRC/drivers/kernelsu/Makefile"
+grep -n 'KSU_VERSION_FULL :=' "$SRC/drivers/kernelsu/Makefile"
 
 # 挂进 drivers 的 Kconfig 与 Makefile（幂等）
 grep -q 'kernelsu/Kconfig' "$SRC/drivers/Kconfig" || \
