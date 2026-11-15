@@ -63,6 +63,13 @@ export KBUILD_BUILD_HOST="$BUILD_HOST"
 export KBUILD_BUILD_TIMESTAMP="$BUILD_TIMESTAMP"
 export KBUILD_BUILD_VERSION=1
 echo "==> 构建者信息: ${BUILD_USER}@${BUILD_HOST}  ${BUILD_TIMESTAMP}"
+
+# GKI 的 KMI 跨 sub-level 稳定，靠的就是 gendwarfksyms 的 --stable：
+# scripts/Makefile.build:198  $(if $(KBUILD_GENDWARFKSYMS_STABLE), --stable)
+# kleaf（AOSP 官方构建，设备内核和作者都用它）默认传这个标志，裸 make 不会。
+# 不开的话 CRC 会绑定实现细节（函数体、内联、编译顺序等），跨版本一变就不同，
+# 厂商 .ko 全部拒载。开了之后只按稳定类型信息算，才和设备的 __versions 对得上。
+export KBUILD_GENDWARFKSYMS_STABLE=1
 # setlocalversion 已被替换成固定输出，不再需要靠 LOCALVERSION 环境变量压制 -g<sha>-dirty；
 # 保留反而会干扰 Makefile 里 LOCALVERSION = $(CONFIG_LOCALVERSION) 的取值
 
