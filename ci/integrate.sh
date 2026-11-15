@@ -448,7 +448,11 @@ assert anchor not in t, "G6 handle 已存在"
 mount = "\tLSM_HOOK_INIT(inode_setxattr, selinux_inode_setxattr),"
 assert t.count(mount) == 1, f"inode_setxattr 挂载点没匹配上: {t.count(mount)}"
 
-handle = r"""extern int ksu_backup_inode_setxattr(void *idmap, struct dentry *dentry, const char *name,
+handle = r"""/* G6: hooks.c 未直接 include linux/version.h，这里显式补上，
+   否则下面的 LINUX_VERSION_CODE/KERNEL_VERSION 在 -Werror,-Wundef 下报未定义 */
+#include <linux/version.h>
+
+extern int ksu_backup_inode_setxattr(void *idmap, struct dentry *dentry, const char *name,
                                       const void *value, size_t size, int flags);
 
 /* G6: app-uid 写 security.selinux 时走官方 #3996 live-parse 修复；
