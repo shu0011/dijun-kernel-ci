@@ -133,7 +133,7 @@ patch = needle + """
        这里不能再去改 const 的 write_op[]，否则 built-in 下写坏只读页 → 开机崩溃。
        只保留 backup sepolicy 与 fake status，running 由 feature_set 置位。 */
     ksu_selinux_hide_keep_backup = true;
-    pr_info("selinux_hide: CONFIG_KSU_SUSFS=y, skip runtime hooks (compile-time wrappers)\n");
+    pr_info("selinux_hide: CONFIG_KSU_SUSFS=y, skip runtime hooks (compile-time wrappers)\\n");
     return 0;
 #endif
 """
