@@ -95,13 +95,23 @@ jobs:
             # clang 包里不带 bindgen，rustc 1.91.1-dev 又编不过老 crate
             # （memchr 报错），逐个降版本试，最后用 apt 兜底。
             CARGO=$(dirname "$RC")/cargo
+            # bindgen 与编内核的 rustc 是解耦的：bindgen 只是个独立二进制，
+            # 用哪个 rustc 编都行。而 AOSP 的 1.91.1-dev 太新，bindgen 0.72.1
+            # 锁定的老 crate（libc / version-check / unicode-ident）编不过；
+            # 0.71.0 虽然能编，但生成的 blk_mq_tag_set 变成 opaque，Rust 侧报
+            # "has no field named ops"。所以用 rustup 装个老 rustc 来编 bindgen。
             if [ -x "$CARGO" ]; then
-              for v in 0.72.1 0.71.0 0.69.5; do
-                echo "--- 尝试 bindgen $v ---"
-                LIBCLANG_PATH="$CL/lib" "$CARGO" install bindgen-cli \
-                  --version "$v" --locked --root /tmp/bg 2>&1 | tail -6 || true
-                [ -x /tmp/bg/bin/bindgen ] && break
-              done
+              LIBCLANG_PATH="$CL/lib" "$CARGO" install bindgen-cli --version 0.72.1 \
+                --locked --root /tmp/bg 2>&1 | tail -4 || true
+            fi
+            if [ ! -x /tmp/bg/bin/bindgen ]; then
+              echo "--- 用 rustup 1.78 编 bindgen 0.72.1 ---"
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --default-toolchain 1.78.0 --profile minimal 2>&1 | tail -3 || true
+              if [ -x "$HOME/.cargo/bin/cargo" ]; then
+                LIBCLANG_PATH="$CL/lib" "$HOME/.cargo/bin/cargo" install bindgen-cli \
+                  --version 0.72.1 --locked --root /tmp/bg 2>&1 | tail -5 || true
+              fi
             fi
             if [ ! -x /tmp/bg/bin/bindgen ]; then
               echo "--- 回落 apt ---"
