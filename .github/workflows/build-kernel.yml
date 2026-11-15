@@ -45,15 +45,32 @@ jobs:
           repo init -u https://android.googlesource.com/kernel/manifest \
                     -b common-android17-6.18-2026-06 --depth=1 --no-repo-verify -q
           repo sync -c -j4 --no-tags --no-clone-bundle -q \
-                    platform/prebuilts/clang/host/linux-x86 \
-                    platform/prebuilts/rust || true
+                    platform/prebuilts/clang/host/linux-x86 || true
+
           # ASHMEM 的 Kconfig 是 "depends on SHMEM && RUST"，设备开了 RUST=y。
-          # 不装 rust 工具链 → CONFIG_RUST 被旧 defconfig 丢掉 → ASHMEM 跟着没 → 
-          # camera 的 AshMemManager 拿到 NULL 在 memset 里崩。
-          RC=$(ls -d /tmp/ws/prebuilts/rust/linux-x86/*/bin/rustc 2>/dev/null | sort -V | tail -1)
+          # 缺 rust 工具链 → CONFIG_RUST 被丢 → ASHMEM 跟着没 → camera 的
+          # AshMemManager 拿到 NULL 在 memset 里崩。
+          # kernel/manifest 里没有 rust 项目，单独 clone；rustc 的 LLVM 必须与
+          # clang 同版本（CONFIG_RUSTC_CLANG_LLVM_COMPATIBLE），所以只能用 AOSP 那份。
+          git clone --depth=1 --filter=blob:none --sparse \
+                    https://android.googlesource.com/platform/prebuilts/rust /tmp/arust 2>/dev/null || \
+            git clone --depth=1 --sparse \
+                    https://android.googlesource.com/platform/prebuilts/rust /tmp/arust 2>/dev/null || true
+          if [ -d /tmp/arust/.git ]; then
+            cd /tmp/arust
+            # 设备用 rustc 1.91.1（CONFIG_RUSTC_VERSION=109101），只取这个版本；
+            # 目录名对不上就退回全量
+            git sparse-checkout set linux-x86/1.91.1 2>/dev/null || \
+              git sparse-checkout set linux-x86 2>/dev/null || true
+            echo "--- 可用 rust 版本 ---"
+            ls linux-x86/ 2>/dev/null | head -12
+          fi
+          RC=$(ls -d /tmp/arust/linux-x86/*/bin/rustc 2>/dev/null | sort -V | tail -1)
           if [ -n "$RC" ]; then
             echo "AOSP_RUSTC=$RC" >> "$GITHUB_ENV"
             "$RC" --version
+          else
+            echo "::warning::没拉到 AOSP rust，CONFIG_RUST 会被关闭（camera 大概率仍崩）"
           fi
           BG=$(ls -d /tmp/ws/prebuilts/clang/host/linux-x86/clang-r*/bin/bindgen 2>/dev/null | sort -V | tail -1)
           [ -n "$BG" ] && echo "AOSP_BINDGEN=$BG" >> "$GITHUB_ENV" && "$BG" --version
