@@ -13,7 +13,9 @@
 #            等七处，先让系统能起来再切
 set -euo pipefail
 
-SRC="${SRC:-kernel}"
+# 必须转成绝对路径：下面会 cd "$SRC"，之后再拿相对路径拼 "$SRC/drivers/..."
+# 就会变成 kernel/kernel/drivers/...，symlink 检查全部落空。
+SRC="$(cd "${SRC:-kernel}" && pwd)"
 KSU_BRANCH="${KSU_BRANCH:-main}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
