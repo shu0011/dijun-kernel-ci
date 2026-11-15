@@ -37,6 +37,12 @@ jobs:
           set -o pipefail
           bash ci/fetch-kernel.sh 2>&1 | tee kernel-fetch.log
 
+      - name: 集成 SukiSU(built-in) + SUSFS SELinux 隐藏
+        run: |
+          set -o pipefail
+          mkdir -p out
+          bash ci/integrate.sh 2>&1 | tee out/integrate.log
+
       - name: 编译 Image 并抽取 BTF
         run: |
           set -o pipefail

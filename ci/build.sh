@@ -92,6 +92,24 @@ drop_kleaf_file_dep() {
 echo "    处理 kleaf 专属文件依赖"
 drop_kleaf_file_dep "$SRC/.config"
 
+# 打开 KernelSU(built-in) 与 SUSFS 的 SELinux 隐藏。
+# Kconfig 定义由 ci/integrate.sh 注入，所以这一步必须排在它之后。
+enable_cfg() {
+    local k="$1" f="$2"
+    [ -e "$f" ] || return 0
+    if grep -q "^# CONFIG_${k} is not set" "$f"; then
+        sed -i "s|^# CONFIG_${k} is not set|CONFIG_${k}=y|" "$f"
+    elif grep -q "^CONFIG_${k}=" "$f"; then
+        sed -i "s|^CONFIG_${k}=.*|CONFIG_${k}=y|" "$f"
+    else
+        echo "CONFIG_${k}=y" >> "$f"
+    fi
+}
+for k in KSU KSU_SUSFS; do
+    enable_cfg "$k" "$SRC/.config"
+done
+grep -E '^CONFIG_(KSU|KSU_SUSFS)=' "$SRC/.config" || echo "    !! KSU 没打开"
+
 # 顺手把 config 里所有「指向源码树内某个不存在文件」的字符串项列出来。
 # 这类条目都是 kleaf 构建时才有的生成物，缺一个就可能在编译末尾报
 # "No rule to make target"，早暴露总比等半小时好。
@@ -113,6 +131,9 @@ if [ -e "$SRC/include/config/auto.conf" ]; then
     sed -i "s|^CONFIG_LOCALVERSION_AUTO=.*|# CONFIG_LOCALVERSION_AUTO is not set|" \
         "$SRC/include/config/auto.conf"
     drop_kleaf_file_dep "$SRC/include/config/auto.conf"
+    for k in KSU KSU_SUSFS; do
+        enable_cfg "$k" "$SRC/include/config/auto.conf"
+    done
 fi
 rm -f "$SRC/include/config/kernel.release" "$SRC/include/generated/utsrelease.h"
 
