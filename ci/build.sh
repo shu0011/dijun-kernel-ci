@@ -27,6 +27,12 @@ LLVM_SUFFIX="${LLVM_SUFFIX:--18}"
 # 只有 ubuntu 的 clang-18 时要用 LLVM=-18 走带后缀的工具链。
 # AOSP 预编译 clang 自带这些名字，用 LLVM=1 才能让 POR_EL0 之类的
 # 编译器能力探测通过（决定 CONFIG_ARM64_POE 等 config）。
+# AOSP 预编译 clang 由 workflow 拉到 $AOSP_CLANG，优先用它：
+# 设备内核就是 r584948c 编的，同版本编译器才能算出同样的 DWARF → 同样的符号 CRC。
+if [ -n "${AOSP_CLANG:-}" ] && [ -x "$AOSP_CLANG/bin/clang" ]; then
+    export PATH="$AOSP_CLANG/bin:$PATH"
+fi
+
 LLVM_VAL="${LLVM_VAL:-}"
 if [ -z "$LLVM_VAL" ]; then
     if clang --version 2>/dev/null | grep -q "Android"; then

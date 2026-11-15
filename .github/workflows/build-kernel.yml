@@ -32,6 +32,28 @@ jobs:
           ls -la /usr/include/dwarf.h /usr/include/openssl/opensslv.h
           clang-18 --version | head -1
 
+      - name: 准备 AOSP prebuilt clang
+        run: |
+          set -euo pipefail
+          # CRC 由 gendwarfksyms 按 DWARF 类型信息算，编译器版本不同结果就不同。
+          # 设备是 AOSP clang r584948c（22.0.1），Ubuntu clang-18 算出的
+          # module_layout CRC 与厂商 .ko 的 __versions 对不上，.ko 全被拒载。
+          # 用 kernel/manifest 的 repo 拉 prebuilts/clang，和作者工作流同一条路。
+          curl -sL -o /usr/local/bin/repo https://storage.googleapis.com/git-repo-downloads/repo
+          chmod +x /usr/local/bin/repo
+          mkdir -p /tmp/ws && cd /tmp/ws
+          repo init -u https://android.googlesource.com/kernel/manifest \
+                    -b common-android17-6.18-2026-06 --depth=1 --no-repo-verify -q
+          repo sync -c -j4 --no-tags --no-clone-bundle -q \
+                    platform/prebuilts/clang/host/linux-x86 || true
+          CL=$(ls -d /tmp/ws/prebuilts/clang/host/linux-x86/clang-r* 2>/dev/null | sort -V | tail -1)
+          if [ -n "$CL" ] && [ -x "$CL/bin/clang" ]; then
+            echo "AOSP_CLANG=$CL" >> "$GITHUB_ENV"
+            "$CL/bin/clang" --version | head -1
+          else
+            echo "::warning::没拉到 AOSP clang，回落系统 clang-18（CRC 大概率仍然对不上）"
+          fi
+
       - name: 拉取 android17-6.18 源码
         run: |
           set -o pipefail
