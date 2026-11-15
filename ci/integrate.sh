@@ -1,85 +1,69 @@
 #!/usr/bin/env bash
-# 把 SukiSU（built-in，不是 LKM）和 SUSFS 的 SELinux 隐藏合进内核源码树。
+# 集成 SukiSU + SUSFS 的 SELinux 隐藏。
 #
-# 为什么 built-in：
-#   LKM 形态下模块改不了 security/selinux/ 的源码，只能用 kprobe 挂钩，
-#   会留下 /sys/kernel/debug/kprobes/list 痕迹。编进 Image 后这些补丁是
-#   直接改函数体，一个 kprobe 都不用。
+# KSU 部分严格按官方指南来（docs/guide/how-to-integrate.md）：
+#   curl -LSs .../kernel/setup.sh | bash -s <branch>
+# 官方脚本负责 clone、链到 drivers/kernelsu、改 drivers/Makefile 与 drivers/Kconfig。
+# 之前手写这套搬运，在 symlink、obj- 重复、版本串上连踩三个坑，没必要重复。
+#
+# 分支：
+#   main     kprobe/kretprobe + sys_enter tracepoint 运行时注册（built-in 也照注册）
+#   builtin  不注册 kprobe，需在内核源码手动调用 hook 入口 —— 想让
+#            kprobes/list 彻底干净必须用它，但要改 execveat/faccessat/stat/read
+#            等七处，先让系统能起来再切
 set -euo pipefail
 
 SRC="${SRC:-kernel}"
-KSU_REPO="${KSU_REPO:-https://github.com/SukiSU-Ultra/SukiSU-Ultra}"
-KSU_REF="${KSU_REF:-v4.3.0-r2}"
+KSU_BRANCH="${KSU_BRANCH:-main}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-echo "==> A 拉取 SukiSU $KSU_REF"
-rm -rf /tmp/ksu-src
-git clone --depth=1 --branch "$KSU_REF" "$KSU_REPO" /tmp/ksu-src
+echo "==> A 按官方指南集成 KernelSU（分支 $KSU_BRANCH）"
+cd "$SRC"
+curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+    | bash -s "$KSU_BRANCH"
 
-echo "==> B 装到 drivers/kernelsu（built-in）"
-rm -rf "$SRC/drivers/kernelsu"
-mkdir -p "$SRC/drivers/kernelsu"
-# 注意 kernel/include/uapi 在仓库里是 symlink（指向根目录的 uapi/），
-# cp -a 会把这个链接原样拷过来，进了内核树就指向一个不存在的相对路径。
-# 必须用 -L 解引用。
-cp -aL /tmp/ksu-src/kernel/. "$SRC/drivers/kernelsu/"
-
-# 原 kernel/Makefile 是外部模块编译驱动（make -C $KDIR M=...），built-in 用不上。
-# Kbuild 里已经自带 "obj-$(CONFIG_KSU) += kernelsu.o" 和全部 kernelsu-objs 清单，
-# 直接把它当子目录 Makefile 即可 —— 再补一行 obj- 会导致 kernelsu.o 重复链接。
-rm -f "$SRC/drivers/kernelsu/Makefile"
-cp /tmp/ksu-src/kernel/Kbuild "$SRC/drivers/kernelsu/Makefile"
-
-# 版本串：Kbuild 靠 `cd $(KSU_SRC) && git rev-parse` 取 sha/branch，而拷进来的
-# 目录没有 .git，会降级成 v4.3.0-r2-SukiSU-Ultra-unknown@unknown。
-# 用 clone 时拿到的 sha 和用户要的 @shushu 直接写死。
-KSU_SHA=$(git -C /tmp/ksu-src rev-parse --short=8 HEAD)
-KSU_TAG="${KSU_REF#v}"
-sed -i "s|^KSU_VERSION_FULL := .*|KSU_VERSION_FULL := v${KSU_TAG}-${KSU_SHA}@shushu|" \
-    "$SRC/drivers/kernelsu/Makefile"
-grep -n 'KSU_VERSION_FULL :=' "$SRC/drivers/kernelsu/Makefile"
-
-# built-in 时 Kbuild 用 $(srctree)/$(src) 拼 -I，kbuild 递归到子目录后这个相对
-# 路径解析不到 include/uapi/xxx.h（报 uapi/app_profile.h not found）。
-# 用 abspath 兜一条绝对路径，并把 include 情况打出来方便核对。
-cat >> "$SRC/drivers/kernelsu/Makefile" <<'EOF'
-
-# --- 本项目追加：built-in 的 -I 兜底 ---
-KSU_ABS := $(abspath $(srctree)/drivers/kernelsu)
-ccflags-y += -I$(KSU_ABS) -I$(KSU_ABS)/include
-$(info -- KSU include dirs: $(KSU_ABS) $(KSU_ABS)/include)
-EOF
-
-# KSU 源码里 #include "uapi/xxx.h" 是按 -I<根>/-I<根>/include 两种布局都能命中的
-# 写法；保险起见把 uapi 也在根下放一份，少一条路径依赖。
-if [ -d "$SRC/drivers/kernelsu/include/uapi" ]; then
-    cp -r "$SRC/drivers/kernelsu/include/uapi" "$SRC/drivers/kernelsu/uapi"
-    echo "    uapi 头文件已在 include/ 与根目录各放一份"
+echo "==> B symlink 换成实目录"
+# setup.sh 用 ln -s 链过去。打 SUSFS 补丁会污染上游仓库，而且 kbuild 在
+# symlink 下解析 $(src) 容易出岔子，换成实拷贝。
+if [ -L "$SRC/drivers/kernelsu" ]; then
+    target=$(readlink -f "$SRC/drivers/kernelsu")
+    rm -f "$SRC/drivers/kernelsu"
+    cp -aL "$target" "$SRC/drivers/kernelsu"
+    echo "    $target -> drivers/kernelsu"
 fi
-{ ls "$SRC/drivers/kernelsu/include/uapi" 2>&1 || true; } | head -4
-
-# 挂进 drivers 的 Kconfig 与 Makefile（幂等）
-grep -q 'kernelsu/Kconfig' "$SRC/drivers/Kconfig" || \
-    printf '\nsource "drivers/kernelsu/Kconfig"\n' >> "$SRC/drivers/Kconfig"
-grep -q 'kernelsu/' "$SRC/drivers/Makefile" || \
-    printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> "$SRC/drivers/Makefile"
+[ -d "$SRC/drivers/kernelsu" ] || { echo "!! drivers/kernelsu 不存在"; exit 1; }
 
 echo "==> C 注册 CONFIG_KSU_SUSFS"
-if ! grep -q '^config KSU_SUSFS' "$SRC/drivers/kernelsu/Kconfig"; then
-    cat >> "$SRC/drivers/kernelsu/Kconfig" <<'EOF'
-
+# 上游没有 SUSFS 开关，补一个。放 drivers/Kconfig 而非 kernelsu 的 Kconfig，
+# 让 KSU 目录保持与上游一致，方便日后 diff。
+python3 - "$SRC/drivers/Kconfig" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if 'config KSU_SUSFS' in s:
+    print("    已存在，跳过")
+    sys.exit(0)
+block = """
 config KSU_SUSFS
 	bool "SUSFS (SELinux hiding only)"
 	depends on KSU
-	default n
+	default y
 	help
-	  SUSFS 的 SELinux 隐藏部分：伪造 getenforce 的返回值、拦截
-	  /sys/fs/selinux 的读写路径、过滤 AVC 日志里的 ksu 痕迹。
-	  不含 sus_path / sus_mount / open_redirect 这些必须改 VFS 的功能。
-EOF
-fi
+	  SUSFS 的 SELinux 隐藏：伪造 getenforce 返回值、拦截 /sys/fs/selinux
+	  读写路径、过滤 AVC 日志里的 ksu 痕迹。不含 sus_path / sus_mount /
+	  open_redirect 这些必须改 VFS 的功能。
 
-echo "==> D 合 SUSFS 的 SELinux 补丁（5 个文件 / 134 行上下文已验证可套）"
+"""
+i = s.rfind("endmenu")
+if i < 0:
+    s = s + block
+else:
+    s = s[:i] + block + s[i:]
+open(p, "w").write(s)
+print("    KSU_SUSFS 已插入 drivers/Kconfig 的 endmenu 之前")
+PYEOF
+
+echo "==> D 合 SUSFS 的 SELinux 补丁"
 patch -p1 -d "$SRC" --forward < "$HERE/patches/susfs-selinux.patch"
 
 echo "==> E 加桥接层"
@@ -88,10 +72,9 @@ grep -q 'susfs_bridge' "$SRC/fs/Makefile" || \
     printf '\nobj-$(CONFIG_KSU_SUSFS) += susfs_bridge.o\n' >> "$SRC/fs/Makefile"
 
 echo "==> F 导出 KSU selinux_hide 的状态符号"
-# SUSFS 的 hooks.c 补丁要读 KSU 自己那套 selinux hide 的状态：
+# SUSFS 的 hooks.c 补丁要读：
 #   extern bool ksu_selinux_hide_running __read_mostly;
-# 但在 KSU 里这几个都是 static，链接时才会报 undefined symbol。
-# 去 static 让它们成为全局，函数补原型满足 -Wmissing-prototypes。
+# 这几个在 KSU 里是 static，编译期各文件互不干扰，链接时才报 undefined。
 SH="$SRC/drivers/kernelsu/feature/selinux_hide.c"
 python3 - "$SH" <<'PYEOF'
 import sys
@@ -112,10 +95,19 @@ for old, new in subs:
         sys.exit("selinux_hide.c 里找不到: " + old)
     s = s.replace(old, new, 1)
 open(p, "w").write(s)
-print("    已导出 ksu_selinux_hide_running / fake_status / initialize_fake_status / fake_status_initialize_key")
+print("    已导出 4 个符号")
 PYEOF
 
-echo "==> G 集成完成"
-grep -c 'CONFIG_KSU_SUSFS' "$SRC/security/selinux/status.c" "$SRC/security/selinux/avc.c" \
-     "$SRC/security/selinux/hooks.c" "$SRC/security/selinux/selinuxfs.c" \
-     "$SRC/security/selinux/ss/services.c" || true
+echo "==> G 固定 KSU 版本串"
+# Kbuild 里 KSU_VERSION_FULL 靠 git describe 拼，分支名会是 main。
+# 用户要 @shushu，直接写死；sha 和 tag 从 setup.sh 克隆的仓库里读。
+KSU_SHA=$(git -C "$SRC/KernelSU" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
+KSU_TAG=$(git -C "$SRC/KernelSU" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)
+[ -n "${KSU_TAG:-}" ] || KSU_TAG=4.3.0
+sed -i "s|^KSU_VERSION_FULL := .*|KSU_VERSION_FULL := v${KSU_TAG}-${KSU_SHA}@shushu|" \
+    "$SRC/drivers/kernelsu/Kbuild"
+grep -n 'KSU_VERSION_FULL :=' "$SRC/drivers/kernelsu/Kbuild"
+
+echo "==> H 集成完成"
+echo "    KSU 分支配置文件: $(ls "$SRC/drivers/kernelsu"/Kbuild "$SRC/drivers/kernelsu"/Makefile 2>/dev/null | tr '\n' ' ')"
+echo "    SELinux 补丁命中: $(grep -c 'CONFIG_KSU_SUSFS' "$SRC/security/selinux/status.c" 2>/dev/null || echo 0) 处 status.c"
