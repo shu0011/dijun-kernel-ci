@@ -21,6 +21,24 @@ FALLBACK="${FALLBACK:-https://github.com/aosp-mirror/kernel_common.git}"
 
 rm -rf "$DEST"
 
+# 优先用 repo + kernel/manifest，与作者的构建方式完全一致。
+# manifest 分支（common-android17-6.18-2026-06）里写的 kernel/common revision
+# 与直接 clone 分支 HEAD 可能不是同一个 commit —— 如果不同，编出来的
+# struct module 等类型虽然 sizeof 一致，gendwarfksyms 算出的 CRC 却不一样。
+fetch_by_repo() {
+    command -v repo >/dev/null 2>&1 || return 1
+    local work=/tmp/ksrc-ws
+    rm -rf "$work"; mkdir -p "$work"; cd "$work" || return 1
+    repo init -u https://android.googlesource.com/kernel/manifest \
+              -b "common-${BRANCH}" --depth=1 --no-repo-verify -q 2>/dev/null || return 1
+    repo sync -c -j4 --no-tags --no-clone-bundle -q common 2>/dev/null || return 1
+    [ -d "$work/common" ] || return 1
+    mv "$work/common" "$OLDPWD/$DEST"
+    cd "$OLDPWD" || return 1
+    echo "==> repo 拉取完成，commit $(git -C "$DEST" rev-parse --short HEAD 2>/dev/null)"
+    return 0
+}
+
 clone() {
     echo "==> clone $1 ($BRANCH)"
     # googlesource 偶尔在 "Updating files" 阶段断掉（实测 43% 处），重试即可
@@ -35,7 +53,11 @@ clone() {
     return 1
 }
 
-if ! clone "$PRIMARY"; then
+if fetch_by_repo; then
+    :
+elif clone "$PRIMARY"; then
+    :
+else
     echo "==> 主源失败，改用镜像"
     rm -rf "$DEST"
     clone "$FALLBACK"
