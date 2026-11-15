@@ -95,8 +95,22 @@ jobs:
               sudo apt-get install -y bindgen 2>&1 | tail -3 || true
             fi
             if [ -x /tmp/bg/bin/bindgen ]; then
+              # bindgen 0.71 的 --version 不被识别（被当成位置参数 HEADER），
+              # 而内核 scripts/rust_is_available.sh 正是靠解析 `bindgen --version`
+              # 的输出拿版本号，直接把这一行变成致命错误。包一层 wrapper：
+              # --version 吐固定串，其余参数原样透传。
+              BV=$(/tmp/bg/bin/bindgen --version 2>/dev/null | head -1 || true)
+              case "$BV" in
+                bindgen*) : ;;
+                *)
+                  mv /tmp/bg/bin/bindgen /tmp/bg/bin/bindgen.real
+                  printf '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "bindgen 0.71.0"; exit 0; fi\nexec "$(dirname "$0")/bindgen.real" "$@"\n' > /tmp/bg/bin/bindgen
+                  chmod +x /tmp/bg/bin/bindgen
+                  echo "    已包 wrapper 处理 --version"
+                  ;;
+              esac
               echo "AOSP_BINDGEN=/tmp/bg/bin/bindgen" >> "$GITHUB_ENV"
-              /tmp/bg/bin/bindgen --version | head -1
+              /tmp/bg/bin/bindgen --version || true
             elif command -v bindgen >/dev/null 2>&1; then
               echo "AOSP_BINDGEN=$(command -v bindgen)" >> "$GITHUB_ENV"
               bindgen --version | head -1
