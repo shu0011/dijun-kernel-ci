@@ -57,8 +57,8 @@ export KBUILD_BUILD_HOST="$BUILD_HOST"
 export KBUILD_BUILD_TIMESTAMP="$BUILD_TIMESTAMP"
 export KBUILD_BUILD_VERSION=1
 echo "==> 构建者信息: ${BUILD_USER}@${BUILD_HOST}  ${BUILD_TIMESTAMP}"
-# 显式设为空串（"已设置"状态），setlocalversion 才不会追加 -g<sha>-dirty
-export LOCALVERSION=""
+# setlocalversion 已被替换成固定输出，不再需要靠 LOCALVERSION 环境变量压制 -g<sha>-dirty；
+# 保留反而会干扰 Makefile 里 LOCALVERSION = $(CONFIG_LOCALVERSION) 的取值
 
 echo "==> 1 用设备 config 生成 .config"
 cp "$CFG" "$SRC/arch/arm64/configs/dijun_defconfig"
@@ -67,8 +67,26 @@ make -C "$SRC" ARCH=arm64 LLVM="$LLVM_VAL" dijun_defconfig
 echo "==> 2 对齐版本字符串 -> $TARGET_RELEASE"
 # SUBLEVEL 来自顶 Makefile；值以 '-' 开头，不能用 scripts/config（会被 getopt 当选项）
 sed -i "s/^SUBLEVEL = .*/SUBLEVEL = $TARGET_SUBLEVEL/" "$SRC/Makefile"
-sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"$TARGET_LOCALVERSION\"|" "$SRC/.config"
-sed -i "s|^CONFIG_LOCALVERSION_AUTO=.*|# CONFIG_LOCALVERSION_AUTO is not set|" "$SRC/.config"
+
+# 版本串拆成两段拼，和设备一致：
+#   UTS_RELEASE = 6.18.21 + (setlocalversion 输出) + CONFIG_LOCALVERSION
+#   设备 = 6.18.21 + "-android17-5-g284297031c53-abogki553682993" + "-4k"
+# 之前图省事把整串塞进 CONFIG_LOCALVERSION 并关掉 LOCALVERSION_AUTO，
+# 结果 CONFIG_MODULE_SCMVERSION（depends on LOCALVERSION_AUTO）被连带关掉，
+# struct module 少了 scmversion[64]，布局差 64 字节，module_layout 的 CRC
+# 跟着变 —— 厂商 .ko 全部 "disagrees about version of symbol module_layout"。
+# 现在保持 LOCALVERSION_AUTO=y、LOCALVERSION 只放 -4k，改 setlocalversion 伪造前半段。
+sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"-4k\"|" "$SRC/.config"
+sed -i "s|^# CONFIG_LOCALVERSION_AUTO is not set|CONFIG_LOCALVERSION_AUTO=y|" "$SRC/.config"
+sed -i "s|^CONFIG_LOCALVERSION_AUTO=.*|CONFIG_LOCALVERSION_AUTO=y|" "$SRC/.config"
+
+cat > "$SRC/scripts/setlocalversion" <<'SLV'
+#!/bin/sh
+# 固定输出，使 UTS_RELEASE 与设备逐字节一致
+echo "-android17-5-g284297031c53-abogki553682993"
+exit 0
+SLV
+chmod +x "$SRC/scripts/setlocalversion"
 
 # 设备 config 里有两个指向 kleaf 生成物的条目，AOSP 源码树里没有：
 #   CONFIG_UNUSED_KSYMS_WHITELIST="abi_symbollist.raw"
@@ -113,7 +131,7 @@ disable_cfg() {
     fi
 }
 
-for k in KSU KSU_SUSFS; do
+for k in KSU KSU_SUSFS MODULE_SCMVERSION; do
     enable_cfg "$k" "$SRC/.config"
 done
 
@@ -147,7 +165,7 @@ if [ -e "$SRC/include/config/auto.conf" ]; then
     sed -i "s|^CONFIG_LOCALVERSION_AUTO=.*|# CONFIG_LOCALVERSION_AUTO is not set|" \
         "$SRC/include/config/auto.conf"
     drop_kleaf_file_dep "$SRC/include/config/auto.conf"
-    for k in KSU KSU_SUSFS; do
+    for k in KSU KSU_SUSFS MODULE_SCMVERSION; do
         enable_cfg "$k" "$SRC/include/config/auto.conf"
     done
 
