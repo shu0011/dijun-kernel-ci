@@ -1,67 +1,117 @@
-# dijun 内核 CI 构建（GitHub Actions）
+# dijun 内核（小米 15S Pro / 玄戒 O1 / android17-6.18）
 
-> 目标设备：小米 15S Pro（dijun），OS4.0.4.0.XODCNXM
-> 原厂内核：`6.18.21-android17-5-g284297031c53-abogki553682993-4k`（KMI android17-6.18）
+> 设备：小米 15S Pro（`dijun`），HyperOS OS4.0.5.0，玄戒 O1
+> 内核基线：`6.18.21-android17-5-g284297031c53-abogki553682993-4k`（GKI / KMI `android17-6.18`）
+> 当前状态：**built-in SukiSU + SELinux 隐藏已上机验证通过**，AK3 公测包见 Releases
 
-## 这个仓库干什么
+本仓库用 GitHub Actions 复现整套构建：AOSP `android17-6.18` 源码 + 设备原厂 `boot.img` 抽出的 config，
+编译出可直接刷入 `boot` 分区、内置 SukiSU Ultra 与 SELinux 隐藏的内核。
+`init_boot` 保持**官方原版**，不注入 LKM —— 这样不会有两套 KSU 互相抢 `su`。
 
-在 Linux runner 上编译 `android17-6.18` 内核，用**从设备原厂 `boot.img` 里抽出来的 config**，
-然后把编出来的 `.BTF` 和**同一份原厂 Image 里抠出来的 BTF** 逐类型比对。
+## 当前实现的功能
 
-**这一步不加 SUSFS。** 它只回答一个问题：这棵树 + 这份 config，能不能长出与设备同 ABI 的内核。
-对上了才谈移植；对不上说明源码版本差太多，及时止损。
-
-## 为什么必须在 Linux 上编
-
-macOS 上缺三样**必需**的东西，而且都不能用替身糊过去：
-
-| 缺什么 | 谁要它 | 为什么不能绕 |
-|---|---|---|
-| `libdwarf`（`dwarf.h`） | `scripts/gendwarfksyms` | 它决定导出符号的 **CRC**；CRC 不一致，厂商那几十个 `.ko` 全部拒绝加载 |
-| OpenSSL 头 | `scripts/sign-file` | 模块签名链，`CONFIG_MODULE_SIG_PROTECT` 带白名单 |
-| GNU sed | `scripts/headers_install.sh` | BSD sed 不支持嵌套地址块 |
-
-顺带 macOS 还缺 `elf.h`、`endian.h`，且自带 GNU Make 只有 3.81（内核要 ≥4.0）。
-这些在 Ubuntu 上 `apt install` 一行就齐。
-
-## 产物
-
-`out/` 里：
-
-| 文件 | 说明 |
+| 能力 | 说明 |
 |---|---|
-| `Image` | 编出来的 arm64 内核（**还不能刷**，见下） |
-| `vmlinux.btf` | 从 vmlinux 抽出的 BTF，比对用 |
-| `System.map` / `config.built` | 符号表与实际生效的 config |
-| `btf-report.json` | 与设备 BTF 的逐类型比对结果 |
-| `summary.txt` | 提交号、release 串、Image 大小与 sha256 |
-| `build.log` | 完整构建日志 |
+| 可复现 GKI 构建 | AOSP 源码 `284297031c53`；`KBUILD_GENDWARFKSYMS_STABLE=1` 让导出符号 CRC 与厂商 `.ko` 对齐（`module_layout = 0x60801db3`，18187 个导出符号，vermagic 与原厂一致） |
+| AOSP 工具链 | 预编译 clang / rustc / bindgen 0.72.1；开启 `CONFIG_RUST=y` + `CONFIG_ASHMEM=y`，否则 camera HAL 初始化会崩 |
+| SukiSU Ultra built-in | 按官方 `kernel/setup.sh` 集成到 `drivers/kernelsu`，分支 `main`，版本 `41185` / `v4.3.0-r2-bd9a894e@shushu`；管理器与 `ksud` 可用 |
+| SELinux 隐藏（完整生效） | 见下节；**检测软件已通过**，`ksud feature get 4` = enabled，开机无重启 |
+| 零运行期 patch / 零 kprobe | 不写只读的 `write_op[]`，不挂 `selinux_hide` 相关 kprobe，隐藏全部走编译期钩子 |
+| boot 打包 | 官方 4096 B header（改 `kernel_size`）+ 自编 `Image` + 官方 vbmeta(2368 B) + 零填充 + 原 64 B AVB footer；总长不变，已多次上机验证 |
+| CI / Release | Actions 自动构建并产出 `Image`、`System.map`、`config.built`、`vmlinux.symvers`、`summary.txt`、完整日志；AK3 包在 Releases 发布 |
 
-## 判读结果
+### SELinux 隐藏是怎么打通的
 
-打开 Actions 的 run 摘要，看这一行：
+上游 `ksu_selinux_hide_enable()` 在 built-in 模式下会用 `ksu_patch_text` 往
+`static ssize_t (*const write_op[])`（位于 `.rodata`，只读）塞函数指针：
+module 模式下这两次写入返回 `-EFAULT` 还能退到 kprobe，built-in 没有退路，
+结果是 system_server 调 `sel_write_context` 时跳到坏指针 → 连续重启。
 
-```
-比较 11669 个类型，不一致 0，缺失 0，passed=True
-```
+本项目的解法分三步，全部在 `ci/integrate.sh`：
 
-- **passed=True** → 树和 config 对得上，可以进入下一步（移植 SUSFS 2.4）。
-- **不一致 > 0** → 摘要里会列出前 10 个差异（通常是 `task_struct` 这类），说明源码提交差得太多，
-  需要换到设备那个 `284297031c53` 的源码。
+1. **G2**：`CONFIG_KSU_SUSFS=y` 时让 `enable()` 早退，跳过三处运行期 hook 安装。
+   SUSFS 的补丁在编译期已经把 `selinuxfs.c` / `hooks.c` 的对应函数换成了 `handle_*` 包装，
+   运行期再塞一遍纯属重复且是崩溃源。
+2. **G3**：`sel_open_handle_status` 的 fake status 改为打开 status 时按需初始化，
+   去掉 `fake_status_initialize_key` 的 static key 门控（防时序导致的静默失效）。
+3. **G4（关键修复）**：SUSFS 编译期包装原本查**实时策略**（已含 `ksu_file`），
+   而官方 `my_write_context` / `my_write_access` 查的是 **`backup_sepolicy`**（原厂策略）
+   并强制 `avd.seqno = 1`，这才是检测软件查不出改动的原因。
+   现在把 `security_*_with_policy(backup_sepolicy, ...)` 包装成
+   `ksu_backup_context_to_sid` / `ksu_backup_sid_to_context` / `ksu_backup_compute_av`，
+   接回编译期包装，`access` 补 `avd.seqno = 1`；`write_op[]` 与 `handle_*` 不动。
 
-## 已知限制
+另外把 `KSU_VERSION` 显式固定为 **41185**（官方公式 `40000 + 4000 − 2815`，对应上游 main 4000 commits）。
+上游 Kbuild 是在构建时通过 GitHub API 查 commit 数再算版本码的，CI runner 上未认证 API 被限流、
+加上 `setup.sh` 浅克隆没有完整 git 历史时会回退成 `40000`（管理器显示 `40000-6`）。
+钉死之后构建结果与网络无关，管理器显示 `41185-6`。
 
-1. **这版 Image 不能直接刷。** 它没有 SUSFS，也没有 KernelSU；而且 `boot` 分区还要处理 AVB，
-   以及 `vendor_boot` / `dtbo` 的配套。那是下一步。
-2. 取不到设备提交 `284297031c53` 时会用分支 HEAD，脚本会打印实际用的提交号——
-   BTF 比对正是用来判断"HEAD 是否等价"的。
-3. `LOCALVERSION` 被强制成设备那串（`-android17-5-g284297031c53-abogki553682993-4k`），
-   否则 vermagic 与厂商模块对不上。这是有意的，不是造假数据——BTF 比对会独立证明结构是否一致。
+## 当前进度
 
-## 手动跑
+- ✅ **已完成并上机验证**：GKI ABI 对齐、Rust/ASHMEM 工具链、SukiSU built-in、SELinux 隐藏（检测软件通过）、
+  官方 `init_boot` 兼容、boot/AVB 打包、CI 可复现构建、AK3 打包。
+- 🔄 **进行中**：AK3 公测分发，收集不同机器/不同槽位/不同系统版本的反馈。
+- ⚠️ **已知限制**
+  - 目前只移植了 **SUSFS 的 SELinux 隐藏相关部分**，不是完整 SUSFS。
+  - `build.log` 尾部 BTF 类型比对 `passed=False`：7 类不一致 / 21 个缺失，均为 `pkvm_*`、`f2fs_*`、
+    `mt_device`、`fsverity_info` 等 vendor-only 类型；符号 CRC 与厂商 `.ko` 一致，实机正常开机。
+  - AVB 沿用官方 vbmeta、未重算 kernel hash 描述符（设备侧校验不阻塞）。
+  - `init_boot` **必须是官方原版**；刷入 LKM 版 `init_boot` 会与 built-in KSU 冲突。
+  - 需要已解锁 bootloader；刷机有风险，请先备份原厂 `boot.img` / `init_boot.img`。
+
+## 下一步：SUSFS 全部移植
+
+目标是把 SUSFS 从"只用到 SELinux 隐藏"扩展到完整能力，而不是继续给隐藏打补丁：
+
+1. **逐 feature 盘点**：`sus_path` / `sus_mount`、挂载隐藏、路径与 stat 伪装、`spoof_uname`、
+   `hide ksu/su` 相关符号伪装、以及 SUSFS 对 `avc` / `setprocattr` 的其余包装，
+   逐项对照 `android17-6.18` 的内核接口，确认哪些能直接合、哪些要重写。
+2. **补齐 Kconfig 与桥接层**：目前 `CONFIG_KSU_SUSFS` 只是我们自己注册的开关，
+   全量移植需要按 feature 拆开关，并补上 `susfs_bridge.c` 对应的实现
+   （现有桥接层里 `susfs_is_sus_type_rcu()` 恒 false、`susfs_spoof_avd_allowed_rcu()` 是空壳）。
+3. **顺序**：先做不碰挂载命名空间的低风险项（uname / stat / 路径伪装），
+   再做 `sus_mount`、挂载隐藏等会影响文件系统的项，每加一项跑一次 ABI 校验 + 上机回归。
+4. **验收**：保持零运行期代码改写、零 `selinux_hide` kprobe；
+   每次改动都要能过检测软件，且开机不出现 `XR_AP_PANIC` / 连续重启。
+
+## 构建与刷写
 
 ```bash
+# CI 手动触发
 gh workflow run build-kernel.yml
-gh run watch
 gh run download --name dijun-kernel-<run_number> -D ./artifacts
+
+# 或本地打包（需 CI 产物 out/Image 与原厂 boot.img）
+# 布局见 ci/integrate.sh 与 Releases 里的交付说明
+
+# 刷写（init_boot 保持官方原版）
+fastboot flash boot boot_g4_official_selinuxhide.img
+fastboot reboot
 ```
+
+AK3 公测包请从 **Releases** 下载，在 Recovery / KernelSU 管理器里刷入；
+包内 `README-AK3.txt` 会写明适用机型、槽位处理与回滚方式。
+
+回滚：刷回原厂 `boot.img`（`fastboot flash boot <原厂 boot.img>`）即可，
+`init_boot` 全程不需要动。
+
+## 致谢
+
+- **SukiSU Ultra（SukiSU-Ultra 团队）**：KernelSU 分支、管理器、`selinux_hide` 官方实现，
+  以及 `kernel/setup.sh` 的 built-in 集成指南 —— 本项目的隐藏逻辑完全建立在官方实现之上。
+- **KernelSU 原项目及其贡献者**：整套内核侧 root 架构的基础。
+- **SUSFS 项目（susfs4ksu 系列）**：SELinux 编译期包装与隐藏思路，本项目当前接入的补丁来源。
+- **LingLuo17 / AnyKernel3**：`dijun` 上实测可开机的 AK3 基线与打包方案，
+  是本项目判断"哪些改动会开机失败"的重要参照。
+- **AOSP / Google**：`android17-6.18` GKI 源码、clang/rustc 工具链与 `gendwarfksyms` 稳定 CRC 机制。
+- **小米 / 玄戒**：原厂固件与开源内核，以及设备侧的 `logfs`/`oops`/`pstore` 日志能力 ——
+  没有这些日志，`.rodata` 写入导致 panic 的根因无从定位。
+- **finasu 的 LKM 版 `kernelsu.ko`**：作为对照基线，用它验证了"官方隐藏功能本来就够用"，
+  从而把问题收敛到 built-in 的失效点，而不是去另造一套隐藏。
+- **所有参与实机刷机、抓日志、跑检测软件并反馈结果的朋友**：这个项目几乎每一步结论都来自上机证据，
+  而不是推测。
+
+## 免责声明
+
+本项目仅用于个人设备研究与学习。刷写内核有变砖风险，请确保已解锁、已备份、了解回滚方式；
+因使用本项目产物造成的设备或数据损失，作者与贡献者不承担责任。

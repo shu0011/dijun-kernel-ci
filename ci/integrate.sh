@@ -110,6 +110,21 @@ sed -i "s|^KSU_VERSION_FULL := .*|KSU_VERSION_FULL := v${KSU_TAG}-${KSU_SHA}@shu
     "$SRC/drivers/kernelsu/Kbuild"
 grep -n 'KSU_VERSION_FULL :=' "$SRC/drivers/kernelsu/Kbuild"
 
+echo "==> G-fix 固定 KSU_VERSION（消除构建期网络/浅克隆依赖）"
+# 上游 Kbuild 的版本码是**运行时**算的：
+#   GITHUB_COMMITS := curl -sI api.github.com/.../commits?per_page=1 取 rel="last" 的页数
+#   LOCAL_COUNT    := GITHUB_COMMITS 或 git rev-list --count main
+#   KSU_VERSION    := VERSION_BASE(40000) + LOCAL_COUNT - VERSION_OFFSET(2815)
+# CI runner 上未认证 API 被限流时 GITHUB_COMMITS 为空；setup.sh 是 --depth=1 浅克隆，
+# git rev-list 也拿不到完整历史 ⇒ LOCAL_COUNT 为空 ⇒ 直接回退 VERSION_BASE=40000，
+# 管理器显示成 "40000-6"。各版 build.log 实测：G2/G3 = 41185（正确），
+# G1/G4 = 40000，早期 main = 37186（浅克隆只有 1 个 commit）。
+# 按官方公式用上游 main 的 4000 commits 算得 41185，显式钉死，构建结果与网络无关。
+KSU_VERSION_NUM=41185
+sed -i -E "s|^KSU_VERSION[[:space:]]*:=.*|KSU_VERSION     := $KSU_VERSION_NUM|" \
+    "$SRC/drivers/kernelsu/Kbuild"
+grep -n '^KSU_VERSION ' "$SRC/drivers/kernelsu/Kbuild"
+
 echo "==> G2 让 KSU 的 selinux_hide 不再运行期改 write_op[]"
 # ksu_selinux_hide_enable() 会往 selinuxfs 的 write_op[] 里塞函数指针，
 # 而那是个 const 数组（.rodata）。module 模式下 ksu_patch_text 一律 EFAULT(-14)，
