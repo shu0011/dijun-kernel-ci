@@ -7,7 +7,7 @@ on:
 
 concurrency:
   group: build-dijun-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -45,7 +45,18 @@ jobs:
           repo init -u https://android.googlesource.com/kernel/manifest \
                     -b common-android17-6.18-2026-06 --depth=1 --no-repo-verify -q
           repo sync -c -j4 --no-tags --no-clone-bundle -q \
-                    platform/prebuilts/clang/host/linux-x86 || true
+                    platform/prebuilts/clang/host/linux-x86 \
+                    platform/prebuilts/rust || true
+          # ASHMEM 的 Kconfig 是 "depends on SHMEM && RUST"，设备开了 RUST=y。
+          # 不装 rust 工具链 → CONFIG_RUST 被旧 defconfig 丢掉 → ASHMEM 跟着没 → 
+          # camera 的 AshMemManager 拿到 NULL 在 memset 里崩。
+          RC=$(ls -d /tmp/ws/prebuilts/rust/linux-x86/*/bin/rustc 2>/dev/null | sort -V | tail -1)
+          if [ -n "$RC" ]; then
+            echo "AOSP_RUSTC=$RC" >> "$GITHUB_ENV"
+            "$RC" --version
+          fi
+          BG=$(ls -d /tmp/ws/prebuilts/clang/host/linux-x86/clang-r*/bin/bindgen 2>/dev/null | sort -V | tail -1)
+          [ -n "$BG" ] && echo "AOSP_BINDGEN=$BG" >> "$GITHUB_ENV" && "$BG" --version
           CL=$(ls -d /tmp/ws/prebuilts/clang/host/linux-x86/clang-r* 2>/dev/null | sort -V | tail -1)
           if [ -n "$CL" ] && [ -x "$CL/bin/clang" ]; then
             echo "AOSP_CLANG=$CL" >> "$GITHUB_ENV"

@@ -70,6 +70,19 @@ echo "==> 构建者信息: ${BUILD_USER}@${BUILD_HOST}  ${BUILD_TIMESTAMP}"
 # 不开的话 CRC 会绑定实现细节（函数体、内联、编译顺序等），跨版本一变就不同，
 # 厂商 .ko 全部拒载。开了之后只按稳定类型信息算，才和设备的 __versions 对得上。
 export KBUILD_GENDWARFKSYMS_STABLE=1
+
+# CONFIG_RUST 是 ASHMEM 的前置（drivers/staging/android/Kconfig: depends on SHMEM && RUST）。
+# 设备开了 RUST=y，我们也得开，否则 /dev/ashmem 不存在，camera HAL 初始化时
+# AshMemManager 拿到 NULL 直接 SIGSEGV，系统起不到桌面。
+# rustc/bindgen 由 workflow 从 prebuilts 拉，路径通过环境变量传进来。
+if [ -n "${AOSP_RUSTC:-}" ] && [ -x "$AOSP_RUSTC" ]; then
+    export RUSTC="$AOSP_RUSTC"
+    export HOSTRUSTC="$AOSP_RUSTC"
+fi
+if [ -n "${AOSP_BINDGEN:-}" ] && [ -x "$AOSP_BINDGEN" ]; then
+    export BINDGEN="$AOSP_BINDGEN"
+fi
+echo "==> rust: rustc=${RUSTC:-<未设置>} bindgen=${BINDGEN:-<未设置>}"
 # setlocalversion 已被替换成固定输出，不再需要靠 LOCALVERSION 环境变量压制 -g<sha>-dirty；
 # 保留反而会干扰 Makefile 里 LOCALVERSION = $(CONFIG_LOCALVERSION) 的取值
 
@@ -151,7 +164,7 @@ disable_cfg() {
     fi
 }
 
-for k in KSU KSU_SUSFS MODULE_SCMVERSION; do
+for k in KSU KSU_SUSFS MODULE_SCMVERSION RUST ASHMEM; do
     enable_cfg "$k" "$SRC/.config"
 done
 
@@ -189,7 +202,7 @@ if [ -e "$SRC/include/config/auto.conf" ]; then
     sed -i "s|^CONFIG_LOCALVERSION_AUTO=.*|CONFIG_LOCALVERSION_AUTO=y|" \
         "$SRC/include/config/auto.conf"
     drop_kleaf_file_dep "$SRC/include/config/auto.conf"
-    for k in KSU KSU_SUSFS MODULE_SCMVERSION; do
+    for k in KSU KSU_SUSFS MODULE_SCMVERSION RUST ASHMEM; do
         enable_cfg "$k" "$SRC/include/config/auto.conf"
     done
 
