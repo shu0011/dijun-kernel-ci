@@ -105,9 +105,27 @@ enable_cfg() {
         echo "CONFIG_${k}=y" >> "$f"
     fi
 }
+disable_cfg() {
+    local k="$1" f="$2"
+    [ -e "$f" ] || return 0
+    if grep -q "^CONFIG_${k}=" "$f"; then
+        sed -i "s|^CONFIG_${k}=.*|# CONFIG_${k} is not set|" "$f"
+    fi
+}
+
 for k in KSU KSU_SUSFS; do
     enable_cfg "$k" "$SRC/.config"
 done
+
+# 关掉 MODVERSIONS。
+# 设备内核是 6.18.21 + 小米私有提交，我们的 CRC 是从 AOSP 6.18.32 用
+# gendwarfksyms 算的，必然对不上。开着这个选项时 check_version() 会逐一比对
+# .ko 的 __versions 与内核 __kcrctab，不一致就拒载 —— 而 vendor_dlkm 里那批
+# 是 UFS/display/touch 这些关键驱动，少一个 init 就挂不到 /data，表现为
+# logo 之后反复重启（实测：没有 AVB 警告，正是 init 阶段挂掉的特征）。
+# 关掉之后内核加载 .ko 时直接忽略 __versions，不校验 CRC。
+disable_cfg MODVERSIONS "$SRC/.config"
+grep -E 'MODVERSIONS' "$SRC/.config" || true
 grep -E '^CONFIG_(KSU|KSU_SUSFS)=' "$SRC/.config" || echo "    !! KSU 没打开"
 
 # 顺手把 config 里所有「指向源码树内某个不存在文件」的字符串项列出来。
@@ -134,6 +152,7 @@ if [ -e "$SRC/include/config/auto.conf" ]; then
     for k in KSU KSU_SUSFS; do
         enable_cfg "$k" "$SRC/include/config/auto.conf"
     done
+    disable_cfg MODVERSIONS "$SRC/include/config/auto.conf"
 fi
 rm -f "$SRC/include/config/kernel.release" "$SRC/include/generated/utsrelease.h"
 
