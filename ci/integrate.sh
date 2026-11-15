@@ -378,6 +378,16 @@ old_call = "return susfs_selinux_setprocattr(name, value, size);"
 assert t.count(old_call) == 1, f"setprocattr 调用没匹配上: {t.count(old_call)}"
 t = t.replace(old_call, "return ksu_backup_setprocattr(name, value, size);", 1)
 
+# 换成官方 wrapper 后，SUSFS 这两个 static 函数变成死代码；
+# 项目开 -Werror,-Wunused-function，必须标记为 maybe_unused 才能编过。
+# lsm_setattr 的唯一调用者就是 setprocattr，会被连带架空，两个都要标。
+for susfs_def in [
+    "static int susfs_selinux_setprocattr(const char *name, void *value, size_t size)",
+    "static int susfs_selinux_lsm_setattr(u64 attr, void *value, size_t size)",
+]:
+    assert t.count(susfs_def) == 1, f"未找到 SUSFS 定义: {susfs_def}"
+    t = t.replace(susfs_def, susfs_def.replace("static int", "static __maybe_unused int"), 1)
+
 open(hk, "w").write(t)
 print("    hooks.c: setprocattr app-uid 分支切到官方 #3981 修复")
 PYEOF
