@@ -182,6 +182,119 @@ open(p, "w").write(s)
 print("    selinuxfs.c: fake status 改为按需初始化")
 PYEOF
 
+echo "==> G4 编译期接入官方 selinux_hide 的 context/access 实现"
+# 官方 ksu_selinux_hide_enable() 的本质是把 write_op[SEL_CONTEXT]/[SEL_ACCESS] 等
+# 函数指针在运行期换成 my_write_context / my_write_access（查 backup_sepolicy）。
+# built-in 下这些槽位在 .rodata，ksu_patch_text 运行期改写会写坏只读页 → 开机崩；
+# G2 早退虽然止住了崩溃，却把官方隐藏一起关掉了，而 SUSFS 编译期包装查的是
+# 实时策略（含 ksu_file），所以检测软件照样报。
+# 这里在编译期就把这两个包装接到官方实现的同一条策略路径上：
+#   - 不改 write_op[] 的指向（仍是 handle_sel_write_*，带 uid/running 判断）
+#   - selinuxfs.c 内只替换两处函数调用，改为 KSU 导出的 backup 策略 wrapper
+#   - 不新增运行期 hook、不挂 kprobe、不写任何只读数据
+SH="$SRC/drivers/kernelsu/feature/selinux_hide.c"
+SF="$SRC/security/selinux/selinuxfs.c"
+python3 - "$SH" "$SF" <<'PYEOF'
+import sys
+sh, sf = sys.argv[1], sys.argv[2]
+
+# --- 1) KSU 侧：保住 backup_sepolicy，并暴露官方 app-uid 分支 ---
+s = open(sh).read()
+old = "static bool ksu_selinux_hide_keep_backup __read_mostly = false;"
+assert s.count(old) == 1, "keep_backup 声明没匹配上"
+s = s.replace(old, "static bool ksu_selinux_hide_keep_backup __read_mostly = true;", 1)
+
+wrappers = r"""
+/* ---- 编译期 SELinux 隐藏入口（CONFIG_KSU_SUSFS=y）------------------------
+ * built-in 下 write_op[] 在编译期就指向 handle_sel_write_*，运行期不 patch
+ * 任何只读数据，也不挂 kprobe。这里把官方 my_write_context / my_write_access
+ * 的 app-uid 分支原样暴露出来，策略源同为 backup_sepolicy（原厂策略）。
+ * ------------------------------------------------------------------------ */
+int ksu_backup_context_to_sid(const char *scontext, u32 scontext_len, u32 *sid)
+{
+    if (!backup_sepolicy)
+        return -EINVAL;
+    return security_context_to_sid_with_policy(backup_sepolicy, scontext,
+                                                scontext_len, sid,
+                                                SECSID_NULL, GFP_KERNEL,
+                                                NULL, NULL);
+}
+
+int ksu_backup_sid_to_context(u32 sid, char **scontext, u32 *scontext_len)
+{
+    if (!backup_sepolicy)
+        return -EINVAL;
+    return security_sid_to_context_with_policy(backup_sepolicy, sid,
+                                                scontext, scontext_len);
+}
+
+void ksu_backup_compute_av(u32 ssid, u32 tsid, u16 tclass,
+                           struct av_decision *avd)
+{
+    if (!backup_sepolicy) {
+        memset(avd, 0, sizeof(*avd));
+        return;
+    }
+    security_compute_av_user_with_policy(backup_sepolicy, ssid, tsid,
+                                          tclass, avd);
+}
+"""
+assert "int ksu_backup_context_to_sid(" not in s, "wrapper 已存在"
+s = s.rstrip() + "\n" + wrappers
+open(sh, "w").write(s)
+print("    selinux_hide.c: 3 个 backup wrapper + keep_backup 初值")
+
+# --- 2) selinuxfs.c：extern 与两处调用换成官方 backup 策略路径 ---
+t = open(sf).read()
+
+old_ext = "extern int susfs_security_context_to_sid(const char *scontext, u32 scontext_len, u32 *sid, gfp_t gfp);"
+new_ext = """extern int ksu_backup_context_to_sid(const char *scontext, u32 scontext_len, u32 *sid);
+extern int ksu_backup_sid_to_context(u32 sid, char **scontext, u32 *scontext_len);
+extern void ksu_backup_compute_av(u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd);"""
+assert t.count(old_ext) == 1, "selinuxfs.c extern 声明没匹配上"
+t = t.replace(old_ext, new_ext, 1)
+
+old_ctx = """\tlength = susfs_security_context_to_sid(buf, size, &sid, GFP_KERNEL);
+\tif (length)
+\t\tgoto out;
+
+\tlength = security_sid_to_context(sid, &canon, &len);"""
+new_ctx = """\t/* 官方 my_write_context 的 app-uid 分支：用原厂备份策略翻译 */
+\tlength = ksu_backup_context_to_sid(buf, size, &sid);
+\tif (length)
+\t\tgoto out;
+
+\tlength = ksu_backup_sid_to_context(sid, &canon, &len);"""
+assert t.count(old_ctx) == 1, "context 调用块没匹配上"
+t = t.replace(old_ctx, new_ctx, 1)
+
+old_acc = """\tlength = susfs_security_context_str_to_sid(scon, &ssid, GFP_KERNEL);
+\tif (length)
+\t\tgoto out;
+
+\tlength = susfs_security_context_str_to_sid(tcon, &tsid, GFP_KERNEL);
+\tif (length)
+\t\tgoto out;
+
+\tsusfs_security_compute_av_user(ssid, tsid, tclass, &avd);"""
+new_acc = """\t/* 官方 my_write_access 的 app-uid 分支：用原厂备份策略翻译 */
+\tlength = ksu_backup_context_to_sid(scon, strlen(scon), &ssid);
+\tif (length)
+\t\tgoto out;
+
+\tlength = ksu_backup_context_to_sid(tcon, strlen(tcon), &tsid);
+\tif (length)
+\t\tgoto out;
+
+\tksu_backup_compute_av(ssid, tsid, tclass, &avd);
+\tavd.seqno = 1;"""
+assert t.count(old_acc) == 1, "access 调用块没匹配上"
+t = t.replace(old_acc, new_acc, 1)
+
+open(sf, "w").write(t)
+print("    selinuxfs.c: context/access 已切到 backup_sepolicy 路径")
+PYEOF
+
 echo "==> H 集成完成"
 echo "    KSU 分支配置文件: $(ls "$SRC/drivers/kernelsu"/Kbuild "$SRC/drivers/kernelsu"/Makefile 2>/dev/null | tr '\n' ' ')"
 echo "    SELinux 补丁命中: $(grep -c 'CONFIG_KSU_SUSFS' "$SRC/security/selinux/status.c" 2>/dev/null || echo 0) 处 status.c"
