@@ -160,9 +160,13 @@ make -C "$SRC" ARCH=arm64 LLVM="$LLVM_VAL" olddefconfig
 # olddefconfig 不一定刷新 auto.conf，而 setlocalversion 与 modpost 认的都是 auto.conf。
 # 注意 auto.conf 是 make 语法，字符串值不带引号（.config 才带）。
 if [ -e "$SRC/include/config/auto.conf" ]; then
-    sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=$TARGET_LOCALVERSION|" \
+    # auto.conf 会被内核 Makefile include，优先级高于 .config —— 这里必须用
+    # 和 .config 相同的新写法，否则前面改的又被覆盖回去。
+    sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=-4k|" \
         "$SRC/include/config/auto.conf"
-    sed -i "s|^CONFIG_LOCALVERSION_AUTO=.*|# CONFIG_LOCALVERSION_AUTO is not set|" \
+    sed -i "s|^# CONFIG_LOCALVERSION_AUTO is not set|CONFIG_LOCALVERSION_AUTO=y|" \
+        "$SRC/include/config/auto.conf"
+    sed -i "s|^CONFIG_LOCALVERSION_AUTO=.*|CONFIG_LOCALVERSION_AUTO=y|" \
         "$SRC/include/config/auto.conf"
     drop_kleaf_file_dep "$SRC/include/config/auto.conf"
     for k in KSU KSU_SUSFS MODULE_SCMVERSION; do
