@@ -64,12 +64,25 @@ jobs:
             echo "::warning::没拉到 AOSP clang"
           fi
 
-          RC=$(ls -d /tmp/ws/prebuilts/rust-toolchain/linux-x86/*/bin/rustc 2>/dev/null | sort -V | tail -1)
+          # 目录名排序取最新是错的：1.91.1.p4 用的是 LLVM 23，而设备内核是
+          # LLVM 22（CONFIG_RUSTC_LLVM_VERSION=220001），
+          # CONFIG_RUSTC_CLANG_LLVM_COMPATIBLE 检查不过，CONFIG_RUST 直接关掉，
+          # ASHMEM 跟着没，camera 崩。按 rustc 自报的 LLVM 版本挑。
+          echo "--- 各版本 rustc 的 LLVM ---"
+          RC=""
+          for d in /tmp/ws/prebuilts/rust-toolchain/linux-x86/1.91.1*; do
+            [ -x "$d/bin/rustc" ] || continue
+            LV=$("$d/bin/rustc" -vV 2>/dev/null | sed -n 's/^LLVM version: *//p' || true)
+            echo "    $(basename "$d") -> LLVM ${LV:-未知}"
+            case "$LV" in
+              22.*) RC="$d/bin/rustc" ;;
+            esac
+          done
           if [ -n "$RC" ]; then
             echo "AOSP_RUSTC=$RC" >> "$GITHUB_ENV"
             "$RC" --version
           else
-            echo "::warning::没拉到 AOSP rustc，CONFIG_RUST 会关，camera 大概率仍崩"
+            echo "::warning::没找到 LLVM 22 的 rustc，CONFIG_RUST 会关，camera 大概率仍崩"
           fi
 
           echo "LIBCLANG_PATH=$CL/lib" >> "$GITHUB_ENV"
