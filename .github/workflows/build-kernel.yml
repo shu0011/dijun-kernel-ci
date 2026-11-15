@@ -57,6 +57,14 @@ jobs:
                     https://android.googlesource.com/platform/prebuilts/rust /tmp/arust 2>/dev/null || \
             git clone --depth=1 --sparse \
                     https://android.googlesource.com/platform/prebuilts/rust /tmp/arust 2>/dev/null || true
+          # 直接看 manifest 怎么声明 rust 的，别再猜名字
+          echo "--- manifest 里含 rust 的项目 ---"
+          { grep -i "rust" /tmp/ws/.repo/manifests/default.xml 2>/dev/null || true; } | head -6
+          echo "--- clang 包里有没有 rustc ---"
+          { ls /tmp/ws/prebuilts/clang/host/linux-x86/clang-*/bin/ 2>/dev/null || true; } | grep -iE "^rust|bindgen" | head -5
+          echo "--- 已 sync 的顶层目录 ---"
+          { ls /tmp/ws 2>/dev/null || true; } | head -12
+
           if [ -d /tmp/arust/.git ]; then
             cd /tmp/arust
             # 设备用 rustc 1.91.1（CONFIG_RUSTC_VERSION=109101），只取这个版本；
