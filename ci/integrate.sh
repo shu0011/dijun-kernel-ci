@@ -19,7 +19,10 @@ git clone --depth=1 --branch "$KSU_REF" "$KSU_REPO" /tmp/ksu-src
 echo "==> B 装到 drivers/kernelsu（built-in）"
 rm -rf "$SRC/drivers/kernelsu"
 mkdir -p "$SRC/drivers/kernelsu"
-cp -a /tmp/ksu-src/kernel/. "$SRC/drivers/kernelsu/"
+# 注意 kernel/include/uapi 在仓库里是 symlink（指向根目录的 uapi/），
+# cp -a 会把这个链接原样拷过来，进了内核树就指向一个不存在的相对路径。
+# 必须用 -L 解引用。
+cp -aL /tmp/ksu-src/kernel/. "$SRC/drivers/kernelsu/"
 
 # 原 kernel/Makefile 是外部模块编译驱动（make -C $KDIR M=...），built-in 用不上。
 # Kbuild 里已经自带 "obj-$(CONFIG_KSU) += kernelsu.o" 和全部 kernelsu-objs 清单，
@@ -53,7 +56,7 @@ if [ -d "$SRC/drivers/kernelsu/include/uapi" ]; then
     cp -r "$SRC/drivers/kernelsu/include/uapi" "$SRC/drivers/kernelsu/uapi"
     echo "    uapi 头文件已在 include/ 与根目录各放一份"
 fi
-ls "$SRC/drivers/kernelsu/uapi" 2>&1 | head -4
+{ ls "$SRC/drivers/kernelsu/include/uapi" 2>&1 || true; } | head -4
 
 # 挂进 drivers 的 Kconfig 与 Makefile（幂等）
 grep -q 'kernelsu/Kconfig' "$SRC/drivers/Kconfig" || \
