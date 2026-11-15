@@ -2,7 +2,8 @@
 
 > 设备：小米 15S Pro（`dijun`），HyperOS OS4.0.5.0，玄戒 O1
 > 内核基线：`6.18.21-android17-5-g284297031c53-abogki553682993-4k`（GKI / KMI `android17-6.18`）
-> 当前状态：**built-in SukiSU + SELinux 隐藏已上机验证通过**，AK3 公测包见 Releases
+> 当前状态：**built-in SukiSU + 完整 SELinux 隐藏已上机验证通过**，Maple「策略属性写入」侧信道已修；AK3 公测包见 Releases
+> 上游：2026-11-15 起 SukiSU-Ultra 更名为 **SukiSU-Nova**，本项目同步跟踪其 `main` 分支
 
 本仓库用 GitHub Actions 复现整套构建：AOSP `android17-6.18` 源码 + 设备原厂 `boot.img` 抽出的 config，
 编译出可直接刷入 `boot` 分区、内置 SukiSU Ultra 与 SELinux 隐藏的内核。
@@ -14,8 +15,8 @@
 |---|---|
 | 可复现 GKI 构建 | AOSP 源码 `284297031c53`；`KBUILD_GENDWARFKSYMS_STABLE=1` 让导出符号 CRC 与厂商 `.ko` 对齐（`module_layout = 0x60801db3`，18187 个导出符号，vermagic 与原厂一致） |
 | AOSP 工具链 | 预编译 clang / rustc / bindgen 0.72.1；开启 `CONFIG_RUST=y` + `CONFIG_ASHMEM=y`，否则 camera HAL 初始化会崩 |
-| SukiSU Ultra built-in | 按官方 `kernel/setup.sh` 集成到 `drivers/kernelsu`，分支 `main`，版本 `41185` / `v4.3.0-r2-bd9a894e@shushu`；管理器与 `ksud` 可用 |
-| SELinux 隐藏（完整生效） | 见下节；**检测软件已通过**，`ksud feature get 4` = enabled，开机无重启 |
+| SukiSU built-in | 按官方 `kernel/setup.sh` 集成到 `drivers/kernelsu`，分支 `main`；版本号**由上游 Kbuild 自动计算**（不再写死），版本串 `v4.3.0-<sha>@shushu`；管理器与 `ksud` 可用 |
+| SELinux 隐藏（完整生效） | 见下节；**检测软件已通过**，Maple「策略属性写入特征」侧信道已修，`ksud feature get 4` = enabled，开机无重启 |
 | 零运行期 patch / 零 kprobe | 不写只读的 `write_op[]`，不挂 `selinux_hide` 相关 kprobe，隐藏全部走编译期钩子 |
 | boot 打包 | 官方 4096 B header（改 `kernel_size`）+ 自编 `Image` + 官方 vbmeta(2368 B) + 零填充 + 原 64 B AVB footer；总长不变，已多次上机验证 |
 | CI / Release | Actions 自动构建并产出 `Image`、`System.map`、`config.built`、`vmlinux.symvers`、`summary.txt`、完整日志；AK3 包在 Releases 发布 |
@@ -34,22 +35,38 @@ module 模式下这两次写入返回 `-EFAULT` 还能退到 kprobe，built-in �
    运行期再塞一遍纯属重复且是崩溃源。
 2. **G3**：`sel_open_handle_status` 的 fake status 改为打开 status 时按需初始化，
    去掉 `fake_status_initialize_key` 的 static key 门控（防时序导致的静默失效）。
-3. **G4（关键修复）**：SUSFS 编译期包装原本查**实时策略**（已含 `ksu_file`），
+3. **G4（context/access 修复）**：SUSFS 编译期包装原本查**实时策略**（已含 `ksu_file`），
    而官方 `my_write_context` / `my_write_access` 查的是 **`backup_sepolicy`**（原厂策略）
    并强制 `avd.seqno = 1`，这才是检测软件查不出改动的原因。
    现在把 `security_*_with_policy(backup_sepolicy, ...)` 包装成
    `ksu_backup_context_to_sid` / `ksu_backup_sid_to_context` / `ksu_backup_compute_av`，
    接回编译期包装，`access` 补 `avd.seqno = 1`；`write_op[]` 与 `handle_*` 不动。
+4. **G5（setprocattr / Maple 侧信道修复）**：Maple 报的「重要: 策略属性写入特征」
+   （`kernelsu_traits_count:1`）来自 app 写 `/proc/self/attr/current`（setprocattr）的侧信道：
+   检测软件写一个含 KSU type 的 context，比较内核返回行为判断 live policy 是否被改过。
+   上游 `c836ea2c`（#3981，2026-11-09）已修此问题：`my_setprocattr` 先用
+   `security_context_to_sid_live()` 校验，只有遇到 ksu 新增 type（`-EAGAIN`，stale type mark）
+   才 dual parse 查 `backup_sepolicy`，因此写原厂 context 的行为与未 root 真机一致。
+   但 G2 早退跳过了 `ksu_lsm_hook(&selinux_setprocattr_hook)`，这个修复在 built-in 下
+   只是**编进内核、从未挂上**；app 的写入落到 SUSFS 的 `susfs_selinux_setprocattr`（无 live-parse）
+   → 侧信道暴露。LKM ko 能过检测，是因为它完整跑了 `enable()`、`my_setprocattr` 真挂上了。
+   G5 用与 G4 相同的编译期手法：导出 `ksu_backup_setprocattr` 指向官方 `my_setprocattr`，
+   把 `handle_selinux_setprocattr` 的 app-uid 分支改调它。**不挂 kprobe、不改 `write_op[]`、
+   不写只读数据、不新增功能**，只是让官方已有实现真正生效。
 
-另外把 `KSU_VERSION` 显式固定为 **41185**（官方公式 `40000 + 4000 − 2815`，对应上游 main 4000 commits）。
-上游 Kbuild 是在构建时通过 GitHub API 查 commit 数再算版本码的，CI runner 上未认证 API 被限流、
-加上 `setup.sh` 浅克隆没有完整 git 历史时会回退成 `40000`（管理器显示 `40000-6`）。
-钉死之后构建结果与网络无关，管理器显示 `41185-6`。
+**版本号完全交给上游 Kbuild 自动计算**（不写死）：公式为
+`KSU_VERSION = VERSION_BASE + LOCAL_COUNT − VERSION_OFFSET`。早期 Ultra 是 `40000 + COUNT − 2815`，
+2026-11-15 改名 Nova 后改为 `30000 + COUNT − 4001`。之前曾短暂写死 `41185`，这违背上游"自动计算"
+的设计且改名后过时，已撤销。CI 上偶发的 `40000`/`30000` 回退并非 API 限流，而是 G-fix 修复前
+`setup.sh` 浅克隆 + `drivers/kernelsu` 换成实目录后 `.git` 丢失，`git rev-list --count main` 数不到
+完整历史所致。G-fix 现在会补齐 KernelSU 的完整历史并在 `drivers/` 下补 `.git` 指针，
+让版本码由上游公式自动算出，不依赖网络 API。
 
 ## 当前进度
 
 - ✅ **已完成并上机验证**：GKI ABI 对齐、Rust/ASHMEM 工具链、SukiSU built-in、SELinux 隐藏（检测软件通过）、
   官方 `init_boot` 兼容、boot/AVB 打包、CI 可复现构建、AK3 打包。
+- ✅ **G5 已修复（待上机复验）**：Maple「策略属性写入特征」侧信道（G2 早退误伤了官方 #3981 修复）。
 - 🔄 **进行中**：AK3 公测分发，收集不同机器/不同槽位/不同系统版本的反馈。
 - ⚠️ **已知限制**
   - 目前只移植了 **SUSFS 的 SELinux 隐藏相关部分**，不是完整 SUSFS。
@@ -97,8 +114,9 @@ AK3 公测包请从 **Releases** 下载，在 Recovery / KernelSU 管理器里�
 
 ## 致谢
 
-- **SukiSU Ultra（SukiSU-Ultra 团队）**：KernelSU 分支、管理器、`selinux_hide` 官方实现，
+- **SukiSU-Ultra / SukiSU-Nova 团队**：KernelSU 分支、管理器、`selinux_hide` 官方实现，
   以及 `kernel/setup.sh` 的 built-in 集成指南 —— 本项目的隐藏逻辑完全建立在官方实现之上。
+  特别感谢上游 `c836ea2c`（#3981）对 setprocattr 侧信道的修复，G5 只是把它在 built-in 下接通。
 - **KernelSU 原项目及其贡献者**：整套内核侧 root 架构的基础。
 - **SUSFS 项目（susfs4ksu 系列）**：SELinux 编译期包装与隐藏思路，本项目当前接入的补丁来源。
 - **LingLuo17 / AnyKernel3**：`dijun` 上实测可开机的 AK3 基线与打包方案，

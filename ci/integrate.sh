@@ -110,20 +110,35 @@ sed -i "s|^KSU_VERSION_FULL := .*|KSU_VERSION_FULL := v${KSU_TAG}-${KSU_SHA}@shu
     "$SRC/drivers/kernelsu/Kbuild"
 grep -n 'KSU_VERSION_FULL :=' "$SRC/drivers/kernelsu/Kbuild"
 
-echo "==> G-fix 固定 KSU_VERSION（消除构建期网络/浅克隆依赖）"
-# 上游 Kbuild 的版本码是**运行时**算的：
-#   GITHUB_COMMITS := curl -sI api.github.com/.../commits?per_page=1 取 rel="last" 的页数
-#   LOCAL_COUNT    := GITHUB_COMMITS 或 git rev-list --count main
-#   KSU_VERSION    := VERSION_BASE(40000) + LOCAL_COUNT - VERSION_OFFSET(2815)
-# CI runner 上未认证 API 被限流时 GITHUB_COMMITS 为空；setup.sh 是 --depth=1 浅克隆，
-# git rev-list 也拿不到完整历史 ⇒ LOCAL_COUNT 为空 ⇒ 直接回退 VERSION_BASE=40000，
-# 管理器显示成 "40000-6"。各版 build.log 实测：G2/G3 = 41185（正确），
-# G1/G4 = 40000，早期 main = 37186（浅克隆只有 1 个 commit）。
-# 按官方公式用上游 main 的 4000 commits 算得 41185，显式钉死，构建结果与网络无关。
-KSU_VERSION_NUM=41185
-sed -i -E "s|^KSU_VERSION[[:space:]]*:=.*|KSU_VERSION     := $KSU_VERSION_NUM|" \
-    "$SRC/drivers/kernelsu/Kbuild"
-grep -n '^KSU_VERSION ' "$SRC/drivers/kernelsu/Kbuild"
+echo "==> G-fix 让版本号走上游自动计算（补齐浅克隆历史，不写死）"
+# 上游 Kbuild 在构建时自动算版本码，公式随上游版本演进：
+#   LOCAL_COUNT := GitHub API 的 commit 页数（GITHUB_COMMITS）或 git rev-list --count main
+#   KSU_VERSION := VERSION_BASE + LOCAL_COUNT - VERSION_OFFSET
+# 早期 SukiSU-Ultra：40000 + COUNT - 2815（COUNT=4000 → 41185）
+# 2026-11-15 改名 Nova 后：30000 + COUNT - 4001（当前 API 实测 COUNT=4001 → 30000）
+# 之前写死 41185 违背了上游"自动计算"的设计，且上游改名后已经过时 —— 撤销。
+#
+# CI 上偶发显示 40000/30000（=VERSION_BASE 回退值）有两个原因，这里都修掉：
+#   1) setup.sh 用 --depth=1 浅克隆，git rev-list --count main 只数到 1；
+#   2) B 步骤把 drivers/kernelsu 的 symlink 换成实目录后 .git 丢了，
+#      Kbuild 里 $(KSU_SRC)/../.git 判断落空 → 走 MDIR → 更拿不到历史。
+# 修法：在 B 之后、编译之前把 KernelSU 的完整历史 fetch 下来，并在 drivers/
+# 下补一个 .git 指针，让 Kbuild 的 wildcard/../.git 判断与 git rev-list 都命中。
+# 这样版本号完全由上游公式自动算出，不钉死、不依赖网络 API 是否限流。
+KSU_REPO="$SRC/KernelSU"
+if [ -d "$KSU_REPO/.git" ] || [ -f "$KSU_REPO/.git" ]; then
+    # 浅克隆补完整历史（已完整时 fetch --unshallow 会报错，忽略即可）
+    git -C "$KSU_REPO" fetch --unshallow --tags -q 2>/dev/null || true
+    N=$(git -C "$KSU_REPO" rev-list --count main 2>/dev/null || echo 0)
+    echo "    KSU main commit count = $N"
+    # B 步骤 cp -aL 后 drivers/kernelsu 是实目录，Kbuild 要 $(KSU_SRC)/../.git
+    if [ ! -e "$SRC/drivers/.git" ] && [ -e "$KSU_REPO/.git" ]; then
+        ln -s "$KSU_REPO/.git" "$SRC/drivers/.git"
+        echo "    drivers/.git -> $KSU_REPO/.git"
+    fi
+fi
+# 原样保留上游 Kbuild 的 KSU_VERSION 计算逻辑，不做任何 sed 覆盖
+grep -nE 'VERSION_BASE|VERSION_OFFSET|KSU_VERSION[[:space:]]*:=' "$SRC/drivers/kernelsu/Kbuild" | head -8
 
 echo "==> G2 让 KSU 的 selinux_hide 不再运行期改 write_op[]"
 # ksu_selinux_hide_enable() 会往 selinuxfs 的 write_op[] 里塞函数指针，
@@ -308,6 +323,63 @@ t = t.replace(old_acc, new_acc, 1)
 
 open(sf, "w").write(t)
 print("    selinuxfs.c: context/access 已切到 backup_sepolicy 路径")
+PYEOF
+
+echo "==> G5 把 setprocattr 接回官方 #3981 侧信道修复"
+# Maple 检测项「重要: 策略属性写入特征 / kernelsu_traits_count:1」定位到
+# setprocattr（写 /proc/self/attr/current）的侧信道：检测软件写一个 context，
+# 比较返回行为判定 live policy 是否被 KSU 改过。
+# 上游 2026-11-09 的 c836ea2c（#3981）正是修它：my_setprocattr 先用
+# security_context_to_sid_live() 校验，只有遇到 ksu 新增 type（-EAGAIN，stale
+# type mark）才 dual parse 查 backup_sepolicy —— 写原厂 context 时行为与真机一致。
+# 但 G2 早退跳过了 ksu_lsm_hook(&selinux_setprocattr_hook)，my_setprocattr
+# 只是编进内核、从未挂上；app 的写入落到 SUSFS 的 susfs_selinux_setprocattr
+# （无 live-parse 修复）→ 侧信道暴露。LKM ko 能过检测，是因为它完整跑了
+# enable()（ko 里有 "selinux_setprocattr_hook err ... try kprobe" 与
+# "ksu hide kprobe fallback active"），my_setprocattr 真挂上了。
+# 和 G4 同一手法：编译期导出 wrapper 指向 my_setprocattr，把 SUSFS 的
+# handle_selinux_setprocattr 的 app-uid 分支改调它。不挂 kprobe、不改
+# write_op[]、不写只读数据、不新增功能，只是让官方已有实现真正生效。
+SH="$SRC/drivers/kernelsu/feature/selinux_hide.c"
+HK="$SRC/security/selinux/hooks.c"
+python3 - "$SH" "$HK" <<'PYEOF'
+import sys
+sh, hk = sys.argv[1], sys.argv[2]
+
+# --- 1) selinux_hide.c: 导出 wrapper 指向官方 my_setprocattr ---
+s = open(sh).read()
+assert "my_setprocattr(" in s, "selinux_hide.c 里找不到 my_setprocattr"
+assert "int ksu_backup_setprocattr(" not in s, "ksu_backup_setprocattr 已存在"
+g5 = r"""
+/* ---- 编译期 setprocattr 入口（CONFIG_KSU_SUSFS=y, G5 / 上游 #3981）---------
+ * built-in + G2 早退下 ksu_lsm_hook(selinux_setprocattr_hook) 从未注册，
+ * 含 #3981 修复的 my_setprocattr 是死代码。这里编译期导出同一实现给
+ * SUSFS 的 handle_selinux_setprocattr 在 app-uid 分支调用，堵住「策略属性
+ * 写入」侧信道。两个 goto call_orig 分支（uid<10000 / name!="current"）
+ * 因 handle 的前置判断而不会走到，不触碰未注册的 .original。
+ * ------------------------------------------------------------------------ */
+int ksu_backup_setprocattr(const char *name, void *value, size_t size)
+{
+    return my_setprocattr(name, value, size);
+}
+"""
+s = s.rstrip() + "\n" + g5
+open(sh, "w").write(s)
+print("    selinux_hide.c: 导出 ksu_backup_setprocattr -> my_setprocattr")
+
+# --- 2) hooks.c: handle 的 app-uid 分支从 SUSFS 实现改到官方 wrapper ---
+t = open(hk).read()
+old_decl = "static int handle_selinux_setprocattr(const char *name, void *value, size_t size)"
+new_decl = "extern int ksu_backup_setprocattr(const char *name, void *value, size_t size);\n\n" + old_decl
+assert t.count(old_decl) == 1, f"handle_selinux_setprocattr 定义没匹配上: {t.count(old_decl)}"
+t = t.replace(old_decl, new_decl, 1)
+
+old_call = "return susfs_selinux_setprocattr(name, value, size);"
+assert t.count(old_call) == 1, f"setprocattr 调用没匹配上: {t.count(old_call)}"
+t = t.replace(old_call, "return ksu_backup_setprocattr(name, value, size);", 1)
+
+open(hk, "w").write(t)
+print("    hooks.c: setprocattr app-uid 分支切到官方 #3981 修复")
 PYEOF
 
 echo "==> H 集成完成"
