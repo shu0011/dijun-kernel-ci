@@ -117,14 +117,12 @@ for k in KSU KSU_SUSFS; do
     enable_cfg "$k" "$SRC/.config"
 done
 
-# 关掉 MODVERSIONS。
-# 设备内核是 6.18.21 + 小米私有提交，我们的 CRC 是从 AOSP 6.18.32 用
-# gendwarfksyms 算的，必然对不上。开着这个选项时 check_version() 会逐一比对
-# .ko 的 __versions 与内核 __kcrctab，不一致就拒载 —— 而 vendor_dlkm 里那批
-# 是 UFS/display/touch 这些关键驱动，少一个 init 就挂不到 /data，表现为
-# logo 之后反复重启（实测：没有 AVB 警告，正是 init 阶段挂掉的特征）。
-# 关掉之后内核加载 .ko 时直接忽略 __versions，不校验 CRC。
-disable_cfg MODVERSIONS "$SRC/.config"
+# MODVERSIONS 必须保持 y。
+# 关掉它不只是"跳过 CRC 校验"，还会让 kernel/module/Makefile 里的
+#   obj-$(CONFIG_MODVERSIONS) += version.o
+# 不编译 —— 而 version.o 正是 module_layout 符号的定义所在。没有它，
+# 每个 .ko 加载都在 simplify_symbols 阶段失败，报 Exec format error：
+#   init: Failed to insmod '.../securelib.ko': Exec format error
 grep -E 'MODVERSIONS' "$SRC/.config" || true
 grep -E '^CONFIG_(KSU|KSU_SUSFS)=' "$SRC/.config" || echo "    !! KSU 没打开"
 
@@ -152,7 +150,7 @@ if [ -e "$SRC/include/config/auto.conf" ]; then
     for k in KSU KSU_SUSFS; do
         enable_cfg "$k" "$SRC/include/config/auto.conf"
     done
-    disable_cfg MODVERSIONS "$SRC/include/config/auto.conf"
+
 fi
 rm -f "$SRC/include/config/kernel.release" "$SRC/include/generated/utsrelease.h"
 
