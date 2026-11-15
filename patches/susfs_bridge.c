@@ -34,6 +34,15 @@ extern int security_context_to_sid(const char *scontext, u32 scontext_len,
 extern void security_compute_av_user(u32 ssid, u32 tsid, u16 tclass,
 				     struct av_decision *avd);
 
+/* 补丁里这些是 extern，定义在本文件；先声明再定义，避免
+ * -Wmissing-prototypes 把它们当"没有原型的全局函数"报错。 */
+bool susfs_is_current_ksu_domain(void);
+bool susfs_is_sus_type_rcu(u32 sid);
+void susfs_security_compute_av_user(u32 ssid, u32 tsid, u16 tclass,
+				    struct av_decision *avd);
+void susfs_spoof_avd_allowed_rcu(u32 s_type, u32 t_type, u32 c_type,
+				 u32 *avd_allowed);
+
 /* ---- 补丁引用的全局量 ---- */
 u32 susfs_ksu_sid __read_mostly;
 u32 susfs_priv_app_sid __read_mostly;
@@ -48,6 +57,7 @@ bool susfs_is_current_ksu_domain(void)
 /* 没有 sus_path 表，任何 sid 都不算"要伪造的类型" */
 bool susfs_is_sus_type_rcu(u32 sid)
 {
+	(void)sid;
 	return false;
 }
 
@@ -61,6 +71,10 @@ void susfs_security_compute_av_user(u32 ssid, u32 tsid, u16 tclass,
 void susfs_spoof_avd_allowed_rcu(u32 s_type, u32 t_type, u32 c_type,
 				 u32 *avd_allowed)
 {
+	(void)s_type;
+	(void)t_type;
+	(void)c_type;
+	(void)avd_allowed;
 }
 
 static int __init susfs_bridge_init(void)
