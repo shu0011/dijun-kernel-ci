@@ -110,6 +110,37 @@ sed -i "s|^KSU_VERSION_FULL := .*|KSU_VERSION_FULL := v${KSU_TAG}-${KSU_SHA}@shu
     "$SRC/drivers/kernelsu/Kbuild"
 grep -n 'KSU_VERSION_FULL :=' "$SRC/drivers/kernelsu/Kbuild"
 
+echo "==> G2 让 KSU 的 selinux_hide 不再运行期改 write_op[]"
+# ksu_selinux_hide_enable() 会往 selinuxfs 的 write_op[] 里塞函数指针，
+# 而那是个 const 数组（.rodata）。module 模式下 ksu_patch_text 一律 EFAULT(-14)，
+# 只能退到 kprobe；built-in 模式下这次写入会落到只读数据上，轻则无效重则写坏
+# 相邻字段 —— 打开开关后开机即崩就是这个位置。
+# 而 SUSFS 的补丁已经在编译期把 sel_write_context / sel_write_access /
+# setprocattr 全部换成了 handle_* 包装，运行期这笔 patch 纯属重复劳动。
+python3 - "$SRC/drivers/kernelsu/feature/selinux_hide.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+needle = """    if (!backup_sepolicy) {
+        pr_err("no backup sepolicy available, please save feature and reboot to retry!\\n");
+        return -EAGAIN;
+    }
+"""
+assert s.count(needle) == 1, "selinux_hide.c 里找不到 backup_sepolicy 检查"
+patch = needle + """
+#ifdef CONFIG_KSU_SUSFS
+    /* SUSFS 在编译期已经接管 sel_write_context / sel_write_access / setprocattr，
+       这里不能再去改 const 的 write_op[]，否则 built-in 下写坏只读页 → 开机崩溃。
+       只保留 backup sepolicy 与 fake status，running 由 feature_set 置位。 */
+    ksu_selinux_hide_keep_backup = true;
+    pr_info("selinux_hide: CONFIG_KSU_SUSFS=y, skip runtime hooks (compile-time wrappers)\n");
+    return 0;
+#endif
+"""
+open(p, "w").write(s.replace(needle, patch, 1))
+print("    selinux_hide.c: 已插入 CONFIG_KSU_SUSFS 早退分支")
+PYEOF
+
 echo "==> H 集成完成"
 echo "    KSU 分支配置文件: $(ls "$SRC/drivers/kernelsu"/Kbuild "$SRC/drivers/kernelsu"/Makefile 2>/dev/null | tr '\n' ' ')"
 echo "    SELinux 补丁命中: $(grep -c 'CONFIG_KSU_SUSFS' "$SRC/security/selinux/status.c" 2>/dev/null || echo 0) 处 status.c"
