@@ -667,16 +667,18 @@ else:
     else:
         s = s[:it] + "buf.sb = fd_file(f)->f_inode->i_sb;\n\t" + s[it:]
 
-    # filldir64 直接插在函数体开头：不依赖函数中段的具体语句
+    # filldir64 插在 buf 声明之后：只在 buf 已存在的位置插入，避免 undeclared identifier
     f = s.find("static bool filldir64(")
     if f < 0:
         print("    fs/readdir.c: filldir64 没找到")
     else:
-        b = s.find("{\n", f)
-        if b < 0:
-            print("    fs/readdir.c: filldir64 函数体没找到")
+        anc = "container_of(ctx, struct getdents_callback64, ctx);"
+        a = s.find(anc, f)
+        if a < 0:
+            print("    fs/readdir.c: filldir64 的 buf 声明没匹配上")
         else:
-            b += 2
+            a = s.find("\n", a + len(anc))
+            a += 1
             block = (
                 "\t{\n"
                 "\t\tstruct inode *sus_inode = ilookup(buf->sb, ino);\n"
@@ -690,8 +692,8 @@ else:
                 "\t\t}\n"
                 "\t}\n\n"
             )
-            s = s[:b] + block + s[b:]
-            print("    fs/readdir.c: filldir64 已注入（函数入口）")
+            s = s[:a] + block + s[a:]
+            print("    fs/readdir.c: filldir64 已注入（buf 声明之后）")
 
 open(p, "w").write(s)
 PYEOF
