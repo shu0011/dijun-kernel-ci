@@ -1,4 +1,4 @@
-﻿# dijun 内核（小米 15S Pro / 玄戒 O1 / android17-6.18）
+# dijun 内核（小米 15S Pro / 玄戒 O1 / android17-6.18）
 
 > 设备：小米 15S Pro（`dijun`），HyperOS OS4.0.5.0，玄戒 O1
 > 内核基线：`6.18.21-android17-5-g284297031c53-abogki553682993-4k`（GKI / KMI `android17-6.18`）
