@@ -80,24 +80,32 @@ static bool susfs_is_off(const char *s)
 static ssize_t susfs_buf_read(char *buf, bool enabled, char __user *ubuf,
 			      size_t count, loff_t *ppos)
 {
-	char out[SUSFS_CMDLINE_MAX + 8];
+	char *out;
 	int len;
+	size_t n;
 
 	if (*ppos)
 		return 0;
 
+	/* 不能放栈上：内核栈帧上限 2048，这里需要 2KB+ */
+	out = kmalloc(SUSFS_CMDLINE_MAX + 8, GFP_KERNEL);
+	if (!out)
+		return -ENOMEM;
+
 	mutex_lock(&susfs_proc_mutex);
-	len = enabled ? scnprintf(out, sizeof(out), "1\n%s\n", buf)
-		      : scnprintf(out, sizeof(out), "0\n");
+	len = enabled ? scnprintf(out, SUSFS_CMDLINE_MAX + 8, "1\n%s\n", buf)
+		      : scnprintf(out, SUSFS_CMDLINE_MAX + 8, "0\n");
 	mutex_unlock(&susfs_proc_mutex);
 
-	if ((size_t)len > count)
-		len = count;
-	if (copy_to_user(ubuf, out, len))
+	n = min((size_t)len, count);
+	if (copy_to_user(ubuf, out, n)) {
+		kfree(out);
 		return -EFAULT;
+	}
 
-	*ppos += len;
-	return len;
+	kfree(out);
+	*ppos += n;
+	return n;
 }
 
 static ssize_t susfs_buf_write(char *buf, size_t bufsz, bool *enabled,
