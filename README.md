@@ -2,8 +2,10 @@
 
 > 设备：小米 15S Pro（`dijun`），HyperOS OS4.0.5.0，玄戒 O1
 > 内核基线：`6.18.21-android17-5-g284297031c53-abogki553682993-4k`（GKI / KMI `android17-6.18`）
-> 当前状态：**built-in SukiSU + 完整 SELinux 隐藏已上机验证通过**，G2 早退误伤的官方隐藏动作已全部盘点并接通
-> （G4 context/access、G5 setprocattr/#3981、G6 inode_setxattr/#3996）；AK3 公测包见 Releases
+> 当前状态：**built-in SukiSU + 完整 SUSFS 移植 + SELinux 隐藏已上机验证通过**。
+> SUSFS 从"仅 SELinux 隐藏"扩展到完整能力（路径/ stat / 挂载 / maps 隐藏、uname/cmdline/version 伪装），
+> 并补齐 reboot-magic 查询 ABI，使管理器与 susfs-for-kernelsu 模块正确识别 **SUSFS v2.4.0 (GKI)**。
+> 检测软件通过、开机稳定、零 kprobe。AK3 成品包见 Releases。
 > 上游：2026-11-15 起 SukiSU-Ultra 更名为 **SukiSU-Nova**，本项目同步跟踪其 `main` 分支
 
 本仓库用 GitHub Actions 复现整套构建：AOSP `android17-6.18` 源码 + 设备原厂 `boot.img` 抽出的 config，
@@ -18,9 +20,11 @@
 | AOSP 工具链 | 预编译 clang / rustc / bindgen 0.72.1；开启 `CONFIG_RUST=y` + `CONFIG_ASHMEM=y`，否则 camera HAL 初始化会崩 |
 | SukiSU built-in | 按官方 `kernel/setup.sh` 集成到 `drivers/kernelsu`，分支 `main`；版本号**由上游 Kbuild 自动计算**（不再写死），版本串 `v3.0.0-<sha>@shushu`；管理器与 `ksud` 可用 |
 | SELinux 隐藏（完整生效） | 见下节；**检测软件已通过**，Maple「策略属性写入特征」侧信道已修，`ksud feature get 4` = enabled，开机无重启 |
+| SUSFS 完整移植 | 在仅隐藏的基础上补齐全部功能：`spoof_uname`/`cmdline`/`version`、`sus_path`（路径/stat 隐藏）、`sus_kstat`、`sus_mount`（挂载隐藏）、`sus_map`（maps/smaps 隐藏）、`namei.c` 多级挂点。功能经 `/proc/susfs_*` 接口控制（0600、root 写、uid≥10000 生效），已逐项上机验证 |
+| 管理器识别 SUSFS v2.4.0 | 内核实现 reboot-magic 查询 ABI（magic1=`0xDEADBEEF`/magic2=`0xFAFAFAFA`，cmd `0x555E1/2/3`），返回版本 `v2.4.0`、variant `GKI`、7 项功能名。**SukiSU Nova 管理器显示 "SuFS 版本 v2.4.0"，susfs-for-kernelsu 模块识别成功**（不再回退默认 v1.5.2） |
 | 零运行期 patch / 零 kprobe | 不写只读的 `write_op[]`，不挂 `selinux_hide` 相关 kprobe，隐藏全部走编译期钩子 |
 | boot 打包 | 官方 4096 B header（改 `kernel_size`）+ 自编 `Image` + 官方 vbmeta(2368 B) + 零填充 + 原 64 B AVB footer；总长不变，已多次上机验证 |
-| CI / Release | Actions 自动构建并产出 `Image`、`System.map`、`config.built`、`vmlinux.symvers`、`summary.txt`、完整日志；AK3 包在 Releases 发布 |
+| CI / Release | Actions 自动构建并产出 `Image`、`System.map`、`config.built`、`vmlinux.symvers`、`summary.txt`、完整日志；AK3 成品包在 Releases 发布 |
 
 ### SELinux 隐藏是怎么打通的
 
@@ -75,36 +79,42 @@ module 模式下这两次写入返回 `-EFAULT` 还能退到 kprobe，built-in �
 完整历史所致。G-fix 现在会补齐 KernelSU 的完整历史并在 `drivers/` 下补 `.git` 指针，
 让版本码由上游公式自动算出，不依赖网络 API。
 
+## 本项目做了什么、目的是什么
+
+**目的**：在小米 15S Pro（玄戒 O1 / android17-6.18）上，做出一套**可复现、可直接刷入**的内核——
+内置 root（SukiSU / KernelSU）、完整 SUSFS 隐藏能力，且**不依赖 LKM、不写运行期只读内存、零 kprobe**，
+在通过 root 检测的同时保持开机稳定、相机等硬件正常。所有功能最终要能被管理器和 susfs-for-kernelsu 模块
+**正确识别和管理**。
+
+**做了哪些动作**（按阶段，全部已上机验证）：
+
+1. **构建底座**：用 AOSP `android17-6.18` 源码 + 设备原厂 config 复现 GKI 构建；开启
+   `KBUILD_GENDWARFKSYMS_STABLE=1` 让导出符号 CRC 与厂商 `.ko` 对齐，避免模块版本不匹配；
+   补齐 AOSP clang / rustc / bindgen 工具链（`CONFIG_RUST` + `CONFIG_ASHMEM`，否则相机 HAL 崩）。
+2. **built-in SukiSU**：按官方 `setup.sh` 集成到 `drivers/kernelsu`，版本号由上游 Kbuild 自动计算
+   （`30000 + COUNT − 4001`，不写死），`init_boot` 保持官方原版避免两套 KSU 抢 `su`。
+3. **SELinux 隐藏（G2–G6）**：built-in 模式下官方 `selinux_hide` 的运行期 `write_op[]` 补丁会写只读段导致崩溃，
+   故 G2 让它早退；但这误伤了官方其余 5 类动作，逐一盘点并用编译期钩子接通：
+   G3 fake status、G4 context/access 走 `backup_sepolicy`、G5 setprocattr（#3981 侧信道）、
+   G6 inode_setxattr（#3996 文件 label 侧信道）。目的是让官方已有实现真正生效，而不是另造隐藏。
+4. **SUSFS 完整移植（I–O）**：从"仅 SELinux 隐藏"补齐为完整能力——uname/cmdline/version 伪装、
+   `sus_path` 路径与 stat 隐藏、`sus_kstat`、`sus_mount` 挂载隐藏、`sus_map` maps/smaps 隐藏、
+   `namei.c` 多级挂点。功能统一经 `/proc/susfs_*` 接口控制。目的是把 SUSFS 的隐藏能力真正用起来。
+5. **管理器识别 ABI（P）**：在 `kernel/reboot.c` 注入 reboot-magic 查询分发，实现只读查询
+   version/variant/features，让管理器不再回退默认 `v1.5.2`。目的是让上层工具能识别并管理这些功能。
+6. **打包与分发**：CI 自动构建 + 标准 AnyKernel3 打包，产物在 Releases 发布，管理器可直接刷入。
+
 ## 当前进度
 
-- ✅ **已完成并上机验证**：GKI ABI 对齐、Rust/ASHMEM 工具链、SukiSU built-in、SELinux 隐藏（检测软件通过）、
-  官方 `init_boot` 兼容、boot/AVB 打包、CI 可复现构建、AK3 打包。
-- ✅ **G5/G6 已修复（待上机复验）**：完整盘点 G2 早退的 6 类动作——fake status、context、access、setprocattr 已接通，
-  G5 补 setprocattr（#3981，Maple「策略属性写入特征」），G6 补最后遗漏的 inode_setxattr（#3996，文件 label 侧信道）。
-  两类都是把官方已有实现在 built-in 下接通，零 kprobe、不写只读数据。
-- 🔄 **进行中**：AK3 公测分发，收集不同机器/不同槽位/不同系统版本的反馈。
+- ✅ **全部完成并上机验证**：GKI ABI 对齐、Rust/ASHMEM 工具链、SukiSU built-in、SELinux 隐藏（检测软件通过）、
+  SUSFS 完整功能（路径/挂载/maps 隐藏、伪装）、管理器识别 SUSFS v2.4.0、官方 `init_boot` 兼容、
+  boot/AVB 打包、CI 可复现构建、AK3 打包。已合并到 `main`。
 - ⚠️ **已知限制**
-  - 目前只移植了 **SUSFS 的 SELinux 隐藏相关部分**，不是完整 SUSFS。
-  - `build.log` 尾部 BTF 类型比对 `passed=False`：7 类不一致 / 21 个缺失，均为 `pkvm_*`、`f2fs_*`、
+  - `build.log` 尾部 BTF 类型比对 `passed=False`：不一致 8 / 缺失 21，均为 `pkvm_*`、`f2fs_*`、
     `mt_device`、`fsverity_info` 等 vendor-only 类型；符号 CRC 与厂商 `.ko` 一致，实机正常开机。
   - AVB 沿用官方 vbmeta、未重算 kernel hash 描述符（设备侧校验不阻塞）。
   - `init_boot` **必须是官方原版**；刷入 LKM 版 `init_boot` 会与 built-in KSU 冲突。
   - 需要已解锁 bootloader；刷机有风险，请先备份原厂 `boot.img` / `init_boot.img`。
-
-## 下一步：SUSFS 全部移植
-
-目标是把 SUSFS 从"只用到 SELinux 隐藏"扩展到完整能力，而不是继续给隐藏打补丁：
-
-1. **逐 feature 盘点**：`sus_path` / `sus_mount`、挂载隐藏、路径与 stat 伪装、`spoof_uname`、
-   `hide ksu/su` 相关符号伪装、以及 SUSFS 对 `avc` / `setprocattr` 的其余包装，
-   逐项对照 `android17-6.18` 的内核接口，确认哪些能直接合、哪些要重写。
-2. **补齐 Kconfig 与桥接层**：目前 `CONFIG_KSU_SUSFS` 只是我们自己注册的开关，
-   全量移植需要按 feature 拆开关，并补上 `susfs_bridge.c` 对应的实现
-   （现有桥接层里 `susfs_is_sus_type_rcu()` 恒 false、`susfs_spoof_avd_allowed_rcu()` 是空壳）。
-3. **顺序**：先做不碰挂载命名空间的低风险项（uname / stat / 路径伪装），
-   再做 `sus_mount`、挂载隐藏等会影响文件系统的项，每加一项跑一次 ABI 校验 + 上机回归。
-4. **验收**：保持零运行期代码改写、零 `selinux_hide` kprobe；
-   每次改动都要能过检测软件，且开机不出现 `XR_AP_PANIC` / 连续重启。
 
 ## 构建与刷写
 
@@ -121,7 +131,7 @@ fastboot flash boot boot_g4_official_selinuxhide.img
 fastboot reboot
 ```
 
-AK3 公测包请从 **Releases** 下载，在 Recovery / KernelSU 管理器里刷入；
+AK3 成品包请从 **Releases** 下载，在 Recovery / KernelSU 管理器里刷入；
 包内 `README-AK3.txt` 会写明适用机型、槽位处理与回滚方式。
 
 回滚：刷回原厂 `boot.img`（`fastboot flash boot <原厂 boot.img>`）即可，
