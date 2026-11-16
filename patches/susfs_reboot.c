@@ -174,6 +174,11 @@ static void susfs_abi_set_uname(void __user **arg)
 	}
 	info.release[sizeof(info.release) - 1] = '\0';
 	info.version[sizeof(info.version) - 1] = '\0';
+	/* upstream rejects an empty release or version with -EFAULT */
+	if (!info.release[0] || !info.version[0]) {
+		info.err = -EFAULT;
+		goto out;
+	}
 	susfs_uname_abi_set(info.release, info.version);
 	info.err = 0;
 out:

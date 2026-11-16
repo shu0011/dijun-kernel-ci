@@ -98,6 +98,12 @@ static char *susfs_ltrim(char *s)
  */
 void susfs_uname_abi_set(const char *release, const char *version)
 {
+	/* Upstream semantics: "default" restores the real utsname value. */
+	if (release && !strcmp(release, "default"))
+		release = utsname()->release;
+	if (version && !strcmp(version, "default"))
+		version = utsname()->version;
+
 	mutex_lock(&susfs_uts_mutex);
 	memset(susfs_uts.release, 0, sizeof(susfs_uts.release));
 	memset(susfs_uts.version, 0, sizeof(susfs_uts.version));
