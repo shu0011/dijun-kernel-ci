@@ -41,6 +41,44 @@ static LIST_HEAD(susfs_paths);
 static int susfs_path_count;
 static DEFINE_MUTEX(susfs_path_mutex);
 
+/*
+ * 按"输入路径字符串"匹配，用于 namei 层（open / lookup）的早期拦截。
+ * 只处理绝对路径：相对路径（"../x"）在解析前无法确定真实位置，交给 vfs_getattr 那层。
+ */
+bool susfs_is_hidden_name(const struct filename *name)
+{
+	struct susfs_path_entry *e;
+	const char *s;
+	size_t len;
+	bool found = false;
+
+	if (!name || !name->name)
+		return false;
+
+	if (!READ_ONCE(susfs_path_count))
+		return false;
+
+	if (likely(current_uid().val < 10000))
+		return false;
+
+	s = name->name;
+	if (s[0] != '/')
+		return false;
+
+	mutex_lock(&susfs_path_mutex);
+	list_for_each_entry(e, &susfs_paths, node) {
+		len = strlen(e->path);
+		if (!strncmp(s, e->path, len) &&
+		    (s[len] == '\0' || s[len] == '/')) {
+			found = true;
+			break;
+		}
+	}
+	mutex_unlock(&susfs_path_mutex);
+
+	return found;
+}
+
 static bool susfs_path_matches(const char *real, const struct susfs_path_entry *e)
 {
 	size_t len = strlen(e->path);
