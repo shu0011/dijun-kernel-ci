@@ -945,7 +945,76 @@ if missing:
 print("    namei.c: 4/4 注入块校验通过")
 PYEOF
 
+echo "==> P 阶段8：SUSFS reboot-magic 查询 ABI（让管理器/ksu_susfs 识别版本）"
+cp "$HERE/patches/susfs_reboot.c" "$SRC/fs/susfs_reboot.c"
+cp "$HERE/patches/susfs_reboot.h" "$SRC/include/linux/susfs_reboot.h"
+if ! grep -q 'susfs_reboot\.o' "$SRC/fs/Makefile"; then
+    printf 'obj-$(CONFIG_KSU_SUSFS) += susfs_reboot.o\n' >> "$SRC/fs/Makefile"
+fi
+python3 - "$SRC" <<'PYEOF'
+import os
+import sys
+
+SRC = sys.argv[1]
+p = os.path.join(SRC, "kernel/reboot.c")
+s = open(p).read()
+
+# 1) extern 声明：插在内核已有 "DEFINE_MUTEX(system_transition_mutex);" 之后（6.12/6.18 都有）
+anchor = "DEFINE_MUTEX(system_transition_mutex);"
+decl = ("\n#ifdef CONFIG_KSU_SUSFS\n"
+        "extern int susfs_reboot_handler(int magic1, int magic2, unsigned int cmd,\n"
+        "\t\t\t\tvoid __user **arg);\n"
+        "#endif\n")
+if "susfs_reboot_handler" not in s:
+    if anchor not in s:
+        sys.exit("!! reboot.c: 找不到 DEFINE_MUTEX(system_transition_mutex)，终止")
+    s = s.replace(anchor, anchor + decl, 1)
+    print("    reboot.c: extern 声明已注入")
+else:
+    print("    reboot.c: extern 声明已存在")
+
+# 2) handler 调用：定位 SYSCALL_DEFINE4(reboot 起点，在其函数体内找 'int ret = 0;'
+#    插在该行之后。用函数边界 + 严格断言，避免锚点漂移导致静默漏功能。
+i = s.find("SYSCALL_DEFINE4(reboot")
+if i < 0:
+    sys.exit("!! reboot.c: 找不到 SYSCALL_DEFINE4(reboot，终止")
+# 函数体起点：从 i 往后找第一个 '{'
+b = s.find("{", i)
+if b < 0:
+    sys.exit("!! reboot.c: 找不到 reboot 函数体起始 '{'，终止")
+# 在合理窗口内找 'int ret = 0;'（上游 hunk 锚点）
+j = s.find("int ret = 0;", b, b + 400)
+if j < 0:
+    sys.exit("!! reboot.c: reboot 函数体内找不到 'int ret = 0;'，终止")
+
+call_block = (
+    "\n#ifdef CONFIG_KSU_SUSFS\n"
+    "\t{\n"
+    "\t\tint susfs_ret = susfs_reboot_handler(magic1, magic2, cmd, &arg);\n"
+    "\t\tif (!susfs_ret)\n"
+    "\t\t\treturn 0;   /* SUSFS query handled */\n"
+    "\t}\n"
+    "#endif\n"
+)
+if "susfs_reboot_handler(magic1" in s[j - 200:j + 200] or \
+   "susfs_reboot_handler(magic1" in s[j:j + 400]:
+    print("    reboot.c: handler 调用已存在")
+else:
+    # 插在 'int ret = 0;' 这一整行之后
+    eol = s.find("\n", j)
+    s = s[:eol + 1] + call_block + s[eol + 1:]
+    print("    reboot.c: handler 调用已注入（SYSCALL_DEFINE4 reboot）")
+
+open(p, "w").write(s)
+
+# 严格校验：最终文件里两处标记都必须存在
+check = open(p).read()
+if "extern int susfs_reboot_handler" not in check or \
+   "susfs_reboot_handler(magic1, magic2, cmd, &arg)" not in check:
+    sys.exit("!! reboot.c: P 阶段注入块校验失败，终止")
+print("    reboot.c: P 阶段 2/2 注入块校验通过")
+PYEOF
+
 echo "==> H 集成完成"
 echo "    KSU 分支配置文件: $(ls "$SRC/drivers/kernelsu"/Kbuild "$SRC/drivers/kernelsu"/Makefile 2>/dev/null | tr '\n' ' ')"
 echo "    SELinux 补丁命中: $(grep -c 'CONFIG_KSU_SUSFS' "$SRC/security/selinux/status.c" 2>/dev/null || echo 0) 处 status.c"
-
