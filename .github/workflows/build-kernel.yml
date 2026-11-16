@@ -191,6 +191,19 @@ jobs:
             --allow-missing \
             --json out/btf-report.json | tee -a out/build.log || true
 
+      - name: 打包 AK3
+        if: hashFiles('out/Image') != ''
+        run: |
+          set -eux
+          git clone --depth 1 https://github.com/osm0sis/AnyKernel3 /tmp/ak3
+          rm -rf /tmp/ak3/.git /tmp/ak3/.github /tmp/ak3/modules /tmp/ak3/patch /tmp/ak3/ramdisk
+          cp "$GITHUB_WORKSPACE/out/Image" /tmp/ak3/Image
+          cp "$GITHUB_WORKSPACE/ak3/anykernel.sh" /tmp/ak3/anykernel.sh
+          ( cd /tmp/ak3 && zip -r9 "$GITHUB_WORKSPACE/out/AK3-dijun-${{ github.run_number }}.zip" . )
+          ls -l out/AK3-*.zip
+          sha256sum out/AK3-*.zip
+          unzip -l out/AK3-*.zip
+
       - name: 摘要
         if: always()
         run: python3 tools/summary.py
