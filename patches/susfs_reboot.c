@@ -340,7 +340,8 @@ int susfs_reboot_handler(int magic1, int magic2, unsigned int cmd,
 			susfs_extra_set_sus_path_uid_filter(*arg) :
 			susfs_extra_set_priority_uid_filter(*arg);
 
-		copy_to_user(&p->err, &err, sizeof(err));
+		if (copy_to_user(&p->err, &err, sizeof(err)))
+			return -EFAULT;
 		return 0;
 	}
 
@@ -350,7 +351,8 @@ int susfs_reboot_handler(int magic1, int magic2, unsigned int cmd,
 			(struct susfs_abi_open_redirect __user *)*arg;
 		int err = susfs_extra_add_open_redirect(*arg);
 
-		copy_to_user(&p->err, &err, sizeof(err));
+		if (copy_to_user(&p->err, &err, sizeof(err)))
+			return -EFAULT;
 		return 0;
 	}
 
