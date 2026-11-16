@@ -28,6 +28,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/susfs_path.h>
+#include <linux/susfs_extra.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
 
@@ -51,7 +52,10 @@ bool susfs_is_inode_sus_path(struct inode *inode)
 	if (!inode || !READ_ONCE(susfs_path_count))
 		return false;
 
-	if (likely(current_uid().val < 10000))
+	/* SUS_PATH_UID_FILTER: allow-list of uids that may see the real path.
+	 * With no filter configured this keeps the legacy "hide for all app
+	 * uids" behaviour (see susfs_uid_hidden_for_sus_path()). */
+	if (!susfs_uid_hidden_for_sus_path(current_uid().val))
 		return false;
 
 	mutex_lock(&susfs_path_mutex);

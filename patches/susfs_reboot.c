@@ -32,6 +32,7 @@
 #include <linux/susfs_kstat.h>
 #include <linux/susfs_uname.h>
 #include <linux/susfs_proc.h>
+#include <linux/susfs_extra.h>
 
 /* Feature list reported to userspace.  Order and names match upstream
  * susfs_get_enabled_features() so the WebUI maps 1:1.  Only features this
@@ -41,9 +42,16 @@ static const char susfs_feature_list[] =
 	"CONFIG_KSU_SUSFS_SUS_MOUNT\n"
 	"CONFIG_KSU_SUSFS_SUS_KSTAT\n"
 	"CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
+	"CONFIG_KSU_SUSFS_ENABLE_LOG\n"
 	"CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS\n"
 	"CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n"
-	"CONFIG_KSU_SUSFS_SUS_MAP\n";
+	"CONFIG_KSU_SUSFS_OPEN_REDIRECT\n"
+	"CONFIG_KSU_SUSFS_SUS_MAP\n"
+	"CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n";
+/* Note: SUS_PATH_UID_FILTER is a sub-feature of SUS_PATH in upstream's
+ * feature list (upstream does NOT list it separately in SHOW_ENABLED_FEATURES
+ * — it is gated by CONFIG_KSU_SUSFS_SUS_PATH).  We implement it but report
+ * the same 10 names upstream reports, keeping the WebUI mapping 1:1. */
 
 /* ---------- read-only query commands ---------- */
 static void susfs_query_show_version(void __user **arg)
@@ -301,16 +309,51 @@ int susfs_reboot_handler(int magic1, int magic2, unsigned int cmd,
 		susfs_abi_set_mount_toggle(arg);
 		return 0;
 
-	/* enable_log / avc_log_spoofing: no log sink in this build; absorb so
-	 * the official scripts don't treat them as unsupported. */
-	case SUSFS_ABI_CMD_ENABLE_LOG:
+	/* enable_log: real static-key log switch. */
+	case SUSFS_ABI_CMD_ENABLE_LOG: {
+		struct susfs_abi_bool info = {0};
+
+		if (copy_from_user(&info, (struct susfs_abi_bool __user *)*arg,
+				   sizeof(info)))
+			return -EFAULT;
+		susfs_extra_enable_log(info.enabled);
+		info.err = 0;
+		if (copy_to_user((struct susfs_abi_bool __user *)*arg, &info,
+				 sizeof(info)))
+			return -EFAULT;
+		return 0;
+	}
+
+	/* avc_log_spoofing: bridge exposes a spoofing static key but this build
+	 * has no av-rule table; absorb so official scripts see success. */
 	case SUSFS_ABI_CMD_ENABLE_AVC_SPOOF:
 		susfs_abi_bool_ok(arg);
 		return 0;
 
-	/* uid-filter / open-redirect commands are not implemented in this
-	 * built-in port; leave them unsupported so the tool reports
-	 * "operation not supported, please enable it in kernel". */
+	/* uid filters (SUS_PATH allow-list + PRIORITY deny-list).
+	 * err lives at offset 65536 in struct susfs_abi_uid_filter. */
+	case SUSFS_ABI_CMD_SET_SUS_PATH_UID:
+	case SUSFS_ABI_CMD_SET_PRIORITY_UID: {
+		struct susfs_abi_uid_filter __user *p =
+			(struct susfs_abi_uid_filter __user *)*arg;
+		int err = (cmd == SUSFS_ABI_CMD_SET_SUS_PATH_UID) ?
+			susfs_extra_set_sus_path_uid_filter(*arg) :
+			susfs_extra_set_priority_uid_filter(*arg);
+
+		copy_to_user(&p->err, &err, sizeof(err));
+		return 0;
+	}
+
+	/* open_redirect: target path -> redirected path. err at offset 516. */
+	case SUSFS_ABI_CMD_ADD_OPEN_REDIRECT: {
+		struct susfs_abi_open_redirect __user *p =
+			(struct susfs_abi_open_redirect __user *)*arg;
+		int err = susfs_extra_add_open_redirect(*arg);
+
+		copy_to_user(&p->err, &err, sizeof(err));
+		return 0;
+	}
+
 	default:
 		return -EINVAL;
 	}

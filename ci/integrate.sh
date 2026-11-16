@@ -62,6 +62,28 @@ config KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
 	  Upstream SUSFS 的符号隐藏：在 kernel/kallsyms.c 的 s_show() 里按前缀
 	  过滤 ksu_/susfs_ 等符号名。编译期实现，零 kprobe。
 
+config KSU_SUSFS_ENABLE_LOG
+	bool "Enable SUSFS kernel logging (static key)"
+	depends on KSU_SUSFS
+	default y
+	help
+	  Runtime-switchable SUSFS logging via CMD_SUSFS_ENABLE_LOG.
+
+config KSU_SUSFS_OPEN_REDIRECT
+	bool "Enable SUSFS open_redirect"
+	depends on KSU_SUSFS
+	default y
+	help
+	  Redirect a target path to a user-defined path on openat.
+
+config KSU_SUSFS_PRIORITY_UID_FILTER
+	bool "Enable SUSFS priority UID filter"
+	depends on KSU_SUSFS
+	default y
+	help
+	  Hide user-defined uids from get/setpriority and ioprio syscalls.
+	  (SUS_PATH_UID_FILTER shares the SUS_PATH gate; it has no own CONFIG.)
+
 """
 i = s.rfind("endmenu")
 if i < 0:
@@ -1022,6 +1044,11 @@ if "extern int susfs_reboot_handler" not in check or \
     sys.exit("!! reboot.c: P 阶段注入块校验失败，终止")
 print("    reboot.c: P 阶段 2/2 注入块校验通过")
 PYEOF
+
+echo "==> R 阶段：SUSFS extra features（ENABLE_LOG / UID_FILTER / OPEN_REDIRECT）"
+cp "$HERE/patches/susfs_extra.c" "$SRC/fs/susfs_extra.c"
+cp "$HERE/patches/susfs_extra.h" "$SRC/include/linux/susfs_extra.h"
+python3 "$HERE/ci/integrate_extra.py" "$SRC" "$HERE/patches"
 
 echo "==> Q 阶段：SUSFS 符号隐藏（kernel/kallsyms.c s_show，编译期，对齐上游 6.12）"
 python3 - "$SRC" <<'PYEOF'

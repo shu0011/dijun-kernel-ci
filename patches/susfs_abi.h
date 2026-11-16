@@ -106,4 +106,22 @@ struct susfs_abi_str16 {
 	int err;
 };
 
+/* ---- extra features (byte-identical to upstream userspace structs) ---- */
+/* CMD_SUSFS_SET_SUS_PATH_UID_FILTER 0x55554 and
+ * CMD_SUSFS_SET_PRIORITY_UID_FILTER 0x60030 share this layout.
+ * sizeof = 65540, err offset = 65536. */
+#define SUSFS_ABI_APP_STR_BUF_SIZE 65535
+struct susfs_abi_uid_filter {
+	char app_strings[SUSFS_ABI_APP_STR_BUF_SIZE];
+	int err;
+};
+
+/* CMD_SUSFS_ADD_OPEN_REDIRECT 0x555c0. sizeof = 520, err offset = 516. */
+struct susfs_abi_open_redirect {
+	char target_pathname[SUSFS_ABI_MAX_LEN_PATHNAME];
+	char redirected_pathname[SUSFS_ABI_MAX_LEN_PATHNAME];
+	int uid_scheme;
+	int err;
+};
+
 #endif /* _SUSFS_ABI_H */
