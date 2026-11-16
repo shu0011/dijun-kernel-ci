@@ -587,9 +587,13 @@ inject("fs/proc/cmdline.c", "cmdline_proc_show",
        "\tif (susfs_spoof_cmdline_show(m))\n\t\treturn 0;\n")
 inject("fs/proc/version.c", "version_proc_show",
        "\tif (susfs_spoof_version_show(m))\n\t\treturn 0;\n")
+# 上游把 cmdline 与 bootconfig 当同一件事处理（GKI 开 CONFIG_BOOT_CONFIG，
+# /proc/cmdline 的内容由 bootconfig 生成），这里两处都接
+inject("fs/proc/bootconfig.c", "boot_config_proc_show",
+       "\tif (susfs_spoof_cmdline_show(m))\n\t\treturn 0;\n")
 PYEOF
 
-echo "==> K 阶段3：sus_path（inode 匹配，对齐上游 susfs4ksu）"
+echo "==> K 阶段3：sus_path（inode 匹配，挂点对齐上游 fs/namei.c + fs/readdir.c）"
 cp "$HERE/patches/susfs_path.c" "$SRC/fs/susfs_path.c"
 cp "$HERE/patches/susfs_path.h" "$SRC/include/linux/susfs_path.h"
 if ! grep -q 'susfs_path\.o' "$SRC/fs/Makefile"; then
@@ -597,28 +601,36 @@ if ! grep -q 'susfs_path\.o' "$SRC/fs/Makefile"; then
 fi
 python3 - "$SRC" <<'PYEOF'
 import os
-import re
 import sys
 
 SRC = sys.argv[1]
 
-# 1) fs/stat.c：vfs_getattr 入口按 inode 判断
-p = os.path.join(SRC, "fs/stat.c")
+# 1) fs/namei.c：link_path_walk 的主循环，路径解析的必经点。
+#    上游在此处判断 nd->path.dentry 的 inode，命中直接 -ENOENT。
+p = os.path.join(SRC, "fs/namei.c")
 s = open(p).read()
 if "susfs_path.h" not in s:
     i = s.find("#include")
-    assert i > 0, "fs/stat.c: 没找到 include"
+    assert i > 0, "fs/namei.c: 没找到 include"
     s = s[:i] + "#include <linux/susfs_path.h>\n" + s[i:]
 
-pat = re.compile(r"(int vfs_getattr\(const struct path \*path, struct kstat \*stat,\s*u32 request_mask, unsigned int query_flags\)\s*\{\n)")
-m = pat.search(s)
-if not m:
-    print("    fs/stat.c: vfs_getattr 没匹配上，跳过")
+anchor = "\t\tidmap = mnt_idmap(nd->path.mnt);\n\t\terr = may_lookup(idmap, nd);\n"
+if anchor not in s:
+    print("    fs/namei.c: link_path_walk 注入点没匹配上，跳过")
 else:
-    call = "\tif (susfs_is_inode_sus_path(d_inode(path->dentry)))\n\t\treturn -ENOENT;\n\n"
-    s = s[:m.end()] + call + s[m.end():]
-    open(p, "w").write(s)
-    print("    fs/stat.c: vfs_getattr 已注入")
+    block = (
+        "\t\t{\n"
+        "\t\t\tstruct dentry *sus_dentry = nd->path.dentry;\n"
+        "\n"
+        "\t\t\tif (sus_dentry->d_inode &&\n"
+        "\t\t\t    susfs_is_inode_sus_path(sus_dentry->d_inode))\n"
+        "\t\t\t\treturn -ENOENT;\n"
+        "\t\t}\n"
+        "\n"
+    )
+    s = s.replace(anchor, block + anchor, 1)
+    print("    fs/namei.c: link_path_walk 已注入 sus_path 判断")
+open(p, "w").write(s)
 
 # 2) fs/readdir.c：getdents64 取 sb，filldir64 跳过隐藏条目
 p = os.path.join(SRC, "fs/readdir.c")
