@@ -11,6 +11,7 @@
  * 与 LKM 版的语义保持一致：只改 release/version 两个字段，
  * sysname/nodename/machine 不动（那三项在 GKI 上本来就是通用值）。
  */
+#include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -76,9 +77,24 @@ static ssize_t susfs_uname_read(struct file *file, char __user *buf,
 	return len;
 }
 
+static void susfs_rtrim(char *s)
+{
+	size_t n = strlen(s);
+
+	while (n && (s[n - 1] == ' ' || s[n - 1] == '\t'))
+		s[--n] = '\0';
+}
+
+static char *susfs_ltrim(char *s)
+{
+	while (*s == ' ' || *s == '\t')
+		s++;
+	return s;
+}
+
 /*
  * 写入解析：按第一个换行切成 release / version 两段；
- * 两段都会被 strstrip 去掉首尾空白，空串表示"该字段不伪装"。
+ * 两段都会去掉首尾空白，空串表示"该字段不伪装"。
  */
 static ssize_t susfs_uname_write(struct file *file, const char __user *buf,
 				 size_t count, loff_t *ppos)
@@ -117,9 +133,11 @@ static ssize_t susfs_uname_write(struct file *file, const char __user *buf,
 	nl = strchr(kbuf, '\n');
 	if (nl) {
 		*nl = '\0';
-		strscpy(ver, strstrip(nl + 1), sizeof(ver));
+		strscpy(ver, susfs_ltrim(nl + 1), sizeof(ver));
+		susfs_rtrim(ver);
 	}
-	strscpy(rel, strstrip(kbuf), sizeof(rel));
+	strscpy(rel, susfs_ltrim(kbuf), sizeof(rel));
+	susfs_rtrim(rel);
 
 	mutex_lock(&susfs_uts_mutex);
 	strscpy(susfs_uts.release, rel, sizeof(susfs_uts.release));
@@ -135,13 +153,13 @@ static ssize_t susfs_uname_write(struct file *file, const char __user *buf,
 static const struct proc_ops susfs_uname_fops = {
 	.proc_read  = susfs_uname_read,
 	.proc_write = susfs_uname_write,
-	.proc_lseek = no_llseek,
+	.proc_lseek = noop_llseek,
 };
 #else
 static const struct file_operations susfs_uname_fops = {
 	.read  = susfs_uname_read,
 	.write = susfs_uname_write,
-	.llseek = no_llseek,
+	.llseek = noop_llseek,
 };
 #endif
 
