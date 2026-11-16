@@ -5,7 +5,7 @@
  * Command ids and payload layouts are copied verbatim from upstream
  * gitlab.com/simonpunk/susfs4ksu, branch gki-android16-6.12:
  *   ksu_susfs/jni/includes/susfs_defs.h
- *   ksu_susfs/jni/features/*.c
+ *   ksu_susfs/jni/features/  (all .c files)
  *   kernel_patches/include/linux/susfs.h + susfs_def.h
  *
  * The ksu_susfs tool issues:
@@ -49,7 +49,7 @@
 #define SUSFS_ABI_CMD_ADD_SUS_MAP         0x60020
 #define SUSFS_ABI_CMD_SET_PRIORITY_UID    0x60030
 
-/* payload layouts — field order/types identical to userspace features/*.c */
+/* payload layouts — field order/types identical to userspace features/ .c files */
 struct susfs_abi_sus_path {
 	char target_pathname[SUSFS_ABI_MAX_LEN_PATHNAME];
 	int err;
