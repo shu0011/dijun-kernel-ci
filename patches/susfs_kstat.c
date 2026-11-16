@@ -153,7 +153,6 @@ static ssize_t susfs_kstat_write(struct file *file, const char __user *ubuf,
 				 size_t count, loff_t *ppos)
 {
 	char *kbuf, *sep, *mode_str;
-	char path[PATH_MAX];
 	u64 size = 0;
 	unsigned long mode = 0;
 	size_t len;
@@ -193,7 +192,7 @@ static ssize_t susfs_kstat_write(struct file *file, const char __user *ubuf,
 		kfree(kbuf);
 		return -ENAMETOOLONG;
 	}
-	strscpy(path, kbuf, sizeof(path));
+	/* kbuf 已在堆上，*sep='\0' 后其前半段即 path，直接复用，避免栈上 PATH_MAX 缓冲 */
 
 	if (sscanf(sep + 1, "%llu %lo", &size, &mode) < 1) {
 		kfree(kbuf);
@@ -202,7 +201,7 @@ static ssize_t susfs_kstat_write(struct file *file, const char __user *ubuf,
 	mode_str = strchr(sep + 1, ' ');
 	(void)mode_str;
 
-	ret = susfs_kstat_add(path, size, (unsigned int)mode);
+	ret = susfs_kstat_add(kbuf, size, (unsigned int)mode);
 	kfree(kbuf);
 
 	return ret ? ret : count;
