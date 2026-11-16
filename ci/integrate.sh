@@ -552,6 +552,43 @@ open(path, "w").write(s)
 print("    sys.c: newuname/uname 出口已接 susfs_spoof_uname")
 PYEOF
 
+echo "==> J 阶段2：/proc/cmdline 与 /proc/version 伪装"
+cp "$HERE/patches/susfs_proc.c" "$SRC/fs/susfs_proc.c"
+cp "$HERE/patches/susfs_proc.h" "$SRC/include/linux/susfs_proc.h"
+if ! grep -q 'susfs_proc\.o' "$SRC/fs/Makefile"; then
+    printf 'obj-$(CONFIG_KSU_SUSFS) += susfs_proc.o\n' >> "$SRC/fs/Makefile"
+fi
+python3 - "$SRC" <<'PYEOF'
+import os
+import re
+import sys
+
+SRC = sys.argv[1]
+
+
+def inject(rel, fn, call):
+    p = os.path.join(SRC, rel)
+    s = open(p).read()
+    if "susfs_proc.h" not in s:
+        i = s.find("#include")
+        assert i > 0, rel + ": 没找到 include"
+        s = s[:i] + "#include <linux/susfs_proc.h>\n" + s[i:]
+    pat = re.compile(r"(static int " + fn + r"\(struct seq_file \*m, void \*v\)\s*\{\n)")
+    m = pat.search(s)
+    if not m:
+        print("    %s: %s 没匹配上，跳过" % (rel, fn))
+        return
+    s = s[:m.end()] + call + s[m.end():]
+    open(p, "w").write(s)
+    print("    %s: %s 已注入" % (rel, fn))
+
+
+inject("fs/proc/cmdline.c", "cmdline_proc_show",
+       "\tif (susfs_spoof_cmdline_show(m))\n\t\treturn 0;\n")
+inject("fs/proc/version.c", "version_proc_show",
+       "\tif (susfs_spoof_version_show(m))\n\t\treturn 0;\n")
+PYEOF
+
 echo "==> H 集成完成"
 echo "    KSU 分支配置文件: $(ls "$SRC/drivers/kernelsu"/Kbuild "$SRC/drivers/kernelsu"/Makefile 2>/dev/null | tr '\n' ' ')"
 echo "    SELinux 补丁命中: $(grep -c 'CONFIG_KSU_SUSFS' "$SRC/security/selinux/status.c" 2>/dev/null || echo 0) 处 status.c"
