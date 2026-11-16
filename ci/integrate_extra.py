@@ -110,21 +110,22 @@ if MARK not in s:
     s = s.replace(cleanup_anchor, cleanup_block, 1)
 
     # (4) vfs_readlink: spoof readlink on redirected inode (before cached-link fast path)
-    rl_anchor = ("int vfs_readlink(struct dentry *dentry, char __user *buffer, int buflen)\n"
-                 "{\n")
-    assert rl_anchor in s, "namei.c: vfs_readlink signature anchor not found"
-    rl_block = (
-        "int vfs_readlink(struct dentry *dentry, char __user *buffer, int buflen)\n"
-        "{\n"
+    # Inserted *after* the function's declarations so we never emit a statement
+    # before a declaration (-Wdeclaration-after-statement).
+    rl_anchor = ("\tstruct inode *inode = d_inode(dentry);\n"
+                 "\tDEFINE_DELAYED_CALL(done);\n"
+                 "\tconst char *link;\n"
+                 "\tint res;\n")
+    assert rl_anchor in s, "namei.c: vfs_readlink declarations anchor not found"
+    rl_block = rl_anchor + (
         "#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n"
-        "\tif (susfs_inode_has_open_redirect(d_inode(dentry))) {\n"
-        "\t\tchar susfs_buf[PATH_MAX];\n"
-        "\t\tint susfs_len;\n"
-        "\t\tsusfs_len = susfs_open_redirect_readlink(d_inode(dentry),\n"
-        "\t\t\t\tsusfs_buf, sizeof(susfs_buf));\n"
-        "\t\tif (susfs_len >= 0)\n"
-        "\t\t\treturn readlink_copy(buffer, buflen, susfs_buf,\n"
-        "\t\t\t\t\t     strlen(susfs_buf));\n"
+        "\t{\n"
+        "\t\tint susfs_rl;\n"
+        "\t\t/* no local buffer: the helper writes straight to @buffer, so\n"
+        "\t\t * vfs_readlink()'s 2 KiB stack frame budget is preserved. */\n"
+        "\t\tsusfs_rl = susfs_open_redirect_readlink(inode, buffer, buflen);\n"
+        "\t\tif (susfs_rl >= 0)\n"
+        "\t\t\treturn susfs_rl;\n"
         "\t}\n"
         "#endif\n")
     s = s.replace(rl_anchor, rl_block, 1)

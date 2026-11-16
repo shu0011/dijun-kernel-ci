@@ -40,9 +40,12 @@ struct filename;
 struct filename *susfs_open_redirect_filename(struct inode *inode);
 /* True if this inode participates in any redirect (flag check, no uid test). */
 bool susfs_inode_has_open_redirect(struct inode *inode);
-/* Fill buf with the spoofed target path for readlink on the redirected inode;
- * returns 0 on success, negative errno otherwise. */
-int susfs_open_redirect_readlink(struct inode *inode, char *buf, int buflen);
+/* Spoof readlink() on a redirected inode: writes the target path straight into
+ * the caller's user buffer.  Returns >= 0 (bytes) when handled, -ENOENT if the
+ * inode has no redirect rule.  Deliberately takes the user buffer so callers
+ * need no PATH_MAX stack buffer (kernel stack limit is 2 KiB). */
+int susfs_open_redirect_readlink(struct inode *inode, char __user *buffer,
+				 int buflen);
 
 /* ---- ABI setters (root-only, called from susfs_reboot.c) ---- */
 int susfs_extra_enable_log(bool enabled);

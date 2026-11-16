@@ -26,6 +26,7 @@
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/printk.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/string.h>
@@ -357,19 +358,27 @@ struct filename *susfs_open_redirect_filename(struct inode *inode)
 	return ret;
 }
 
-int susfs_open_redirect_readlink(struct inode *inode, char *buf, int buflen)
+/*
+ * Called from vfs_readlink() before the cached-link fast path.  Writes the
+ * spoofed target straight into the caller's user buffer with readlink_copy(),
+ * so the hook needs no stack buffer of its own (a PATH_MAX local inside
+ * vfs_readlink() trips -Wframe-larger-than=2048).
+ * Returns >= 0 (bytes copied) when handled, -ENOENT when there is no rule.
+ */
+int susfs_open_redirect_readlink(struct inode *inode, char __user *buffer,
+				 int buflen)
 {
 	struct susfs_redirect_entry *e;
 	int ret = -ENOENT;
 
-	if (!susfs_inode_has_open_redirect(inode))
+	if (!inode || !susfs_inode_has_open_redirect(inode))
 		return -ENOENT;
 
 	mutex_lock(&susfs_redirect_mutex);
 	list_for_each_entry(e, &susfs_redirect_list, list) {
 		if (e->redirect_inode == inode) {
-			strscpy(buf, e->target_path, buflen);
-			ret = 0;
+			ret = readlink_copy(buffer, buflen, e->target_path,
+					    strlen(e->target_path));
 			break;
 		}
 	}
