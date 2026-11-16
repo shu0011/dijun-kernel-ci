@@ -593,7 +593,7 @@ inject("fs/proc/bootconfig.c", "boot_config_proc_show",
        "\tif (susfs_spoof_cmdline_show(m))\n\t\treturn 0;\n")
 PYEOF
 
-echo "==> K 阶段3：sus_path（inode 匹配，挂点对齐上游 fs/namei.c + fs/readdir.c）"
+echo "==> K 阶段3：sus_path（inode 匹配）"
 cp "$HERE/patches/susfs_path.c" "$SRC/fs/susfs_path.c"
 cp "$HERE/patches/susfs_path.h" "$SRC/include/linux/susfs_path.h"
 if ! grep -q 'susfs_path\.o' "$SRC/fs/Makefile"; then
@@ -601,19 +601,36 @@ if ! grep -q 'susfs_path\.o' "$SRC/fs/Makefile"; then
 fi
 python3 - "$SRC" <<'PYEOF'
 import os
+import re
 import sys
 
 SRC = sys.argv[1]
 
-# 1) fs/namei.c：link_path_walk 的主循环，路径解析的必经点。
-#    上游在此处判断 nd->path.dentry 的 inode，命中直接 -ENOENT。
-p = os.path.join(SRC, "fs/namei.c")
-s = open(p).read()
-if "susfs_path.h" not in s:
-    i = s.find("#include")
-    assert i > 0, "fs/namei.c: 没找到 include"
-    s = s[:i] + "#include <linux/susfs_path.h>\n" + s[i:]
 
+def add_include(path, header):
+    s = open(path).read()
+    if header not in s:
+        i = s.find("#include")
+        assert i > 0, path + ": 没找到 include"
+        s = s[:i] + "#include <%s>\n" % header + s[i:]
+    return s
+
+
+# 1) fs/stat.c: vfs_getattr 按 inode 判断（覆盖 stat 隐藏路径本身）
+p = os.path.join(SRC, "fs/stat.c")
+s = add_include(p, "linux/susfs_path.h")
+pat = re.compile(r"(int vfs_getattr\(const struct path \*path, struct kstat \*stat,\s*u32 request_mask, unsigned int query_flags\)\s*\{\n)")
+m = pat.search(s)
+if not m:
+    print("    fs/stat.c: vfs_getattr 没匹配上，跳过")
+else:
+    s = s[:m.end()] + "\tif (susfs_is_inode_sus_path(d_inode(path->dentry)))\n\t\treturn -ENOENT;\n\n" + s[m.end():]
+    open(p, "w").write(s)
+    print("    fs/stat.c: vfs_getattr 已注入")
+
+# 2) fs/namei.c: link_path_walk 主循环（覆盖 open/exec 子路径）
+p = os.path.join(SRC, "fs/namei.c")
+s = add_include(p, "linux/susfs_path.h")
 anchor = "\t\tidmap = mnt_idmap(nd->path.mnt);\n\t\terr = may_lookup(idmap, nd);\n"
 if anchor not in s:
     print("    fs/namei.c: link_path_walk 注入点没匹配上，跳过")
@@ -629,20 +646,16 @@ else:
         "\n"
     )
     s = s.replace(anchor, block + anchor, 1)
-    print("    fs/namei.c: link_path_walk 已注入 sus_path 判断")
+    print("    fs/namei.c: link_path_walk 已注入")
 open(p, "w").write(s)
 
-# 2) fs/readdir.c：getdents64 取 sb，filldir64 跳过隐藏条目
+# 3) fs/readdir.c: getdents64 取 sb；filldir64 入口按 inode 跳过
 p = os.path.join(SRC, "fs/readdir.c")
-s = open(p).read()
-if "susfs_path.h" not in s:
-    i = s.find("#include")
-    assert i > 0, "fs/readdir.c: 没找到 include"
-    s = s[:i] + "#include <linux/susfs_path.h>\n" + s[i:]
+s = add_include(p, "linux/susfs_path.h")
 
 i = s.find("struct getdents_callback64 {")
 if i < 0:
-    print("    fs/readdir.c: getdents_callback64 没匹配上，readdir 部分跳过")
+    print("    fs/readdir.c: getdents_callback64 没匹配上，readdir 跳过")
 else:
     j = s.find("{", i) + 1
     s = s[:j] + "\n\tstruct super_block *sb;" + s[j:]
@@ -654,28 +667,31 @@ else:
     else:
         s = s[:it] + "buf.sb = fd_file(f)->f_inode->i_sb;\n\t" + s[it:]
 
+    # filldir64 直接插在函数体开头：不依赖函数中段的具体语句
     f = s.find("static bool filldir64(")
-    anchor = "if (prev_reclen && signal_pending(current))\n\t\treturn false;\n"
-    a = s.find(anchor, f) if f >= 0 else -1
-    if a < 0:
-        print("    fs/readdir.c: filldir64 注入点没匹配上")
+    if f < 0:
+        print("    fs/readdir.c: filldir64 没找到")
     else:
-        a += len(anchor)
-        block = (
-            "\n\t{\n"
-            "\t\tstruct inode *sus_inode = ilookup(buf->sb, ino);\n"
-            "\n"
-            "\t\tif (sus_inode) {\n"
-            "\t\t\tbool sus_hidden = susfs_is_inode_sus_path(sus_inode);\n"
-            "\n"
-            "\t\t\tiput(sus_inode);\n"
-            "\t\t\tif (sus_hidden)\n"
-            "\t\t\t\treturn true;\n"
-            "\t\t}\n"
-            "\t}\n"
-        )
-        s = s[:a] + block + s[a:]
-        print("    fs/readdir.c: filldir64 已注入")
+        b = s.find("{\n", f)
+        if b < 0:
+            print("    fs/readdir.c: filldir64 函数体没找到")
+        else:
+            b += 2
+            block = (
+                "\t{\n"
+                "\t\tstruct inode *sus_inode = ilookup(buf->sb, ino);\n"
+                "\n"
+                "\t\tif (sus_inode) {\n"
+                "\t\t\tbool sus_hidden = susfs_is_inode_sus_path(sus_inode);\n"
+                "\n"
+                "\t\t\tiput(sus_inode);\n"
+                "\t\t\tif (sus_hidden)\n"
+                "\t\t\t\treturn true;\n"
+                "\t\t}\n"
+                "\t}\n\n"
+            )
+            s = s[:b] + block + s[b:]
+            print("    fs/readdir.c: filldir64 已注入（函数入口）")
 
 open(p, "w").write(s)
 PYEOF
