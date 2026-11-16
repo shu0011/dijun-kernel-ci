@@ -15,7 +15,7 @@
  * exposes those through /proc/susfs_* nodes instead.  Any unhandled command
  * returns -EINVAL so kernel/reboot.c falls through to the normal reboot flow.
  */
-#include "susfs_reboot.h"
+#include <linux/susfs_reboot.h>
 
 #include <linux/errno.h>
 #include <linux/cred.h>
