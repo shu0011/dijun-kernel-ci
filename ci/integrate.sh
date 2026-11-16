@@ -698,6 +698,45 @@ else:
 open(p, "w").write(s)
 PYEOF
 
+echo "==> L 阶段4：sus_kstat（伪造 stat 字段）"
+cp "$HERE/patches/susfs_kstat.c" "$SRC/fs/susfs_kstat.c"
+cp "$HERE/patches/susfs_kstat.h" "$SRC/include/linux/susfs_kstat.h"
+if ! grep -q 'susfs_kstat\.o' "$SRC/fs/Makefile"; then
+    printf 'obj-$(CONFIG_KSU_SUSFS) += susfs_kstat.o\n' >> "$SRC/fs/Makefile"
+fi
+python3 - "$SRC" <<'PYEOF'
+import os
+import sys
+
+SRC = sys.argv[1]
+p = os.path.join(SRC, "fs/stat.c")
+s = open(p).read()
+
+if "susfs_kstat.h" not in s:
+    i = s.find("#include")
+    s = s[:i] + "#include <linux/susfs_kstat.h>\n" + s[i:]
+
+# 紧跟在 stage-3 注入的 sus_path 判断之后
+anchor = "\tif (susfs_is_inode_sus_path(d_inode(path->dentry)))\n\t\treturn -ENOENT;\n\n"
+if anchor not in s:
+    print("    fs/stat.c: sus_path 锚点不在，sus_kstat 跳过")
+else:
+    block = (
+        "\tif (susfs_is_inode_sus_kstat(d_inode(path->dentry))) {\n"
+        "\t\tstruct inode *sus_kst_inode = d_inode(path->dentry);\n"
+        "\n"
+        "\t\tgeneric_fillattr(mnt_idmap(path->mnt), request_mask,\n"
+        "\t\t\t\t sus_kst_inode, stat);\n"
+        "\t\tsusfs_kstat_override(sus_kst_inode, stat);\n"
+        "\t\treturn 0;\n"
+        "\t}\n"
+        "\n"
+    )
+    s = s.replace(anchor, anchor + block, 1)
+    print("    fs/stat.c: sus_kstat 已注入")
+open(p, "w").write(s)
+PYEOF
+
 echo "==> H 集成完成"
 echo "    KSU 分支配置文件: $(ls "$SRC/drivers/kernelsu"/Kbuild "$SRC/drivers/kernelsu"/Makefile 2>/dev/null | tr '\n' ' ')"
 echo "    SELinux 补丁命中: $(grep -c 'CONFIG_KSU_SUSFS' "$SRC/security/selinux/status.c" 2>/dev/null || echo 0) 处 status.c"
