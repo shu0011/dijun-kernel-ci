@@ -1,19 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * SUSFS stage-3: sus_path（按路径隐藏）。
- * 编译期在 vfs_getattr 入口插一行判断，app uid 命中路径时返回 -ENOENT。
+ * SUSFS stage-3: sus_path（inode 级匹配，与上游 susfs4ksu 一致）。
  */
 #ifndef _LINUX_SUSFS_PATH_H
 #define _LINUX_SUSFS_PATH_H
 
 #include <linux/fs.h>
-#include <linux/path.h>
 #include <linux/types.h>
 
-/* true 表示该路径对当前 app 进程应当"不存在"（按已解析的真实路径判断） */
-bool susfs_is_hidden_path(const struct path *path);
-
-/* 同上，但按用户传入的路径字符串判断，用于 open/lookup 的早期拦截 */
-bool susfs_is_hidden_name(const struct filename *name);
+/* true 表示该 inode 属于被隐藏的路径；uid < 10000 恒为 false */
+bool susfs_is_inode_sus_path(struct inode *inode);
 
 #endif /* _LINUX_SUSFS_PATH_H */
