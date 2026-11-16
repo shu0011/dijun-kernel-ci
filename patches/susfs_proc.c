@@ -12,6 +12,9 @@
  *
  * 参考 LKM 版（susfs）的 spoof_cmdline 语义：整体替换，不做逐项过滤，
  * 因为检测软件对比的是"是否存在可疑参数"，逐项删更容易露出破绽。
+ *
+ * 注意：/proc/version 伪装是本项目的扩展，上游 susfs 没有这一项。
+ * 上游只处理 /proc/cmdline（通过 fs/proc/bootconfig.c），这里两处都覆盖。
  */
 #include <linux/err.h>
 #include <linux/fs.h>
