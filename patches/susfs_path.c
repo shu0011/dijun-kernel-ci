@@ -41,6 +41,24 @@ static LIST_HEAD(susfs_paths);
 static int susfs_path_count;
 static DEFINE_MUTEX(susfs_path_mutex);
 
+static bool susfs_path_matches(const char *real, const struct susfs_path_entry *e)
+{
+	size_t len = strlen(e->path);
+
+	/* 精确命中 */
+	if (!strcmp(real, e->path))
+		return true;
+
+	/*
+	 * 前缀命中必须落在路径分隔符上：隐藏 /a/b 时 /a/b/c 也算隐藏，
+	 * 但 /a/b_backup 不算，避免误伤同前缀的兄弟目录。
+	 */
+	if (len && real[len] == '/' && !strncmp(real, e->path, len))
+		return true;
+
+	return false;
+}
+
 bool susfs_is_hidden_path(const struct path *path)
 {
 	struct susfs_path_entry *e;
@@ -66,7 +84,7 @@ bool susfs_is_hidden_path(const struct path *path)
 
 	mutex_lock(&susfs_path_mutex);
 	list_for_each_entry(e, &susfs_paths, node) {
-		if (!strcmp(p, e->path)) {
+		if (susfs_path_matches(p, e)) {
 			found = true;
 			break;
 		}
