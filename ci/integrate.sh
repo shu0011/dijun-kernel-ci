@@ -517,6 +517,41 @@ open(hk, "w").write(t)
 print("    hooks.c: inode_setxattr 挂载点切到 G6 handle")
 PYEOF
 
+echo "==> I 阶段1：SUSFS spoof_uname（built-in，proc 接口，零运行期改写）"
+cp "$HERE/patches/susfs_uname.c" "$SRC/fs/susfs_uname.c"
+cp "$HERE/patches/susfs_uname.h" "$SRC/include/linux/susfs_uname.h"
+if ! grep -q 'susfs_uname\.o' "$SRC/fs/Makefile"; then
+    printf 'obj-$(CONFIG_KSU_SUSFS) += susfs_uname.o\n' >> "$SRC/fs/Makefile"
+fi
+python3 - "$SRC/kernel/sys.c" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+s = open(path).read()
+
+inc = "#include <linux/susfs_uname.h>\n"
+if inc not in s:
+    anchor = "#include <linux/syscalls.h>\n"
+    assert anchor in s, "kernel/sys.c: #include <linux/syscalls.h> 没找到"
+    s = s.replace(anchor, anchor + inc, 1)
+
+# newuname / uname 两个系统调用都要挂，glibc 的 uname(2) 走的是后者
+for fn in ("SYSCALL_DEFINE1(newuname,", "SYSCALL_DEFINE0(uname,"):
+    i = s.find(fn)
+    if i < 0:
+        print("    sys.c: %s 不存在，跳过" % fn)
+        continue
+    j = s.find("up_read(&uts_sem);", i)
+    assert j > 0, "kernel/sys.c: %s 里没找到 up_read(&uts_sem)" % fn
+    j += len("up_read(&uts_sem);")
+    if "susfs_spoof_uname" in s[j:j + 80]:
+        continue
+    s = s[:j] + "\n\tsusfs_spoof_uname(&tmp);" + s[j:]
+
+open(path, "w").write(s)
+print("    sys.c: newuname/uname 出口已接 susfs_spoof_uname")
+PYEOF
+
 echo "==> H 集成完成"
 echo "    KSU 分支配置文件: $(ls "$SRC/drivers/kernelsu"/Kbuild "$SRC/drivers/kernelsu"/Makefile 2>/dev/null | tr '\n' ' ')"
 echo "    SELinux 补丁命中: $(grep -c 'CONFIG_KSU_SUSFS' "$SRC/security/selinux/status.c" 2>/dev/null || echo 0) 处 status.c"
