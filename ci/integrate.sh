@@ -589,7 +589,7 @@ inject("fs/proc/version.c", "version_proc_show",
        "\tif (susfs_spoof_version_show(m))\n\t\treturn 0;\n")
 PYEOF
 
-echo "==> K 阶段3：sus_path（按路径隐藏）"
+echo "==> K 阶段3：sus_path（inode 匹配，对齐上游 susfs4ksu）"
 cp "$HERE/patches/susfs_path.c" "$SRC/fs/susfs_path.c"
 cp "$HERE/patches/susfs_path.h" "$SRC/include/linux/susfs_path.h"
 if ! grep -q 'susfs_path\.o' "$SRC/fs/Makefile"; then
@@ -601,62 +601,70 @@ import re
 import sys
 
 SRC = sys.argv[1]
+
+# 1) fs/stat.c：vfs_getattr 入口按 inode 判断
 p = os.path.join(SRC, "fs/stat.c")
 s = open(p).read()
-
 if "susfs_path.h" not in s:
     i = s.find("#include")
     assert i > 0, "fs/stat.c: 没找到 include"
     s = s[:i] + "#include <linux/susfs_path.h>\n" + s[i:]
 
-# vfs_getattr 是 stat/lstat/fstatat 的公共入口，签名自 4.11 起未变
 pat = re.compile(r"(int vfs_getattr\(const struct path \*path, struct kstat \*stat,\s*u32 request_mask, unsigned int query_flags\)\s*\{\n)")
 m = pat.search(s)
 if not m:
-    print("    fs/stat.c: vfs_getattr 没匹配上，sus_path 挂点跳过")
+    print("    fs/stat.c: vfs_getattr 没匹配上，跳过")
 else:
-    call = "\tif (susfs_is_hidden_path(path))\n\t\treturn -ENOENT;\n\n"
+    call = "\tif (susfs_is_inode_sus_path(d_inode(path->dentry)))\n\t\treturn -ENOENT;\n\n"
     s = s[:m.end()] + call + s[m.end():]
     open(p, "w").write(s)
-    print("    fs/stat.c: vfs_getattr 已注入 sus_path 判断")
+    print("    fs/stat.c: vfs_getattr 已注入")
 
-# open(2) 与 lookup(stat/access/chmod) 都不经过 vfs_getattr，必须挂在 namei 入口。
-# 这两处按"输入路径字符串"匹配，只对绝对路径生效。
-p = os.path.join(SRC, "fs/namei.c")
+# 2) fs/readdir.c：getdents64 取 sb，filldir64 跳过隐藏条目
+p = os.path.join(SRC, "fs/readdir.c")
 s = open(p).read()
-
 if "susfs_path.h" not in s:
     i = s.find("#include")
-    assert i > 0, "fs/namei.c: 没找到 include"
+    assert i > 0, "fs/readdir.c: 没找到 include"
     s = s[:i] + "#include <linux/susfs_path.h>\n" + s[i:]
 
+i = s.find("struct getdents_callback64 {")
+if i < 0:
+    print("    fs/readdir.c: getdents_callback64 没匹配上，readdir 部分跳过")
+else:
+    j = s.find("{", i) + 1
+    s = s[:j] + "\n\tstruct super_block *sb;" + s[j:]
 
-def inject_fn(text, sig, call, label):
-    i = text.find(sig)
-    if i < 0:
-        print("    fs/namei.c: %s 没匹配上，跳过" % label)
-        return text
-    j = text.find("{\n", i)
-    if j < 0:
-        print("    fs/namei.c: %s 函数体没匹配上，跳过" % label)
-        return text
-    j += 2
-    print("    fs/namei.c: %s 已注入 sus_path 判断" % label)
-    return text[:j] + call + text[j:]
+    k = s.find("SYSCALL_DEFINE3(getdents64")
+    it = s.find("error = iterate_dir(fd_file(f), &buf.ctx);", k if k >= 0 else 0)
+    if it < 0:
+        print("    fs/readdir.c: iterate_dir 没匹配上")
+    else:
+        s = s[:it] + "buf.sb = fd_file(f)->f_inode->i_sb;\n\t" + s[it:]
 
+    f = s.find("static bool filldir64(")
+    anchor = "if (prev_reclen && signal_pending(current))\n\t\treturn false;\n"
+    a = s.find(anchor, f) if f >= 0 else -1
+    if a < 0:
+        print("    fs/readdir.c: filldir64 注入点没匹配上")
+    else:
+        a += len(anchor)
+        block = (
+            "\n\t{\n"
+            "\t\tstruct inode *sus_inode = ilookup(buf->sb, ino);\n"
+            "\n"
+            "\t\tif (sus_inode) {\n"
+            "\t\t\tbool sus_hidden = susfs_is_inode_sus_path(sus_inode);\n"
+            "\n"
+            "\t\t\tiput(sus_inode);\n"
+            "\t\t\tif (sus_hidden)\n"
+            "\t\t\t\treturn true;\n"
+            "\t\t}\n"
+            "\t}\n"
+        )
+        s = s[:a] + block + s[a:]
+        print("    fs/readdir.c: filldir64 已注入")
 
-s = inject_fn(
-    s,
-    "struct file *do_filp_open(",
-    "\tif (susfs_is_hidden_name(pathname))\n\t\treturn ERR_PTR(-ENOENT);\n\n",
-    "do_filp_open (open)",
-)
-s = inject_fn(
-    s,
-    "struct dentry *filename_lookup(",
-    "\tif (susfs_is_hidden_name(name))\n\t\treturn ERR_PTR(-ENOENT);\n\n",
-    "filename_lookup (stat/access)",
-)
 open(p, "w").write(s)
 PYEOF
 
