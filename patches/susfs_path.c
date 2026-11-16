@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * SUSFS stage-3: sus_path（built-in）
+ * SUSFS stage-3: sus_path（built-in，inode 匹配）
+ *
+ * 与上游 susfs4ksu 一致：加入路径时解析成 inode 并 igrab()，之后所有判断都是
+ * 指针比较（susfs_is_inode_sus_path），因此硬链接 / bind mount / 相对路径
+ * 这些绕过路径字符串的手段都无效。
  *
  * 控制接口：/proc/susfs_add_sus_path  0600
- *   写绝对路径      -> 加入隐藏列表（重复写入幂等）
- *   写 "clear"      -> 清空列表
- *   读              -> 每行一个路径
+ *   写绝对路径 -> 解析并加入（重复写幂等）
+ *   写 "clear" -> 清空并 iput
+ *   读         -> 每行一个已加入路径（仅用于查看，不参与匹配）
  *
- * 匹配方式：d_path() 取真实路径后与列表逐项 strcmp。
- * 只对 app uid（>= 10000）生效，系统进程/root 不受影响——这点和 LKM 版一致，
- * 否则 init 在开机阶段会因为找不到 /data/adb 相关路径而崩。
+ * 只对 app uid（>= 10000）生效：系统进程若被隐藏，开机阶段会找不到 /data/adb 而崩。
  */
 #include <linux/cred.h>
 #include <linux/dcache.h>
@@ -18,8 +20,8 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/limits.h>
-#include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/namei.h>
 #include <linux/path.h>
 #include <linux/proc_fs.h>
 #include <linux/sched.h>
@@ -33,114 +35,47 @@
 #define SUSFS_PATH_PROC "susfs_add_sus_path"
 
 struct susfs_path_entry {
-	struct list_head node;
-	char path[PATH_MAX];
+	struct inode *inode;
+	char path[PATH_MAX];	/* 仅用于回读展示 */
 };
 
-static LIST_HEAD(susfs_paths);
+static struct susfs_path_entry susfs_paths[SUSFS_MAX_PATHS];
 static int susfs_path_count;
 static DEFINE_MUTEX(susfs_path_mutex);
 
-/*
- * 按"输入路径字符串"匹配，用于 namei 层（open / lookup）的早期拦截。
- * 只处理绝对路径：相对路径（"../x"）在解析前无法确定真实位置，交给 vfs_getattr 那层。
- */
-bool susfs_is_hidden_name(const struct filename *name)
+bool susfs_is_inode_sus_path(struct inode *inode)
 {
-	struct susfs_path_entry *e;
-	const char *s;
-	size_t len;
+	int i;
 	bool found = false;
 
-	if (!name || !name->name)
-		return false;
-
-	if (!READ_ONCE(susfs_path_count))
+	if (!inode || !READ_ONCE(susfs_path_count))
 		return false;
 
 	if (likely(current_uid().val < 10000))
 		return false;
 
-	s = name->name;
-	if (s[0] != '/')
-		return false;
-
 	mutex_lock(&susfs_path_mutex);
-	list_for_each_entry(e, &susfs_paths, node) {
-		len = strlen(e->path);
-		if (!strncmp(s, e->path, len) &&
-		    (s[len] == '\0' || s[len] == '/')) {
+	for (i = 0; i < susfs_path_count; i++) {
+		if (susfs_paths[i].inode == inode) {
 			found = true;
 			break;
 		}
 	}
 	mutex_unlock(&susfs_path_mutex);
 
-	return found;
-}
-
-static bool susfs_path_matches(const char *real, const struct susfs_path_entry *e)
-{
-	size_t len = strlen(e->path);
-
-	/* 精确命中 */
-	if (!strcmp(real, e->path))
-		return true;
-
-	/*
-	 * 前缀命中必须落在路径分隔符上：隐藏 /a/b 时 /a/b/c 也算隐藏，
-	 * 但 /a/b_backup 不算，避免误伤同前缀的兄弟目录。
-	 */
-	if (len && real[len] == '/' && !strncmp(real, e->path, len))
-		return true;
-
-	return false;
-}
-
-bool susfs_is_hidden_path(const struct path *path)
-{
-	struct susfs_path_entry *e;
-	char *buf, *p;
-	bool found = false;
-
-	if (!READ_ONCE(susfs_path_count))
-		return false;
-
-	/* 系统进程一律放行 */
-	if (likely(current_uid().val < 10000))
-		return false;
-
-	buf = kmalloc(PATH_MAX, GFP_KERNEL);
-	if (!buf)
-		return false;
-
-	p = d_path(path, buf, PATH_MAX);
-	if (IS_ERR(p)) {
-		kfree(buf);
-		return false;
-	}
-
-	mutex_lock(&susfs_path_mutex);
-	list_for_each_entry(e, &susfs_paths, node) {
-		if (susfs_path_matches(p, e)) {
-			found = true;
-			break;
-		}
-	}
-	mutex_unlock(&susfs_path_mutex);
-
-	kfree(buf);
 	return found;
 }
 
 static void susfs_path_clear(void)
 {
-	struct susfs_path_entry *e, *tmp;
+	int i;
 
 	mutex_lock(&susfs_path_mutex);
-	list_for_each_entry_safe(e, tmp, &susfs_paths, node) {
-		list_del(&e->node);
-		kfree(e);
+	for (i = 0; i < susfs_path_count; i++) {
+		if (susfs_paths[i].inode)
+			iput(susfs_paths[i].inode);
+		susfs_paths[i].inode = NULL;
+		susfs_paths[i].path[0] = '\0';
 	}
 	susfs_path_count = 0;
 	mutex_unlock(&susfs_path_mutex);
@@ -148,32 +83,45 @@ static void susfs_path_clear(void)
 
 static int susfs_path_add(const char *path)
 {
-	struct susfs_path_entry *e;
-	int ret = 0;
+	struct path p;
+	struct inode *inode;
+	int i, ret;
 
 	if (path[0] != '/')
 		return -EINVAL;
 
+	ret = kern_path(path, 0, &p);
+	if (ret)
+		return ret;
+
+	inode = d_backing_inode(p.dentry);
+	if (!inode) {
+		path_put(&p);
+		return -ENOENT;
+	}
+
 	mutex_lock(&susfs_path_mutex);
-	list_for_each_entry(e, &susfs_paths, node) {
-		if (!strcmp(e->path, path))
-			goto out;	/* 已存在，幂等 */
+	for (i = 0; i < susfs_path_count; i++) {
+		if (susfs_paths[i].inode == inode) {
+			mutex_unlock(&susfs_path_mutex);
+			path_put(&p);
+			return 0;	/* 已存在 */
+		}
 	}
 	if (susfs_path_count >= SUSFS_MAX_PATHS) {
-		ret = -ENOSPC;
-		goto out;
+		mutex_unlock(&susfs_path_mutex);
+		path_put(&p);
+		return -ENOSPC;
 	}
-	e = kzalloc(sizeof(*e), GFP_KERNEL);
-	if (!e) {
-		ret = -ENOMEM;
-		goto out;
-	}
-	strscpy(e->path, path, sizeof(e->path));
-	list_add_tail(&e->node, &susfs_paths);
+
+	ihold(inode);
+	susfs_paths[susfs_path_count].inode = inode;
+	strscpy(susfs_paths[susfs_path_count].path, path, PATH_MAX);
 	susfs_path_count++;
-out:
 	mutex_unlock(&susfs_path_mutex);
-	return ret;
+
+	path_put(&p);
+	return 0;
 }
 
 static ssize_t susfs_path_write(struct file *file, const char __user *ubuf,
@@ -215,10 +163,9 @@ static ssize_t susfs_path_write(struct file *file, const char __user *ubuf,
 static ssize_t susfs_path_read(struct file *file, char __user *ubuf,
 			       size_t count, loff_t *ppos)
 {
-	struct susfs_path_entry *e;
 	char *out;
 	size_t used = 0;
-	int n;
+	int i, n;
 
 	if (*ppos)
 		return 0;
@@ -228,8 +175,9 @@ static ssize_t susfs_path_read(struct file *file, char __user *ubuf,
 		return -ENOMEM;
 
 	mutex_lock(&susfs_path_mutex);
-	list_for_each_entry(e, &susfs_paths, node) {
-		n = scnprintf(out + used, PAGE_SIZE - used, "%s\n", e->path);
+	for (i = 0; i < susfs_path_count; i++) {
+		n = scnprintf(out + used, PAGE_SIZE - used, "%s\n",
+			      susfs_paths[i].path);
 		if (n <= 0)
 			break;
 		used += n;
