@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+﻿#!/usr/bin/env bash
 # 集成 SukiSU + SUSFS 的 SELinux 隐藏。
 #
 # KSU 部分严格按官方指南来（docs/guide/how-to-integrate.md）：
@@ -21,7 +21,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 echo "==> A 按官方指南集成 KernelSU（分支 $KSU_BRANCH）"
 cd "$SRC"
-curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+curl -LSs "https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nova/main/kernel/setup.sh" \
     | bash -s "$KSU_BRANCH"
 
 echo "==> B symlink 换成实目录"
@@ -104,8 +104,10 @@ echo "==> G 固定 KSU 版本串"
 # Kbuild 里 KSU_VERSION_FULL 靠 git describe 拼，分支名会是 main。
 # 用户要 @shushu，直接写死；sha 和 tag 从 setup.sh 克隆的仓库里读。
 KSU_SHA=$(git -C "$SRC/KernelSU" rev-parse --short=8 HEAD 2>/dev/null || echo unknown)
-KSU_TAG=$(git -C "$SRC/KernelSU" describe --tags --abbrev=0 2>/dev/null | sed 's/^v//' || true)
-[ -n "${KSU_TAG:-}" ] || KSU_TAG=4.3.0
+# Nova 的 CI 会推一个 manager-ci 标签，它比 v3.0.0 还晚，describe 优先选中它，
+# 版本串于是变成 vmanager-ci-<sha>@shushu。只认语义化版本标签。
+KSU_TAG=$(git -C "$SRC/KernelSU" tag --list 'v[0-9]*' --sort=-v:refname 2>/dev/null | head -1 | sed 's/^v//' || true)
+[ -n "${KSU_TAG:-}" ] || KSU_TAG=3.0.0
 sed -i "s|^KSU_VERSION_FULL := .*|KSU_VERSION_FULL := v${KSU_TAG}-${KSU_SHA}@shushu|" \
     "$SRC/drivers/kernelsu/Kbuild"
 grep -n 'KSU_VERSION_FULL :=' "$SRC/drivers/kernelsu/Kbuild"
@@ -518,3 +520,4 @@ PYEOF
 echo "==> H 集成完成"
 echo "    KSU 分支配置文件: $(ls "$SRC/drivers/kernelsu"/Kbuild "$SRC/drivers/kernelsu"/Makefile 2>/dev/null | tr '\n' ' ')"
 echo "    SELinux 补丁命中: $(grep -c 'CONFIG_KSU_SUSFS' "$SRC/security/selinux/status.c" 2>/dev/null || echo 0) 处 status.c"
+
