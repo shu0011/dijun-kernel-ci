@@ -21,8 +21,10 @@ root 随 `boot` 分区的 `Image` 内置；标准 AK3 只刷写 `boot`，**不�
 | SukiSU built-in | 按官方 `kernel/setup.sh` 集成到 `drivers/kernelsu`，分支 `main`；版本号**由上游 Kbuild 自动计算**（不再写死），版本串 `v3.0.0-<sha>@shushu`；管理器与 `ksud` 可用 |
 | SELinux 隐藏（完整生效） | 见下节；**检测软件已通过**，Maple「策略属性写入特征」侧信道已修，`ksud feature get 4` = enabled，开机无重启 |
 | SUSFS 完整移植 | 在仅隐藏的基础上补齐全部功能：`spoof_uname`/`cmdline`/`version`、`sus_path`（路径/stat 隐藏）、`sus_kstat`、`sus_mount`（挂载隐藏）、`sus_map`（maps/smaps 隐藏）、`namei.c` 多级挂点。功能经 `/proc/susfs_*` 接口控制（0600、root 写、uid≥10000 生效），已逐项上机验证 |
-| 管理器识别 SUSFS v2.4.0 | 内核实现 reboot-magic 查询 ABI（magic1=`0xDEADBEEF`/magic2=`0xFAFAFAFA`，cmd `0x555E1/2/3`），返回版本 `v2.4.0`、variant `GKI`、7 项功能名。**SukiSU Nova 管理器显示 "SuFS 版本 v2.4.0"，susfs-for-kernelsu 模块识别成功**（不再回退默认 v1.5.2） |
-| 零运行期 patch / 零 kprobe | 不写只读的 `write_op[]`，不挂 `selinux_hide` 相关 kprobe，隐藏全部走编译期钩子 |
+| 官方命令字 ABI 对齐 | 内核实现 upstream `ksu_susfs` 的全套 `CMD_SUSFS_*` 命令字（magic1=`0xDEADBEEF`/magic2=`0xFAFAFAFA`，载荷 struct 逐字段对齐官方 gki-android16-6.12）：`add_sus_path`/`add_sus_map`/`add_sus_kstat`/`set_uname`/`set_cmdline` 等落到与 `/proc` 共享的状态源，官方 susfs4ksu 模块脚本的配置下发真正生效。命令字与 `/proc` 两套入口等价 |
+| 管理器识别 SUSFS v2.4.0 | reboot-magic 查询返回版本 `v2.4.0`、variant `GKI`、按官方顺序的功能名。**SukiSU Nova 管理器显示 "SuFS 版本 v2.4.0"，susfs-for-kernelsu 模块识别成功**（不再回退默认 v1.5.2） |
+| 符号隐藏（kallsyms） | 按上游 GKI patch 在 `kernel/kallsyms.c` 的 `s_show()` 里编译期过滤 18 个前缀（`ksu_`/`__ksu_`/`susfs_`/`ksud`/…），`/proc/kallsyms` 不再暴露 KSU/SUSFS 符号名；`CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS`（default y），零 kprobe |
+| 零运行期 patch / 零 kprobe | 不写只读的 `write_op[]`，不挂 kprobe；SELinux 隐藏、符号隐藏全部走编译期钩子（与官方 v2.0.0 起"不依赖 KPROBES"的路线一致） |
 | boot 打包 | 官方 4096 B header（改 `kernel_size`）+ 自编 `Image` + 官方 vbmeta(2368 B) + 零填充 + 原 64 B AVB footer；总长不变，已多次上机验证 |
 | CI / Release | Actions 自动构建并产出 `Image`、`System.map`、`config.built`、`vmlinux.symvers`、`summary.txt`、完整日志；AK3 成品包在 Releases 发布 |
 
@@ -101,8 +103,12 @@ module 模式下这两次写入返回 `-EFAULT` 还能退到 kprobe，built-in �
    `sus_path` 路径与 stat 隐藏、`sus_kstat`、`sus_mount` 挂载隐藏、`sus_map` maps/smaps 隐藏、
    `namei.c` 多级挂点。功能统一经 `/proc/susfs_*` 接口控制。目的是把 SUSFS 的隐藏能力真正用起来。
 5. **管理器识别 ABI（P）**：在 `kernel/reboot.c` 注入 reboot-magic 查询分发，实现只读查询
-   version/variant/features，让管理器不再回退默认 `v1.5.2`。目的是让上层工具能识别并管理这些功能。
-6. **打包与分发**：CI 自动构建 + 标准 AnyKernel3 打包，产物在 Releases 发布，管理器可直接刷入。
+   version/variant/features，让管理器不再回退默认 `v1.5.2`。目的是让上层工具能识别这些功能。
+6. **官方命令字 ABI + 符号隐藏（Q/R）**：对齐上游 `gki-android16-6.12`，把 `ksu_susfs` 的
+   全套 `CMD_SUSFS_*` 命令字接进 reboot handler，按官方 struct 载荷解析、落到与 `/proc` 共享的功能状态，
+   使官方 susfs4ksu 模块的配置下发真正生效（此前只有查询命令、功能命令全被拒）；并按官方 patch
+   在 `kallsyms.c` 编译期过滤 KSU/SUSFS 符号名。目的是让功能接口、符号可见性与官方完全一致，零 kprobe。
+7. **打包与分发**：CI 自动构建 + 标准 AnyKernel3 打包，产物在 Releases 发布，管理器可直接刷入。
 
 ## 当前进度
 
