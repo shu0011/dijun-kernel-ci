@@ -10,7 +10,7 @@
 
 本仓库用 GitHub Actions 复现整套构建：AOSP `android17-6.18` 源码 + 设备原厂 `boot.img` 抽出的 config，
 编译出可直接刷入 `boot` 分区、内置 SukiSU Ultra 与 SELinux 隐藏的内核。
-`init_boot` 保持**官方原版**，不注入 LKM —— 这样不会有两套 KSU 互相抢 `su`。
+root 随 `boot` 分区的 `Image` 内置；标准 AK3 只刷写 `boot`，**不触碰 `init_boot`**，因此不存在与 init_boot 的冲突。
 
 ## 当前实现的功能
 
@@ -92,7 +92,7 @@ module 模式下这两次写入返回 `-EFAULT` 还能退到 kprobe，built-in �
    `KBUILD_GENDWARFKSYMS_STABLE=1` 让导出符号 CRC 与厂商 `.ko` 对齐，避免模块版本不匹配；
    补齐 AOSP clang / rustc / bindgen 工具链（`CONFIG_RUST` + `CONFIG_ASHMEM`，否则相机 HAL 崩）。
 2. **built-in SukiSU**：按官方 `setup.sh` 集成到 `drivers/kernelsu`，版本号由上游 Kbuild 自动计算
-   （`30000 + COUNT − 4001`，不写死），`init_boot` 保持官方原版避免两套 KSU 抢 `su`。
+   （`30000 + COUNT − 4001`，不写死）；root 随 `boot` 内置，AK3 刷入不涉及 `init_boot`。
 3. **SELinux 隐藏（G2–G6）**：built-in 模式下官方 `selinux_hide` 的运行期 `write_op[]` 补丁会写只读段导致崩溃，
    故 G2 让它早退；但这误伤了官方其余 5 类动作，逐一盘点并用编译期钩子接通：
    G3 fake status、G4 context/access 走 `backup_sepolicy`、G5 setprocattr（#3981 侧信道）、
@@ -107,14 +107,13 @@ module 模式下这两次写入返回 `-EFAULT` 还能退到 kprobe，built-in �
 ## 当前进度
 
 - ✅ **全部完成并上机验证**：GKI ABI 对齐、Rust/ASHMEM 工具链、SukiSU built-in、SELinux 隐藏（检测软件通过）、
-  SUSFS 完整功能（路径/挂载/maps 隐藏、伪装）、管理器识别 SUSFS v2.4.0、官方 `init_boot` 兼容、
+  SUSFS 完整功能（路径/挂载/maps 隐藏、伪装）、管理器识别 SUSFS v2.4.0、标准 AK3 刷入不动 `init_boot`、
   boot/AVB 打包、CI 可复现构建、AK3 打包。已合并到 `main`。
 - ⚠️ **已知限制**
   - `build.log` 尾部 BTF 类型比对 `passed=False`：不一致 8 / 缺失 21，均为 `pkvm_*`、`f2fs_*`、
     `mt_device`、`fsverity_info` 等 vendor-only 类型；符号 CRC 与厂商 `.ko` 一致，实机正常开机。
   - AVB 沿用官方 vbmeta、未重算 kernel hash 描述符（设备侧校验不阻塞）。
-  - `init_boot` **必须是官方原版**；刷入 LKM 版 `init_boot` 会与 built-in KSU 冲突。
-  - 需要已解锁 bootloader；刷机有风险，请先备份原厂 `boot.img` / `init_boot.img`。
+  - 需要已解锁 bootloader；刷机有风险，请先备份原厂 `boot.img`（标准 AK3 只刷 `boot`，无需备份 `init_boot`）。
 
 ## 构建与刷写
 
@@ -126,7 +125,7 @@ gh run download --name dijun-kernel-<run_number> -D ./artifacts
 # 或本地打包（需 CI 产物 out/Image 与原厂 boot.img）
 # 布局见 ci/integrate.sh 与 Releases 里的交付说明
 
-# 刷写（init_boot 保持官方原版）
+# 刷写（标准 AK3 只刷 boot，不触碰 init_boot）
 fastboot flash boot boot_g4_official_selinuxhide.img
 fastboot reboot
 ```
