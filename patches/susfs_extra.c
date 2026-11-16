@@ -21,11 +21,13 @@
 #include <linux/errno.h>
 #include <linux/fs.h>
 #include <linux/gfp.h>
+#include <linux/init_task.h>	/* init_cred */
 #include <linux/jump_label.h>
 #include <linux/kstrtox.h>
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/namei.h>	/* kern_path() */
 #include <linux/printk.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
