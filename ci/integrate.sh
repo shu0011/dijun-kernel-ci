@@ -619,6 +619,45 @@ else:
     s = s[:m.end()] + call + s[m.end():]
     open(p, "w").write(s)
     print("    fs/stat.c: vfs_getattr 已注入 sus_path 判断")
+
+# open(2) 与 lookup(stat/access/chmod) 都不经过 vfs_getattr，必须挂在 namei 入口。
+# 这两处按"输入路径字符串"匹配，只对绝对路径生效。
+p = os.path.join(SRC, "fs/namei.c")
+s = open(p).read()
+
+if "susfs_path.h" not in s:
+    i = s.find("#include")
+    assert i > 0, "fs/namei.c: 没找到 include"
+    s = s[:i] + "#include <linux/susfs_path.h>\n" + s[i:]
+
+
+def inject_fn(text, sig, call, label):
+    i = text.find(sig)
+    if i < 0:
+        print("    fs/namei.c: %s 没匹配上，跳过" % label)
+        return text
+    j = text.find("{\n", i)
+    if j < 0:
+        print("    fs/namei.c: %s 函数体没匹配上，跳过" % label)
+        return text
+    j += 2
+    print("    fs/namei.c: %s 已注入 sus_path 判断" % label)
+    return text[:j] + call + text[j:]
+
+
+s = inject_fn(
+    s,
+    "struct file *do_filp_open(",
+    "\tif (susfs_is_hidden_name(pathname))\n\t\treturn ERR_PTR(-ENOENT);\n\n",
+    "do_filp_open (open)",
+)
+s = inject_fn(
+    s,
+    "struct dentry *filename_lookup(",
+    "\tif (susfs_is_hidden_name(name))\n\t\treturn ERR_PTR(-ENOENT);\n\n",
+    "filename_lookup (stat/access)",
+)
+open(p, "w").write(s)
 PYEOF
 
 echo "==> H 集成完成"
