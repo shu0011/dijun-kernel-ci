@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 # 集成 SukiSU + SUSFS 的 SELinux 隐藏。
 #
 # KSU 部分严格按官方指南来（docs/guide/how-to-integrate.md）：
