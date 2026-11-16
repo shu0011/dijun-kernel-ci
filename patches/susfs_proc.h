@@ -15,4 +15,8 @@
 bool susfs_spoof_cmdline_show(struct seq_file *m);
 bool susfs_spoof_version_show(struct seq_file *m);
 
+/* 官方 ksu_susfs CMD_SUSFS_SET_CMDLINE_OR_BOOTCONFIG ABI 设置入口。
+ * 传入整行伪装内容；NULL/空串表示关闭。 */
+void susfs_cmdline_abi_set(const char *cmdline);
+
 #endif /* _LINUX_SUSFS_PROC_H */

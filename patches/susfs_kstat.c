@@ -149,6 +149,11 @@ static int susfs_kstat_add(const char *path, u64 size, unsigned int mode)
 	return 0;
 }
 
+int susfs_kstat_abi_add(const char *path, u64 size, unsigned int mode)
+{
+	return susfs_kstat_add(path, size, mode);
+}
+
 static ssize_t susfs_kstat_write(struct file *file, const char __user *ubuf,
 				 size_t count, loff_t *ppos)
 {

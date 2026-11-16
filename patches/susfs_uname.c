@@ -96,6 +96,19 @@ static char *susfs_ltrim(char *s)
  * 写入解析：按第一个换行切成 release / version 两段；
  * 两段都会去掉首尾空白，空串表示"该字段不伪装"。
  */
+void susfs_uname_abi_set(const char *release, const char *version)
+{
+	mutex_lock(&susfs_uts_mutex);
+	memset(susfs_uts.release, 0, sizeof(susfs_uts.release));
+	memset(susfs_uts.version, 0, sizeof(susfs_uts.version));
+	if (release && release[0])
+		strscpy(susfs_uts.release, release, sizeof(susfs_uts.release));
+	if (version && version[0])
+		strscpy(susfs_uts.version, version, sizeof(susfs_uts.version));
+	susfs_uts.enabled = (susfs_uts.release[0] || susfs_uts.version[0]);
+	mutex_unlock(&susfs_uts_mutex);
+}
+
 static ssize_t susfs_uname_write(struct file *file, const char __user *buf,
 				 size_t count, loff_t *ppos)
 {

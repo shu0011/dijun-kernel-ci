@@ -47,13 +47,20 @@ if 'config KSU_SUSFS' in s:
     sys.exit(0)
 block = """
 config KSU_SUSFS
-	bool "SUSFS (SELinux hiding only)"
+	bool "SUSFS (built-in full port)"
 	depends on KSU
 	default y
 	help
-	  SUSFS 的 SELinux 隐藏：伪造 getenforce 返回值、拦截 /sys/fs/selinux
-	  读写路径、过滤 AVC 日志里的 ksu 痕迹。不含 sus_path / sus_mount /
-	  open_redirect 这些必须改 VFS 的功能。
+	  SUSFS built-in 移植：SELinux 隐藏 + sus_path/mount/kstat/map、
+	  spoof uname/cmdline，以及 ksu_susfs 命令字 ABI。
+
+config KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+	bool "Hide ksu/susfs symbols from /proc/kallsyms"
+	depends on KSU_SUSFS
+	default y
+	help
+	  Upstream SUSFS 的符号隐藏：在 kernel/kallsyms.c 的 s_show() 里按前缀
+	  过滤 ksu_/susfs_ 等符号名。编译期实现，零 kprobe。
 
 """
 i = s.rfind("endmenu")
@@ -948,6 +955,7 @@ PYEOF
 echo "==> P 阶段8：SUSFS reboot-magic 查询 ABI（让管理器/ksu_susfs 识别版本）"
 cp "$HERE/patches/susfs_reboot.c" "$SRC/fs/susfs_reboot.c"
 cp "$HERE/patches/susfs_reboot.h" "$SRC/include/linux/susfs_reboot.h"
+cp "$HERE/patches/susfs_abi.h" "$SRC/include/linux/susfs_abi.h"
 if ! grep -q 'susfs_reboot\.o' "$SRC/fs/Makefile"; then
     printf 'obj-$(CONFIG_KSU_SUSFS) += susfs_reboot.o\n' >> "$SRC/fs/Makefile"
 fi
@@ -1013,6 +1021,88 @@ if "extern int susfs_reboot_handler" not in check or \
    "susfs_reboot_handler(magic1, magic2, cmd, &arg)" not in check:
     sys.exit("!! reboot.c: P 阶段注入块校验失败，终止")
 print("    reboot.c: P 阶段 2/2 注入块校验通过")
+PYEOF
+
+echo "==> Q 阶段：SUSFS 符号隐藏（kernel/kallsyms.c s_show，编译期，对齐上游 6.12）"
+python3 - "$SRC" <<'PYEOF'
+import os, sys
+SRC = sys.argv[1]
+p = os.path.join(SRC, "kernel/kallsyms.c")
+s = open(p).read()
+
+MARK = "SUSFS_HIDE_SYMBOLS"
+if MARK in s:
+    print("    kallsyms.c: 符号隐藏已注入，跳过")
+    sys.exit(0)
+
+# 1) 在 #include "kallsyms_internal.h" 之前插入 helper（仅当开关打开）
+inc_anchor = '#include "kallsyms_internal.h"'
+if inc_anchor not in s:
+    sys.exit("!! kallsyms.c: 找不到 kallsyms_internal.h include，终止")
+helper = (
+    "#ifdef CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS\n"
+    "/* SUSFS_HIDE_SYMBOLS: compiled-in prefix filter (zero kprobe), copied\n"
+    " * from upstream susfs4ksu 50_add_susfs_in_gki-android16-6.12.patch. */\n"
+    "static inline bool susfs_hide_sym_starts_with(const char *str, const char *pfx)\n"
+    "{\n"
+    "\twhile (*pfx) { if (*str++ != *pfx++) return false; }\n"
+    "\treturn true;\n"
+    "}\n"
+    "#endif\n\n"
+)
+s = s.replace(inc_anchor, helper + inc_anchor, 1)
+
+# 2) patch s_show 的 else 分支：把裸 seq_printf 换成条件过滤块。
+#    锚点用 6.12/6.18 一致的原文（value/iter->type/iter->name）。
+orig = (
+    "\t} else\n"
+    "\t\tseq_printf(m, \"%px %c %s\\n\", value,\n"
+    "\t\t\t   iter->type, iter->name);\n"
+    "\treturn 0;\n"
+)
+if orig not in s:
+    sys.exit("!! kallsyms.c: s_show else 锚点未命中，终止（拒绝静默漏功能）")
+repl = (
+    "\t} else\n"
+    "#ifdef CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS\n"
+    "\t{\n"
+    "\t\tconst char *n = iter->name;\n"
+    "\t\tif (susfs_hide_sym_starts_with(n, \"ksu_\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"__ksu_\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"susfs_\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"ksud\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"is_ksu_\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"is_manager_\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"escape_to_\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"setup_selinux\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"track_throne\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"on_post_fs_data\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"try_umount\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"kernelsu\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"__initcall__kmod_kernelsu\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"apply_kernelsu\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"handle_sepolicy\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"getenforce\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"setenforce\") ||\n"
+    "\t\t    susfs_hide_sym_starts_with(n, \"is_zygote\"))\n"
+    "\t\t\treturn 0;\n"
+    "\t\tseq_printf(m, \"%px %c %s\\n\", value,\n"
+    "\t\t\t   iter->type, iter->name);\n"
+    "\t}\n"
+    "#else\n"
+    "\t\tseq_printf(m, \"%px %c %s\\n\", value,\n"
+    "\t\t\t   iter->type, iter->name);\n"
+    "#endif\n"
+    "\treturn 0;\n"
+)
+s = s.replace(orig, repl, 1)
+open(p, "w").write(s)
+
+check = open(p).read()
+if "susfs_hide_sym_starts_with" not in check or \
+   'susfs_hide_sym_starts_with(n, "is_zygote")' not in check:
+    sys.exit("!! kallsyms.c: Q 阶段注入块校验失败，终止")
+print("    kallsyms.c: 符号隐藏 18 前缀注入完成（编译期 #ifdef）")
 PYEOF
 
 echo "==> H 集成完成"

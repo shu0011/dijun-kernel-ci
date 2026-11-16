@@ -16,4 +16,8 @@
 void susfs_spoof_uname(struct new_utsname *u);
 bool susfs_is_uname_spoofed(void);
 
+/* 官方 ksu_susfs CMD_SUSFS_SET_UNAME ABI 设置入口。
+ * release/version 为空串时表示不改该字段；两者皆空则关闭伪装。 */
+void susfs_uname_abi_set(const char *release, const char *version);
+
 #endif /* _LINUX_SUSFS_UNAME_H */

@@ -130,6 +130,22 @@ static int susfs_mount_add(const char *path)
 	return 0;
 }
 
+int susfs_mount_abi_add(const char *path)
+{
+	return susfs_mount_add(path);
+}
+
+/* CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS:
+ * 官方按 mnt_id >= 2000000000 号段整体隐藏（依赖改 fs/namespace.c 的 mount ID
+ * 分配）；本项目用显式路径列表（/proc/susfs_add_sus_mount）实现等价效果，
+ * 没有号段开关。此 setter 仅吸收命令、返回成功，避免官方脚本因 unsupported
+ * 报错；实际隐藏由路径列表负责。 */
+void susfs_mount_abi_set_enabled(bool enabled)
+{
+	/* no-op: path-list based implementation has no global id-range toggle */
+	(void)enabled;
+}
+
 static ssize_t susfs_mount_write(struct file *file, const char __user *ubuf,
 				 size_t count, loff_t *ppos)
 {

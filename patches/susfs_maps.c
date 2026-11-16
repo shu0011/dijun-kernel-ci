@@ -127,6 +127,11 @@ static int susfs_maps_add(const char *path)
 	return 0;
 }
 
+int susfs_map_abi_add(const char *path)
+{
+	return susfs_maps_add(path);
+}
+
 static ssize_t susfs_maps_write(struct file *file, const char __user *ubuf,
 				size_t count, loff_t *ppos)
 {

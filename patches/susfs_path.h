@@ -11,4 +11,8 @@
 /* true 表示该 inode 属于被隐藏的路径；uid < 10000 恒为 false */
 bool susfs_is_inode_sus_path(struct inode *inode);
 
+/* 官方 ksu_susfs CMD_SUSFS_ADD_SUS_PATH ABI 的设置入口（root-only caller）。
+ * 返回 0 成功，负 errno 失败。语义与 /proc/susfs_add_sus_path 写入一致。 */
+int susfs_path_abi_add(const char *path);
+
 #endif /* _LINUX_SUSFS_PATH_H */

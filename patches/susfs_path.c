@@ -124,6 +124,11 @@ static int susfs_path_add(const char *path)
 	return 0;
 }
 
+int susfs_path_abi_add(const char *path)
+{
+	return susfs_path_add(path);
+}
+
 static ssize_t susfs_path_write(struct file *file, const char __user *ubuf,
 				size_t count, loff_t *ppos)
 {

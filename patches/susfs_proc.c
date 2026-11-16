@@ -147,6 +147,19 @@ static ssize_t susfs_cmdline_read(struct file *file, char __user *ubuf,
 			      ubuf, count, ppos);
 }
 
+void susfs_cmdline_abi_set(const char *cmdline)
+{
+	mutex_lock(&susfs_proc_mutex);
+	memset(susfs_cmdline.buf, 0, sizeof(susfs_cmdline.buf));
+	if (cmdline && cmdline[0] && strcmp(cmdline, "0") && strcmp(cmdline, "off")) {
+		strscpy(susfs_cmdline.buf, cmdline, sizeof(susfs_cmdline.buf));
+		susfs_cmdline.enabled = true;
+	} else {
+		susfs_cmdline.enabled = false;
+	}
+	mutex_unlock(&susfs_proc_mutex);
+}
+
 static ssize_t susfs_cmdline_write(struct file *file, const char __user *ubuf,
 				   size_t count, loff_t *ppos)
 {
