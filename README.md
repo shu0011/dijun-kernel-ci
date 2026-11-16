@@ -1,4 +1,4 @@
-# dijun 内核（小米 15S Pro / 玄戒 O1 / android17-6.18）
+﻿# dijun 内核（小米 15S Pro / 玄戒 O1 / android17-6.18）
 
 > 设备：小米 15S Pro（`dijun`），HyperOS OS4.0.5.0，玄戒 O1
 > 内核基线：`6.18.21-android17-5-g284297031c53-abogki553682993-4k`（GKI / KMI `android17-6.18`）
@@ -16,7 +16,7 @@
 |---|---|
 | 可复现 GKI 构建 | AOSP 源码 `284297031c53`；`KBUILD_GENDWARFKSYMS_STABLE=1` 让导出符号 CRC 与厂商 `.ko` 对齐（`module_layout = 0x60801db3`，18187 个导出符号，vermagic 与原厂一致） |
 | AOSP 工具链 | 预编译 clang / rustc / bindgen 0.72.1；开启 `CONFIG_RUST=y` + `CONFIG_ASHMEM=y`，否则 camera HAL 初始化会崩 |
-| SukiSU built-in | 按官方 `kernel/setup.sh` 集成到 `drivers/kernelsu`，分支 `main`；版本号**由上游 Kbuild 自动计算**（不再写死），版本串 `v4.3.0-<sha>@shushu`；管理器与 `ksud` 可用 |
+| SukiSU built-in | 按官方 `kernel/setup.sh` 集成到 `drivers/kernelsu`，分支 `main`；版本号**由上游 Kbuild 自动计算**（不再写死），版本串 `v3.0.0-<sha>@shushu`；管理器与 `ksud` 可用 |
 | SELinux 隐藏（完整生效） | 见下节；**检测软件已通过**，Maple「策略属性写入特征」侧信道已修，`ksud feature get 4` = enabled，开机无重启 |
 | 零运行期 patch / 零 kprobe | 不写只读的 `write_op[]`，不挂 `selinux_hide` 相关 kprobe，隐藏全部走编译期钩子 |
 | boot 打包 | 官方 4096 B header（改 `kernel_size`）+ 自编 `Image` + 官方 vbmeta(2368 B) + 零填充 + 原 64 B AVB footer；总长不变，已多次上机验证 |
@@ -149,3 +149,4 @@ AK3 公测包请从 **Releases** 下载，在 Recovery / KernelSU 管理器里�
 
 本项目仅用于个人设备研究与学习。刷写内核有变砖风险，请确保已解锁、已备份、了解回滚方式；
 因使用本项目产物造成的设备或数据损失，作者与贡献者不承担责任。
+
