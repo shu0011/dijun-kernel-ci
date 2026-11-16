@@ -589,6 +589,38 @@ inject("fs/proc/version.c", "version_proc_show",
        "\tif (susfs_spoof_version_show(m))\n\t\treturn 0;\n")
 PYEOF
 
+echo "==> K 阶段3：sus_path（按路径隐藏）"
+cp "$HERE/patches/susfs_path.c" "$SRC/fs/susfs_path.c"
+cp "$HERE/patches/susfs_path.h" "$SRC/include/linux/susfs_path.h"
+if ! grep -q 'susfs_path\.o' "$SRC/fs/Makefile"; then
+    printf 'obj-$(CONFIG_KSU_SUSFS) += susfs_path.o\n' >> "$SRC/fs/Makefile"
+fi
+python3 - "$SRC" <<'PYEOF'
+import os
+import re
+import sys
+
+SRC = sys.argv[1]
+p = os.path.join(SRC, "fs/stat.c")
+s = open(p).read()
+
+if "susfs_path.h" not in s:
+    i = s.find("#include")
+    assert i > 0, "fs/stat.c: 没找到 include"
+    s = s[:i] + "#include <linux/susfs_path.h>\n" + s[i:]
+
+# vfs_getattr 是 stat/lstat/fstatat 的公共入口，签名自 4.11 起未变
+pat = re.compile(r"(int vfs_getattr\(const struct path \*path, struct kstat \*stat,\s*u32 request_mask, unsigned int query_flags\)\s*\{\n)")
+m = pat.search(s)
+if not m:
+    print("    fs/stat.c: vfs_getattr 没匹配上，sus_path 挂点跳过")
+else:
+    call = "\tif (susfs_is_hidden_path(path))\n\t\treturn -ENOENT;\n\n"
+    s = s[:m.end()] + call + s[m.end():]
+    open(p, "w").write(s)
+    print("    fs/stat.c: vfs_getattr 已注入 sus_path 判断")
+PYEOF
+
 echo "==> H 集成完成"
 echo "    KSU 分支配置文件: $(ls "$SRC/drivers/kernelsu"/Kbuild "$SRC/drivers/kernelsu"/Makefile 2>/dev/null | tr '\n' ' ')"
 echo "    SELinux 补丁命中: $(grep -c 'CONFIG_KSU_SUSFS' "$SRC/security/selinux/status.c" 2>/dev/null || echo 0) 处 status.c"
