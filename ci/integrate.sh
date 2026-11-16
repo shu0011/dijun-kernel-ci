@@ -517,7 +517,504 @@ open(hk, "w").write(t)
 print("    hooks.c: inode_setxattr 挂载点切到 G6 handle")
 PYEOF
 
+echo "==> I 阶段1：SUSFS spoof_uname（built-in，proc 接口，零运行期改写）"
+cp "$HERE/patches/susfs_uname.c" "$SRC/fs/susfs_uname.c"
+cp "$HERE/patches/susfs_uname.h" "$SRC/include/linux/susfs_uname.h"
+if ! grep -q 'susfs_uname\.o' "$SRC/fs/Makefile"; then
+    printf 'obj-$(CONFIG_KSU_SUSFS) += susfs_uname.o\n' >> "$SRC/fs/Makefile"
+fi
+python3 - "$SRC/kernel/sys.c" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+s = open(path).read()
+
+inc = "#include <linux/susfs_uname.h>\n"
+if inc not in s:
+    anchor = "#include <linux/syscalls.h>\n"
+    assert anchor in s, "kernel/sys.c: #include <linux/syscalls.h> 没找到"
+    s = s.replace(anchor, anchor + inc, 1)
+
+# newuname / uname 两个系统调用都要挂，glibc 的 uname(2) 走的是后者
+for fn in ("SYSCALL_DEFINE1(newuname,", "SYSCALL_DEFINE0(uname,"):
+    i = s.find(fn)
+    if i < 0:
+        print("    sys.c: %s 不存在，跳过" % fn)
+        continue
+    j = s.find("up_read(&uts_sem);", i)
+    assert j > 0, "kernel/sys.c: %s 里没找到 up_read(&uts_sem)" % fn
+    j += len("up_read(&uts_sem);")
+    if "susfs_spoof_uname" in s[j:j + 80]:
+        continue
+    s = s[:j] + "\n\tsusfs_spoof_uname(&tmp);" + s[j:]
+
+open(path, "w").write(s)
+print("    sys.c: newuname/uname 出口已接 susfs_spoof_uname")
+PYEOF
+
+echo "==> J 阶段2：/proc/cmdline 与 /proc/version 伪装"
+cp "$HERE/patches/susfs_proc.c" "$SRC/fs/susfs_proc.c"
+cp "$HERE/patches/susfs_proc.h" "$SRC/include/linux/susfs_proc.h"
+if ! grep -q 'susfs_proc\.o' "$SRC/fs/Makefile"; then
+    printf 'obj-$(CONFIG_KSU_SUSFS) += susfs_proc.o\n' >> "$SRC/fs/Makefile"
+fi
+python3 - "$SRC" <<'PYEOF'
+import os
+import re
+import sys
+
+SRC = sys.argv[1]
+
+
+def inject(rel, fn, call):
+    p = os.path.join(SRC, rel)
+    s = open(p).read()
+    if "susfs_proc.h" not in s:
+        i = s.find("#include")
+        assert i > 0, rel + ": 没找到 include"
+        s = s[:i] + "#include <linux/susfs_proc.h>\n" + s[i:]
+    pat = re.compile(r"(static int " + fn + r"\(struct seq_file \*m, void \*v\)\s*\{\n)")
+    m = pat.search(s)
+    if not m:
+        print("    %s: %s 没匹配上，跳过" % (rel, fn))
+        return
+    s = s[:m.end()] + call + s[m.end():]
+    open(p, "w").write(s)
+    print("    %s: %s 已注入" % (rel, fn))
+
+
+inject("fs/proc/cmdline.c", "cmdline_proc_show",
+       "\tif (susfs_spoof_cmdline_show(m))\n\t\treturn 0;\n")
+inject("fs/proc/version.c", "version_proc_show",
+       "\tif (susfs_spoof_version_show(m))\n\t\treturn 0;\n")
+# 上游把 cmdline 与 bootconfig 当同一件事处理（GKI 开 CONFIG_BOOT_CONFIG，
+# /proc/cmdline 的内容由 bootconfig 生成），这里两处都接
+inject("fs/proc/bootconfig.c", "boot_config_proc_show",
+       "\tif (susfs_spoof_cmdline_show(m))\n\t\treturn 0;\n")
+PYEOF
+
+echo "==> K 阶段3：sus_path（inode 匹配）"
+cp "$HERE/patches/susfs_path.c" "$SRC/fs/susfs_path.c"
+cp "$HERE/patches/susfs_path.h" "$SRC/include/linux/susfs_path.h"
+if ! grep -q 'susfs_path\.o' "$SRC/fs/Makefile"; then
+    printf 'obj-$(CONFIG_KSU_SUSFS) += susfs_path.o\n' >> "$SRC/fs/Makefile"
+fi
+python3 - "$SRC" <<'PYEOF'
+import os
+import re
+import sys
+
+SRC = sys.argv[1]
+
+
+def add_include(path, header):
+    s = open(path).read()
+    if header not in s:
+        i = s.find("#include")
+        assert i > 0, path + ": 没找到 include"
+        s = s[:i] + "#include <%s>\n" % header + s[i:]
+    return s
+
+
+# 1) fs/stat.c: vfs_getattr 按 inode 判断（覆盖 stat 隐藏路径本身）
+p = os.path.join(SRC, "fs/stat.c")
+s = add_include(p, "linux/susfs_path.h")
+pat = re.compile(r"(int vfs_getattr\(const struct path \*path, struct kstat \*stat,\s*u32 request_mask, unsigned int query_flags\)\s*\{\n)")
+m = pat.search(s)
+if not m:
+    print("    fs/stat.c: vfs_getattr 没匹配上，跳过")
+else:
+    s = s[:m.end()] + "\tif (susfs_is_inode_sus_path(d_inode(path->dentry)))\n\t\treturn -ENOENT;\n\n" + s[m.end():]
+    open(p, "w").write(s)
+    print("    fs/stat.c: vfs_getattr 已注入")
+
+# 2) fs/namei.c: link_path_walk 主循环（覆盖 open/exec 子路径）
+p = os.path.join(SRC, "fs/namei.c")
+s = add_include(p, "linux/susfs_path.h")
+anchor = "\t\tidmap = mnt_idmap(nd->path.mnt);\n\t\terr = may_lookup(idmap, nd);\n"
+if anchor not in s:
+    print("    fs/namei.c: link_path_walk 注入点没匹配上，跳过")
+else:
+    block = (
+        "\t\t{\n"
+        "\t\t\tstruct dentry *sus_dentry = nd->path.dentry;\n"
+        "\n"
+        "\t\t\tif (sus_dentry->d_inode &&\n"
+        "\t\t\t    susfs_is_inode_sus_path(sus_dentry->d_inode))\n"
+        "\t\t\t\treturn -ENOENT;\n"
+        "\t\t}\n"
+        "\n"
+    )
+    s = s.replace(anchor, block + anchor, 1)
+    print("    fs/namei.c: link_path_walk 已注入")
+open(p, "w").write(s)
+
+# 3) fs/readdir.c: getdents64 取 sb；filldir64 入口按 inode 跳过
+p = os.path.join(SRC, "fs/readdir.c")
+s = add_include(p, "linux/susfs_path.h")
+
+i = s.find("struct getdents_callback64 {")
+if i < 0:
+    print("    fs/readdir.c: getdents_callback64 没匹配上，readdir 跳过")
+else:
+    j = s.find("{", i) + 1
+    s = s[:j] + "\n\tstruct super_block *sb;" + s[j:]
+
+    k = s.find("SYSCALL_DEFINE3(getdents64")
+    it = s.find("error = iterate_dir(fd_file(f), &buf.ctx);", k if k >= 0 else 0)
+    if it < 0:
+        print("    fs/readdir.c: iterate_dir 没匹配上")
+    else:
+        s = s[:it] + "buf.sb = fd_file(f)->f_inode->i_sb;\n\t" + s[it:]
+
+    # filldir64 插在 buf 声明之后：只在 buf 已存在的位置插入，避免 undeclared identifier
+    f = s.find("static bool filldir64(")
+    if f < 0:
+        print("    fs/readdir.c: filldir64 没找到")
+    else:
+        anc = "container_of(ctx, struct getdents_callback64, ctx);"
+        a = s.find(anc, f)
+        if a < 0:
+            print("    fs/readdir.c: filldir64 的 buf 声明没匹配上")
+        else:
+            a = s.find("\n", a + len(anc))
+            a += 1
+            block = (
+                "\t{\n"
+                "\t\tstruct inode *sus_inode = ilookup(buf->sb, ino);\n"
+                "\n"
+                "\t\tif (sus_inode) {\n"
+                "\t\t\tbool sus_hidden = susfs_is_inode_sus_path(sus_inode);\n"
+                "\n"
+                "\t\t\tiput(sus_inode);\n"
+                "\t\t\tif (sus_hidden)\n"
+                "\t\t\t\treturn true;\n"
+                "\t\t}\n"
+                "\t}\n\n"
+            )
+            s = s[:a] + block + s[a:]
+            print("    fs/readdir.c: filldir64 已注入（buf 声明之后）")
+
+open(p, "w").write(s)
+PYEOF
+
+echo "==> L 阶段4：sus_kstat（伪造 stat 字段）"
+cp "$HERE/patches/susfs_kstat.c" "$SRC/fs/susfs_kstat.c"
+cp "$HERE/patches/susfs_kstat.h" "$SRC/include/linux/susfs_kstat.h"
+if ! grep -q 'susfs_kstat\.o' "$SRC/fs/Makefile"; then
+    printf 'obj-$(CONFIG_KSU_SUSFS) += susfs_kstat.o\n' >> "$SRC/fs/Makefile"
+fi
+python3 - "$SRC" <<'PYEOF'
+import os
+import sys
+
+SRC = sys.argv[1]
+p = os.path.join(SRC, "fs/stat.c")
+s = open(p).read()
+
+if "susfs_kstat.h" not in s:
+    i = s.find("#include")
+    s = s[:i] + "#include <linux/susfs_kstat.h>\n" + s[i:]
+
+# 紧跟在 stage-3 注入的 sus_path 判断之后
+anchor = "\tif (susfs_is_inode_sus_path(d_inode(path->dentry)))\n\t\treturn -ENOENT;\n\n"
+if anchor not in s:
+    print("    fs/stat.c: sus_path 锚点不在，sus_kstat 跳过")
+else:
+    block = (
+        "\tif (susfs_is_inode_sus_kstat(d_inode(path->dentry))) {\n"
+        "\t\tstruct inode *sus_kst_inode = d_inode(path->dentry);\n"
+        "\n"
+        "\t\tgeneric_fillattr(mnt_idmap(path->mnt), request_mask,\n"
+        "\t\t\t\t sus_kst_inode, stat);\n"
+        "\t\tsusfs_kstat_override(sus_kst_inode, stat);\n"
+        "\t\treturn 0;\n"
+        "\t}\n"
+        "\n"
+    )
+    s = s.replace(anchor, anchor + block, 1)
+    print("    fs/stat.c: sus_kstat 已注入")
+open(p, "w").write(s)
+PYEOF
+
+echo "==> M 阶段5：sus_mount（隐藏挂载点，inode 匹配，改 proc_namespace.c show 函数）"
+cp "$HERE/patches/susfs_mount.c" "$SRC/fs/susfs_mount.c"
+cp "$HERE/patches/susfs_mount.h" "$SRC/include/linux/susfs_mount.h"
+if ! grep -q 'susfs_mount\.o' "$SRC/fs/Makefile"; then
+    printf 'obj-$(CONFIG_KSU_SUSFS) += susfs_mount.o\n' >> "$SRC/fs/Makefile"
+fi
+python3 - "$SRC" <<'PYEOF'
+import os
+import re
+import sys
+
+SRC = sys.argv[1]
+p = os.path.join(SRC, "fs/proc_namespace.c")
+s = open(p).read()
+
+if "susfs_mount.h" not in s:
+    i = s.find("#include")
+    assert i > 0, "proc_namespace.c: 没找到 include"
+    s = s[:i] + "#include <linux/susfs_mount.h>\n" + s[i:]
+
+# 在 3 个 show 函数体第一行插判断：命中就把该挂载行整行跳过（return 0）。
+# 只改 show 本体，不复制函数、不改 open 回调、不碰 fs/namespace.c 的 mount ID。
+funcs = ["show_vfsmnt", "show_mountinfo", "show_vfsstat"]
+for fn in funcs:
+    pat = re.compile(r"(static int " + fn + r"\(struct seq_file \*m, struct vfsmount \*mnt\)\s*\{\n)")
+    m = pat.search(s)
+    if not m:
+        sys.exit("!! proc_namespace.c: %s 锚点没匹配上（6.18 源码变了？），终止以免静默漏功能" % fn)
+    if "susfs_is_mnt_sus(mnt)" in s[m.end():m.end() + 120]:
+        print("    proc_namespace.c: %s 已注入过" % fn)
+        continue
+    s = s[:m.end()] + "\tif (susfs_is_mnt_sus(mnt))\n\t\treturn 0;\n\n" + s[m.end():]
+    print("    proc_namespace.c: %s 已注入" % fn)
+
+open(p, "w").write(s)
+PYEOF
+
+echo "==> N 阶段6：sus_map（隐藏 /proc/<pid>/maps 映射，改 task_mmu.c show_map_vma/show_smap）"
+cp "$HERE/patches/susfs_maps.c" "$SRC/fs/susfs_maps.c"
+cp "$HERE/patches/susfs_maps.h" "$SRC/include/linux/susfs_maps.h"
+if ! grep -q 'susfs_maps\.o' "$SRC/fs/Makefile"; then
+    printf 'obj-$(CONFIG_KSU_SUSFS) += susfs_maps.o\n' >> "$SRC/fs/Makefile"
+fi
+python3 - "$SRC" <<'PYEOF'
+import os
+import re
+import sys
+
+SRC = sys.argv[1]
+p = os.path.join(SRC, "fs/proc/task_mmu.c")
+s = open(p).read()
+
+if "susfs_maps.h" not in s:
+    i = s.find("#include")
+    assert i > 0, "task_mmu.c: 没找到 include"
+    s = s[:i] + "#include <linux/susfs_maps.h>\n" + s[i:]
+
+# 1) show_map_vma：在 if (vma->vm_file) 块内、dev = 之前插判断。
+#    用 file_inode(vma->vm_file)（底层真实 inode），和加入时 d_backing_inode 一致。
+#    6.18 这里原本是 const struct inode *inode = file_user_inode(vma->vm_file);
+pat = re.compile(
+    r"(\tif \(vma->vm_file\) \{\n"
+    r"\t\tconst struct inode \*inode = file_user_inode\(vma->vm_file\);\n)"
+)
+m = pat.search(s)
+if not m:
+    sys.exit("!! task_mmu.c: show_map_vma 锚点没匹配上（6.18 源码变了？），终止")
+else:
+    if "susfs_is_inode_sus_map" not in s[m.end():m.end() + 200]:
+        # 用 file_inode 而非 m 里那个 inode（后者是 idmapped 视角，和加入时不一致）
+        s = s[:m.end()] + (
+            "\t\tif (susfs_is_inode_sus_map(file_inode(vma->vm_file)))\n"
+            "\t\t\treturn;\n"
+        ) + s[m.end():]
+        print("    task_mmu.c: show_map_vma 已注入")
+    else:
+        print("    task_mmu.c: show_map_vma 已注入过")
+
+# 2) show_smap：函数体开头加判断（/proc/<pid>/smaps 单 vma 详情）
+pat2 = re.compile(r"(static int show_smap\(struct seq_file \*m, void \*v\)\s*\{\n)")
+m2 = pat2.search(s)
+if not m2:
+    sys.exit("!! task_mmu.c: show_smap 锚点没匹配上（6.18 源码变了？），终止")
+else:
+    if "susfs_is_inode_sus_map" not in s[m2.end():m2.end() + 200]:
+        s = s[:m2.end()] + (
+            "\tstruct vm_area_struct *sus_vma = v;\n"
+            "\tif (sus_vma->vm_file &&\n"
+            "\t    susfs_is_inode_sus_map(file_inode(sus_vma->vm_file)))\n"
+            "\t\treturn 0;\n\n"
+        ) + s[m2.end():]
+        print("    task_mmu.c: show_smap 已注入")
+    else:
+        print("    task_mmu.c: show_smap 已注入过")
+
+open(p, "w").write(s)
+PYEOF
+
+echo "==> O 阶段7：补齐 namei.c sus_path 钩子（覆盖最后一步 open/exec）"
+python3 - "$SRC" <<'PYEOF'
+import os
+import sys
+
+SRC = sys.argv[1]
+p = os.path.join(SRC, "fs/namei.c")
+s = open(p).read()
+
+# fs/namei.c 在 6.18 已 include susfs_path.h（K 阶段的 link_path_walk 注入），
+# 这里防御性补一次，避免 K 阶段被跳过时找不到声明。
+if "susfs_path.h" not in s:
+    i = s.find("#include")
+    assert i > 0, "namei.c: 没找到 include"
+    s = s[:i] + "#include <linux/susfs_path.h>\n" + s[i:]
+
+count = 0
+
+# 1) lookup_fast RCU 分支：__d_lookup_rcu 之后，命中则 dentry=NULL（RCU 不 dput）
+anchor1 = "\t\tdentry = __d_lookup_rcu(parent, &nd->last, &nd->next_seq);\n"
+block1 = (
+    "\t\tif (dentry && !IS_ERR(dentry) && dentry->d_inode &&\n"
+    "\t\t    susfs_is_inode_sus_path(dentry->d_inode))\n"
+    "\t\t\tdentry = NULL;  /* RCU: __d_lookup_rcu 未取 dentry 计数，不 dput */\n"
+)
+if anchor1 in s and "susfs_is_inode_sus_path(dentry->d_inode))\n\t\t\tdentry = NULL;  /* RCU" not in s:
+    s = s.replace(anchor1, anchor1 + block1, 1)
+    count += 1
+    print("    namei.c: lookup_fast RCU 已注入")
+else:
+    print("    namei.c: lookup_fast RCU 锚点缺失或已注入")
+
+# 2) lookup_fast 非 RCU 分支：__d_lookup 之后，命中则 dput + return NULL
+anchor2 = "\t\tdentry = __d_lookup(parent, &nd->last);\n"
+block2 = (
+    "\t\tif (dentry && !IS_ERR(dentry) && dentry->d_inode &&\n"
+    "\t\t    susfs_is_inode_sus_path(dentry->d_inode)) {\n"
+    "\t\t\tdput(dentry);\n"
+    "\t\t\tdentry = NULL;\n"
+    "\t\t}\n"
+)
+if anchor2 in s and block2 not in s:
+    s = s.replace(anchor2, anchor2 + block2, 1)
+    count += 1
+    print("    namei.c: lookup_fast 非 RCU 已注入")
+else:
+    print("    namei.c: lookup_fast 非 RCU 锚点缺失或已注入")
+
+# 3) __lookup_slow：函数「末尾」那个 return dentry 之前插判断。
+#    注意该函数里有两个 `return dentry;`：第一个紧跟 `if (IS_ERR(dentry))`，
+#    不能用 find()（会插进错误分支、破坏控制流）。用下一个函数 lookup_slow 作为
+#    结束边界，在 [i, k] 区间 rfind 最后一个 return dentry。
+i = s.find("static struct dentry *__lookup_slow(const struct qstr *name,")
+if i < 0:
+    print("    namei.c: __lookup_slow 没找到")
+else:
+    k = s.find("static struct dentry *lookup_slow(", i)
+    assert k > i, "namei.c: 找不到 __lookup_slow 的结束边界 lookup_slow"
+    j = s.rfind("\treturn dentry;\n", i, k)
+    if j > i:
+        block3 = (
+            "\tif (dentry && !IS_ERR(dentry) && dentry->d_inode &&\n"
+            "\t    susfs_is_inode_sus_path(dentry->d_inode)) {\n"
+            "\t\tif (d_in_lookup(dentry))\n"
+            "\t\t\td_lookup_done(dentry);\n"
+            "\t\tdput(dentry);\n"
+            "\t\treturn ERR_PTR(-ENOENT);\n"
+            "\t}\n"
+        )
+        if block3 not in s[max(i, j - 300):j]:
+            s = s[:j] + block3 + s[j:]
+            count += 1
+            print("    namei.c: __lookup_slow 已注入（末尾 return）")
+        else:
+            print("    namei.c: __lookup_slow 已注入过")
+    else:
+        print("    namei.c: __lookup_slow 末尾 return 锚点没匹配上")
+
+# 4) lookup_open：d_lookup(dir, &nd->last) 之后，命中则 dput + ENOENT
+anchor4 = "\tdentry = d_lookup(dir, &nd->last);\n"
+block4 = (
+    "\tif (dentry && !IS_ERR(dentry) && dentry->d_inode &&\n"
+    "\t    susfs_is_inode_sus_path(dentry->d_inode)) {\n"
+    "\t\tdput(dentry);\n"
+    "\t\treturn ERR_PTR(-ENOENT);\n"
+    "\t}\n"
+)
+if anchor4 in s and block4 not in s:
+    s = s.replace(anchor4, anchor4 + block4, 1)
+    count += 1
+    print("    namei.c: lookup_open 已注入")
+else:
+    print("    namei.c: lookup_open 锚点缺失或已注入")
+
+open(p, "w").write(s)
+print("    namei.c: 本次新注入 %d 处" % count)
+# 严格校验：4 个注入块必须全部存在于最终文件（覆盖幂等重放场景）。
+# 任一缺失说明锚点对不上，明确失败，绝不静默交付缺功能的包。
+markers = {
+    "lookup_fast RCU":     "dentry = NULL;  /* RCU: __d_lookup_rcu",
+    "lookup_fast 非RCU":   "\t\t\tdput(dentry);\n\t\t\tdentry = NULL;\n\t\t}\n",
+    "__lookup_slow":       "susfs_is_inode_sus_path(dentry->d_inode)) {\n\t\tif (d_in_lookup(dentry))",
+    "lookup_open":         "\t\tdput(dentry);\n\t\treturn ERR_PTR(-ENOENT);\n\t}\n",
+}
+missing = [name for name, mk in markers.items() if mk not in s]
+if missing:
+    sys.exit("!! namei.c 注入块缺失: %s（锚点对不上），终止" % ", ".join(missing))
+print("    namei.c: 4/4 注入块校验通过")
+PYEOF
+
+echo "==> P 阶段8：SUSFS reboot-magic 查询 ABI（让管理器/ksu_susfs 识别版本）"
+cp "$HERE/patches/susfs_reboot.c" "$SRC/fs/susfs_reboot.c"
+cp "$HERE/patches/susfs_reboot.h" "$SRC/include/linux/susfs_reboot.h"
+if ! grep -q 'susfs_reboot\.o' "$SRC/fs/Makefile"; then
+    printf 'obj-$(CONFIG_KSU_SUSFS) += susfs_reboot.o\n' >> "$SRC/fs/Makefile"
+fi
+python3 - "$SRC" <<'PYEOF'
+import os
+import sys
+
+SRC = sys.argv[1]
+p = os.path.join(SRC, "kernel/reboot.c")
+s = open(p).read()
+
+# 1) extern 声明：插在内核已有 "DEFINE_MUTEX(system_transition_mutex);" 之后（6.12/6.18 都有）
+anchor = "DEFINE_MUTEX(system_transition_mutex);"
+decl = ("\n#ifdef CONFIG_KSU_SUSFS\n"
+        "extern int susfs_reboot_handler(int magic1, int magic2, unsigned int cmd,\n"
+        "\t\t\t\tvoid __user **arg);\n"
+        "#endif\n")
+if "susfs_reboot_handler" not in s:
+    if anchor not in s:
+        sys.exit("!! reboot.c: 找不到 DEFINE_MUTEX(system_transition_mutex)，终止")
+    s = s.replace(anchor, anchor + decl, 1)
+    print("    reboot.c: extern 声明已注入")
+else:
+    print("    reboot.c: extern 声明已存在")
+
+# 2) handler 调用：定位 SYSCALL_DEFINE4(reboot 起点，在其函数体内找 'int ret = 0;'
+#    插在该行之后。用函数边界 + 严格断言，避免锚点漂移导致静默漏功能。
+i = s.find("SYSCALL_DEFINE4(reboot")
+if i < 0:
+    sys.exit("!! reboot.c: 找不到 SYSCALL_DEFINE4(reboot，终止")
+# 函数体起点：从 i 往后找第一个 '{'
+b = s.find("{", i)
+if b < 0:
+    sys.exit("!! reboot.c: 找不到 reboot 函数体起始 '{'，终止")
+# 在合理窗口内找 'int ret = 0;'（上游 hunk 锚点）
+j = s.find("int ret = 0;", b, b + 400)
+if j < 0:
+    sys.exit("!! reboot.c: reboot 函数体内找不到 'int ret = 0;'，终止")
+
+call_block = (
+    "\n#ifdef CONFIG_KSU_SUSFS\n"
+    "\t{\n"
+    "\t\tint susfs_ret = susfs_reboot_handler(magic1, magic2, cmd, &arg);\n"
+    "\t\tif (!susfs_ret)\n"
+    "\t\t\treturn 0;   /* SUSFS query handled */\n"
+    "\t}\n"
+    "#endif\n"
+)
+if "susfs_reboot_handler(magic1" in s[j - 200:j + 200] or \
+   "susfs_reboot_handler(magic1" in s[j:j + 400]:
+    print("    reboot.c: handler 调用已存在")
+else:
+    # 插在 'int ret = 0;' 这一整行之后
+    eol = s.find("\n", j)
+    s = s[:eol + 1] + call_block + s[eol + 1:]
+    print("    reboot.c: handler 调用已注入（SYSCALL_DEFINE4 reboot）")
+
+open(p, "w").write(s)
+
+# 严格校验：最终文件里两处标记都必须存在
+check = open(p).read()
+if "extern int susfs_reboot_handler" not in check or \
+   "susfs_reboot_handler(magic1, magic2, cmd, &arg)" not in check:
+    sys.exit("!! reboot.c: P 阶段注入块校验失败，终止")
+print("    reboot.c: P 阶段 2/2 注入块校验通过")
+PYEOF
+
 echo "==> H 集成完成"
 echo "    KSU 分支配置文件: $(ls "$SRC/drivers/kernelsu"/Kbuild "$SRC/drivers/kernelsu"/Makefile 2>/dev/null | tr '\n' ' ')"
 echo "    SELinux 补丁命中: $(grep -c 'CONFIG_KSU_SUSFS' "$SRC/security/selinux/status.c" 2>/dev/null || echo 0) 处 status.c"
-
