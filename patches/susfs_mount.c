@@ -198,13 +198,13 @@ static ssize_t susfs_mount_read(struct file *file, char __user *ubuf,
 
 	mutex_lock(&susfs_mount_mutex);
 	for (i = 0; i < susfs_mount_count; i++) {
+		if (used >= PAGE_SIZE - 1)
+			break;
 		n = scnprintf(out + used, PAGE_SIZE - used, "%s\n",
 			      susfs_mounts[i].path);
 		if (n <= 0)
 			break;
 		used += n;
-		if (PAGE_SIZE - used < PATH_MAX)
-			break;
 	}
 	mutex_unlock(&susfs_mount_mutex);
 

@@ -32,17 +32,49 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 
-#define SUSFS_MAX_PATHS 64
+/*
+ * The entry list grows on demand.  A fixed 64-entry array is far too small in
+ * practice: the susfs4ksu module with emulate_vold_app_data adds one path per
+ * installed app (/sdcard/Android/data/<pkg>), easily 150+ entries, and every
+ * add beyond the cap used to fail silently.
+ */
+#define SUSFS_PATH_MIN_CAP 64
+#define SUSFS_PATH_MAX_CAP 4096
+#define SUSFS_PATH_MAX_LEN 256	/* upstream SUSFS_MAX_LEN_PATHNAME */
 #define SUSFS_PATH_PROC "susfs_add_sus_path"
 
 struct susfs_path_entry {
 	struct inode *inode;
-	char path[PATH_MAX];	/* 仅用于回读展示 */
+	char path[SUSFS_PATH_MAX_LEN];	/* 仅用于回读展示 */
 };
 
-static struct susfs_path_entry susfs_paths[SUSFS_MAX_PATHS];
+static struct susfs_path_entry *susfs_paths;
 static int susfs_path_count;
+static int susfs_path_cap;
 static DEFINE_MUTEX(susfs_path_mutex);
+
+/* Doubling growth; caller must hold susfs_path_mutex. */
+static int susfs_path_grow_locked(void)
+{
+	struct susfs_path_entry *grown;
+	int newcap = susfs_path_cap ? susfs_path_cap * 2 : SUSFS_PATH_MIN_CAP;
+
+	if (newcap > SUSFS_PATH_MAX_CAP)
+		newcap = SUSFS_PATH_MAX_CAP;
+	if (newcap <= susfs_path_cap)
+		return -ENOSPC;
+
+	grown = kvmalloc_array(newcap, sizeof(*grown), GFP_KERNEL);
+	if (!grown)
+		return -ENOMEM;
+	if (susfs_path_count)
+		memcpy(grown, susfs_paths,
+		       susfs_path_count * sizeof(*grown));
+	kvfree(susfs_paths);
+	susfs_paths = grown;
+	susfs_path_cap = newcap;
+	return 0;
+}
 
 bool susfs_is_inode_sus_path(struct inode *inode)
 {
@@ -112,15 +144,18 @@ static int susfs_path_add(const char *path)
 			return 0;	/* 已存在 */
 		}
 	}
-	if (susfs_path_count >= SUSFS_MAX_PATHS) {
-		mutex_unlock(&susfs_path_mutex);
-		path_put(&p);
-		return -ENOSPC;
+	if (susfs_path_count >= susfs_path_cap) {
+		ret = susfs_path_grow_locked();
+		if (ret) {
+			mutex_unlock(&susfs_path_mutex);
+			path_put(&p);
+			return ret;
+		}
 	}
 
 	ihold(inode);
 	susfs_paths[susfs_path_count].inode = inode;
-	strscpy(susfs_paths[susfs_path_count].path, path, PATH_MAX);
+	strscpy(susfs_paths[susfs_path_count].path, path, SUSFS_PATH_MAX_LEN);
 	susfs_path_count++;
 	mutex_unlock(&susfs_path_mutex);
 
@@ -185,13 +220,16 @@ static ssize_t susfs_path_read(struct file *file, char __user *ubuf,
 
 	mutex_lock(&susfs_path_mutex);
 	for (i = 0; i < susfs_path_count; i++) {
+		/* Keep filling the page: the previous "PAGE_SIZE - used <
+		 * PATH_MAX" test was always true after the first entry, so the
+		 * readback only ever showed one line. */
+		if (used >= PAGE_SIZE - 1)
+			break;
 		n = scnprintf(out + used, PAGE_SIZE - used, "%s\n",
 			      susfs_paths[i].path);
 		if (n <= 0)
 			break;
 		used += n;
-		if (PAGE_SIZE - used < PATH_MAX)
-			break;
 	}
 	mutex_unlock(&susfs_path_mutex);
 

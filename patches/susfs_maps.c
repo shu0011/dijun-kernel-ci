@@ -184,13 +184,13 @@ static ssize_t susfs_maps_read(struct file *file, char __user *ubuf,
 
 	mutex_lock(&susfs_maps_mutex);
 	for (i = 0; i < susfs_maps_count; i++) {
+		if (used >= PAGE_SIZE - 1)
+			break;
 		n = scnprintf(out + used, PAGE_SIZE - used, "%s\n",
 			      susfs_maps[i].path);
 		if (n <= 0)
 			break;
 		used += n;
-		if (PAGE_SIZE - used < PATH_MAX)
-			break;
 	}
 	mutex_unlock(&susfs_maps_mutex);
 

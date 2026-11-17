@@ -228,6 +228,8 @@ static ssize_t susfs_kstat_read(struct file *file, char __user *ubuf,
 
 	mutex_lock(&susfs_kstat_mutex);
 	for (i = 0; i < susfs_kstat_count; i++) {
+		if (used >= PAGE_SIZE - 1)
+			break;
 		n = scnprintf(out + used, PAGE_SIZE - used, "%s %llu %o\n",
 			      susfs_kstats[i].path,
 			      (unsigned long long)susfs_kstats[i].size,
@@ -235,8 +237,6 @@ static ssize_t susfs_kstat_read(struct file *file, char __user *ubuf,
 		if (n <= 0)
 			break;
 		used += n;
-		if (PAGE_SIZE - used < PATH_MAX + 40)
-			break;
 	}
 	mutex_unlock(&susfs_kstat_mutex);
 
