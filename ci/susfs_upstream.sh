@@ -267,9 +267,13 @@ preamble = (
     "#ifndef CL_COPY_MNT_NS\n"
     "#define CL_COPY_MNT_NS BIT(25)\n"
     "#endif\n")
-i = s.find("#include")
-assert i > 0, "namespace.c: include 锚点没找到"
-s = s[:i] + preamble + s[i:]
+# 必须插在内核其它 include 之后：susfs_def.h 里用到 current_uid()/set_thread_flag()，
+# 放在文件最前面会因为 cred.h / sched 头还没进来而报 undeclared。
+lines = s.split("\n")
+last = max(i for i, ln in enumerate(lines[:80]) if ln.startswith("#include <linux/"))
+assert last > 0, "namespace.c: include 锚点没找到"
+lines.insert(last + 1, preamble.rstrip("\n"))
+s = "\n".join(lines)
 
 # 2) 号段计数器（官方用独立 IDA；6.18 的 xarray 不能在里面做 GFP_KERNEL 分配）
 alloc_anchor = ("static int mnt_alloc_id(struct mount *mnt)\n"
