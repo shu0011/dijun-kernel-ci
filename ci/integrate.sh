@@ -632,9 +632,10 @@ PYEOF
 fi
 
 echo "==> K 阶段3：sus_path（inode 匹配）"
+# 头文件两种模式都要（K 阶段会往 stat.c/namei.c 注入 susfs_is_inode_sus_path 的 include）
+cp "$HERE/patches/susfs_path.h" "$SRC/include/linux/susfs_path.h"
 if ! [ "${SUSFS_UPSTREAM:-0}" = "1" ]; then
 cp "$HERE/patches/susfs_path.c" "$SRC/fs/susfs_path.c"
-cp "$HERE/patches/susfs_path.h" "$SRC/include/linux/susfs_path.h"
 if ! grep -q 'susfs_path\.o' "$SRC/fs/Makefile"; then
     printf 'obj-$(CONFIG_KSU_SUSFS) += susfs_path.o\n' >> "$SRC/fs/Makefile"
 fi
