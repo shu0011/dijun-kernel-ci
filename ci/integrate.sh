@@ -769,24 +769,26 @@ if "susfs_kstat.h" not in s:
     i = s.find("#include")
     s = s[:i] + "#include <linux/susfs_kstat.h>\n" + s[i:]
 
-# 紧跟在 stage-3 注入的 sus_path 判断之后
-anchor = "\tif (susfs_is_inode_sus_path(d_inode(path->dentry)))\n\t\treturn -ENOENT;\n\n"
+# 改在 vfs_getattr 的出口：先走完正常的 vfs_getattr_nosec（statx 的
+# result_mask / mnt_id / attributes 都由它填），再覆盖 sus_kstat 字段。
+# 之前插在函数开头直接 return 0，会让 statx 的 result_mask 保持未初始化值。
+anchor = "\treturn vfs_getattr_nosec(path, stat, request_mask, query_flags);\n"
 if anchor not in s:
-    print("    fs/stat.c: sus_path 锚点不在，sus_kstat 跳过")
+    print("    fs/stat.c: vfs_getattr 出口锚点没匹配上，sus_kstat 跳过")
+elif "susfs_kstat_override" in s:
+    print("    fs/stat.c: sus_kstat 已注入过")
 else:
     block = (
-        "\tif (susfs_is_inode_sus_kstat(d_inode(path->dentry))) {\n"
-        "\t\tstruct inode *sus_kst_inode = d_inode(path->dentry);\n"
-        "\n"
-        "\t\tgeneric_fillattr(mnt_idmap(path->mnt), request_mask,\n"
-        "\t\t\t\t sus_kst_inode, stat);\n"
-        "\t\tsusfs_kstat_override(sus_kst_inode, stat);\n"
-        "\t\treturn 0;\n"
-        "\t}\n"
-        "\n"
+        "\tretval = vfs_getattr_nosec(path, stat, request_mask, query_flags);\n"
+        "#ifdef CONFIG_KSU_SUSFS\n"
+        "\tif (!retval &&\n"
+        "\t    susfs_is_inode_sus_kstat(d_backing_inode(path->dentry)))\n"
+        "\t\tsusfs_kstat_override(d_backing_inode(path->dentry), stat);\n"
+        "#endif\n"
+        "\treturn retval;\n"
     )
-    s = s.replace(anchor, anchor + block, 1)
-    print("    fs/stat.c: sus_kstat 已注入")
+    s = s.replace(anchor, block, 1)
+    print("    fs/stat.c: sus_kstat 已注入（vfs_getattr 出口，保留 statx 掩码）")
 open(p, "w").write(s)
 PYEOF
 
@@ -850,13 +852,12 @@ if "susfs_mount.h" not in s:
     i = s.find("#include")
     assert i > 0, "proc_namespace.c: 没找到 include"
     s = s[:i] + "#include <linux/susfs_mount.h>\n" + s[i:]
-if "susfs_is_current_ksu_domain" not in s:
-    # 必须插在 include 之后：namespace.c 第一个 include 是 syscalls.h，
-    # 在它之前声明 bool 会报 unknown type name 'bool'
+if "#include <linux/cred.h>" not in s:
+    # current_uid() 需要 cred.h；proc_namespace.c 自身不一定带
     brid_anchor = "#include <linux/sched/task.h>\n"
     assert brid_anchor in s, "proc_namespace.c: 找不到 sched/task.h 锚点"
     s = s.replace(brid_anchor,
-                  brid_anchor + "extern bool susfs_is_current_ksu_domain(void);\n", 1)
+                  brid_anchor + "#include <linux/cred.h>\n", 1)
 
 # 在 3 个 show 函数体第一行插判断，命中就整行跳过（return 0）：
 #   1) 显式路径列表（/proc/susfs_add_sus_mount）
@@ -876,7 +877,7 @@ for fn in funcs:
         "\t\treturn 0;\n"
         "\tif (susfs_mount_is_sus_id(real_mount(mnt)->mnt_id) &&\n"
         "\t    susfs_mount_hide_for_non_su() &&\n"
-        "\t    !susfs_is_current_ksu_domain())\n"
+        "\t    current_uid().val >= 10000)\n"
         "\t\treturn 0;\n\n"
     )
     s = s[:m.end()] + block + s[m.end():]

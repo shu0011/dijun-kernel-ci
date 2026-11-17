@@ -193,20 +193,34 @@ int susfs_path_abi_add(const char *path)
 	return susfs_path_add(path);
 }
 
+/* 调用方持 susfs_loop_mutex：把所有待定路径重新解析并入普通表 */
+static int susfs_path_loop_resolve_locked(void)
+{
+	int i, resolved = 0;
+
+	for (i = 0; i < susfs_loop_count; i++) {
+		if (!susfs_loop_paths[i])
+			continue;
+		if (!susfs_path_add(susfs_loop_paths[i]))
+			resolved++;
+	}
+	return resolved;
+}
+
 static void susfs_path_loop_work_fn(struct work_struct *work)
 {
-	int i;
+	int resolved;
 	bool pending;
 
 	/* susfs_path_add() 只取 susfs_path_mutex，这里持 loop 锁在外层，
 	 * 不存在反向加锁路径。 */
 	mutex_lock(&susfs_loop_mutex);
-	for (i = 0; i < susfs_loop_count; i++) {
-		if (susfs_loop_paths[i])
-			susfs_path_add(susfs_loop_paths[i]);
-	}
+	resolved = susfs_path_loop_resolve_locked();
 	pending = susfs_loop_count > 0;
 	mutex_unlock(&susfs_loop_mutex);
+
+	susfs_log("sus_path loop: tick, %d pending, %d resolved\n",
+		  susfs_loop_count, resolved);
 
 	if (pending)
 		schedule_delayed_work(&susfs_path_loop_work,
@@ -240,6 +254,8 @@ int susfs_path_abi_add_loop(const char *path)
 	}
 	susfs_loop_count++;
 	mutex_unlock(&susfs_loop_mutex);
+
+	susfs_log("sus_path loop: queued %s\n", path);
 
 	/* 立刻试一次；路径还不存在属于正常情况，LOOP 语义下仍返回成功。 */
 	ret = susfs_path_add(path);
@@ -342,11 +358,88 @@ static const struct file_operations susfs_path_fops = {
 };
 #endif
 
+#define SUSFS_PATH_LOOP_PROC "susfs_sus_path_loop"
+
+/*
+ * LOOP 表的观察/兜底入口：
+ *   读        -> "count=N" + 每条待定路径
+ *   写任意内容 -> 立即重试解析一次（不依赖定时器）
+ */
+static ssize_t susfs_path_loop_proc_read(struct file *file, char __user *ubuf,
+					 size_t count, loff_t *ppos)
+{
+	char *out;
+	size_t used;
+	int i, n;
+
+	if (*ppos)
+		return 0;
+
+	out = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!out)
+		return -ENOMEM;
+
+	mutex_lock(&susfs_loop_mutex);
+	n = scnprintf(out, PAGE_SIZE, "count=%d\n", susfs_loop_count);
+	used = n > 0 ? n : 0;
+	for (i = 0; i < susfs_loop_count; i++) {
+		if (used >= PAGE_SIZE - 1)
+			break;
+		n = scnprintf(out + used, PAGE_SIZE - used, "%s\n",
+			      susfs_loop_paths[i] ? susfs_loop_paths[i] : "-");
+		if (n <= 0)
+			break;
+		used += n;
+	}
+	mutex_unlock(&susfs_loop_mutex);
+
+	if (used > count)
+		used = count;
+	if (copy_to_user(ubuf, out, used)) {
+		kfree(out);
+		return -EFAULT;
+	}
+	kfree(out);
+	*ppos += used;
+	return used;
+}
+
+static ssize_t susfs_path_loop_proc_write(struct file *file,
+					  const char __user *ubuf,
+					  size_t count, loff_t *ppos)
+{
+	int resolved;
+
+	mutex_lock(&susfs_loop_mutex);
+	resolved = susfs_path_loop_resolve_locked();
+	mutex_unlock(&susfs_loop_mutex);
+
+	susfs_log("sus_path loop: manual retry, %d resolved\n", resolved);
+	return count;
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
+static const struct proc_ops susfs_path_loop_fops = {
+	.proc_read  = susfs_path_loop_proc_read,
+	.proc_write = susfs_path_loop_proc_write,
+	.proc_lseek = noop_llseek,
+};
+#else
+static const struct file_operations susfs_path_loop_fops = {
+	.read   = susfs_path_loop_proc_read,
+	.write  = susfs_path_loop_proc_write,
+	.llseek = noop_llseek,
+};
+#endif
+
 static int __init susfs_path_init(void)
 {
 	INIT_DELAYED_WORK(&susfs_path_loop_work, susfs_path_loop_work_fn);
 
 	if (!proc_create(SUSFS_PATH_PROC, 0600, NULL, &susfs_path_fops))
+		return -ENOMEM;
+	if (!proc_create(SUSFS_PATH_LOOP_PROC, 0600, NULL,
+			 &susfs_path_loop_fops))
 		return -ENOMEM;
 
 	pr_info("susfs: sus_path ready (/proc/%s)\n", SUSFS_PATH_PROC);
