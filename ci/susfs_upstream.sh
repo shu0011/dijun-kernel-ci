@@ -381,6 +381,12 @@ assert "fs_initcall(init_fs_namespace_sysctls);" in s, "namespace.c: 尾部锚�
 tail = """
 #ifdef CONFIG_KSU_SUSFS
 /* 官方实现（6.12 patch 尾部），原样保留 */
+/* 6.18 构建开了 -Werror,-Wmissing-prototypes：非 static 的全局函数定义前必须有原型。
+ * 官方 6.12 在使用方(fd.c/stat.c/statfs.c)声明，但定义方 namespace.c 无前置声明；
+ * 这里补上定义侧原型，签名与官方 extern 完全一致。 */
+extern int susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt);
+extern u64 susfs_get_non_sus_mnt_id_unique_from_mnt(struct mount *orig_mnt);
+extern struct vfsmount *susfs_get_non_sus_vfsmnt_from_vfsmnt(struct vfsmount *vfsmnt);
 int susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt)
 {
 	struct mount *mnt = orig_mnt;
