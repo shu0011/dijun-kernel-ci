@@ -16,6 +16,8 @@ jobs:
     env:
       # 正式版：恢复 CONFIG_PANIC_ON_OOPS 默认（y）
       DIAG_NO_PANIC: "0"
+      # upstream-align：SUSFS 走官方 v2.4.0 实现（自研阶段由 SUSFS_UPSTREAM=1 关闭）
+      SUSFS_UPSTREAM: "1"
 
     steps:
       - uses: actions/checkout@v4

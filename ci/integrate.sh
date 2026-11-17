@@ -546,6 +546,11 @@ open(hk, "w").write(t)
 print("    hooks.c: inode_setxattr 挂载点切到 G6 handle")
 PYEOF
 
+if [ "${SUSFS_UPSTREAM:-0}" = "1" ]; then
+    echo "==> [upstream-align] 官方 SUSFS 移植（vendor + 官方补丁 + 6.18 适配）"
+    bash "$HERE/ci/susfs_upstream.sh" "$SRC" "$HERE"
+fi
+
 echo "==> I 阶段1：SUSFS spoof_uname（built-in，proc 接口，零运行期改写）"
 cp "$HERE/patches/susfs_uname.c" "$SRC/fs/susfs_uname.c"
 cp "$HERE/patches/susfs_uname.h" "$SRC/include/linux/susfs_uname.h"
@@ -623,10 +628,12 @@ inject("fs/proc/bootconfig.c", "boot_config_proc_show",
 PYEOF
 
 echo "==> K 阶段3：sus_path（inode 匹配）"
+if ! [ "${SUSFS_UPSTREAM:-0}" = "1" ]; then
 cp "$HERE/patches/susfs_path.c" "$SRC/fs/susfs_path.c"
 cp "$HERE/patches/susfs_path.h" "$SRC/include/linux/susfs_path.h"
 if ! grep -q 'susfs_path\.o' "$SRC/fs/Makefile"; then
     printf 'obj-$(CONFIG_KSU_SUSFS) += susfs_path.o\n' >> "$SRC/fs/Makefile"
+fi
 fi
 python3 - "$SRC" <<'PYEOF'
 import os
@@ -751,6 +758,7 @@ for cb, fn, sysmark in variants:
 open(p, "w").write(s)
 PYEOF
 
+if ! [ "${SUSFS_UPSTREAM:-0}" = "1" ]; then
 echo "==> L 阶段4：sus_kstat（伪造 stat 字段）"
 cp "$HERE/patches/susfs_kstat.c" "$SRC/fs/susfs_kstat.c"
 cp "$HERE/patches/susfs_kstat.h" "$SRC/include/linux/susfs_kstat.h"
@@ -1272,6 +1280,8 @@ else:
 open(p, "w").write(s)
 PYEOF
 
+fi
+
 echo "==> O 阶段7：补齐 namei.c sus_path 钩子（覆盖最后一步 open/exec）"
 python3 - "$SRC" <<'PYEOF'
 import os
@@ -1431,11 +1441,15 @@ print("    namei.c: %d/%d 注入块校验通过" % (len(markers), len(markers)))
 PYEOF
 
 echo "==> P 阶段8：SUSFS reboot-magic 查询 ABI（让管理器/ksu_susfs 识别版本）"
+if ! [ "${SUSFS_UPSTREAM:-0}" = "1" ]; then
 cp "$HERE/patches/susfs_reboot.c" "$SRC/fs/susfs_reboot.c"
 cp "$HERE/patches/susfs_reboot.h" "$SRC/include/linux/susfs_reboot.h"
+fi
 cp "$HERE/patches/susfs_abi.h" "$SRC/include/linux/susfs_abi.h"
+if ! [ "${SUSFS_UPSTREAM:-0}" = "1" ]; then
 if ! grep -q 'susfs_reboot\.o' "$SRC/fs/Makefile"; then
     printf 'obj-$(CONFIG_KSU_SUSFS) += susfs_reboot.o\n' >> "$SRC/fs/Makefile"
+fi
 fi
 python3 - "$SRC" <<'PYEOF'
 import os
@@ -1501,6 +1515,7 @@ if "extern int susfs_reboot_handler" not in check or \
 print("    reboot.c: P 阶段 2/2 注入块校验通过")
 PYEOF
 
+if ! [ "${SUSFS_UPSTREAM:-0}" = "1" ]; then
 echo "==> R 阶段：SUSFS extra features（ENABLE_LOG / UID_FILTER / OPEN_REDIRECT）"
 cp "$HERE/patches/susfs_extra.c" "$SRC/fs/susfs_extra.c"
 cp "$HERE/patches/susfs_extra.h" "$SRC/include/linux/susfs_extra.h"
@@ -1587,6 +1602,8 @@ if "susfs_hide_sym_starts_with" not in check or \
     sys.exit("!! kallsyms.c: Q 阶段注入块校验失败，终止")
 print("    kallsyms.c: 符号隐藏 18 前缀注入完成（编译期 #ifdef）")
 PYEOF
+
+fi
 
 echo "==> H 集成完成"
 echo "    KSU 分支配置文件: $(ls "$SRC/drivers/kernelsu"/Kbuild "$SRC/drivers/kernelsu"/Makefile 2>/dev/null | tr '\n' ' ')"
