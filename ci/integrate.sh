@@ -971,59 +971,84 @@ if "susfs_mount.h" not in s:
     i = s.find("#include")
     assert i > 0, "namespace.c: 没找到 include"
     s = s[:i] + "#include <linux/susfs_mount.h>\n" + s[i:]
-if "susfs_is_current_ksu_domain" not in s:
+if "DEFAULT_KSU_MNT_ID" not in s:
     # 同上：必须放在 types.h 可达的 include 之后
+    # 常量与标记位对齐上游 susfs_def.h
     brid_anchor = "#include <linux/sched/task.h>\n"
     assert brid_anchor in s, "namespace.c: 找不到 sched/task.h 锚点"
     s = s.replace(brid_anchor,
-                  brid_anchor + "extern bool susfs_is_current_ksu_domain(void);\n", 1)
+                  brid_anchor
+                  + "extern bool susfs_is_current_ksu_domain(void);\n"
+                  + "#ifndef DEFAULT_KSU_MNT_ID\n"
+                  + "#define DEFAULT_KSU_MNT_ID 2000000000\n"
+                  + "#endif\n"
+                  + "#ifndef DEFAULT_KSU_MNT_GROUP_ID\n"
+                  + "#define DEFAULT_KSU_MNT_GROUP_ID 200000\n"
+                  + "#endif\n"
+                  + "#ifndef VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT\n"
+                  + "#define VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT 0x80000000u\n"
+                  + "#endif\n"
+                  + "#ifndef CL_COPY_MNT_NS\n"
+                  + "#define CL_COPY_MNT_NS BIT(25) /* 对齐上游：copy_mnt_ns() 专用标记 */\n"
+                  + "#endif\n", 1)
 
-# 1) mnt_alloc_id：KSU 域进程 -> 号段 id，不登记进 mnt_id_xa
-alloc_anchor = ("static int mnt_alloc_id(struct mount *mnt)\n"
-                "{\n"
-                "\tint res;\n"
-                "\n"
-                "\txa_lock(&mnt_id_xa);\n")
+# 1) mnt_alloc_id：对齐上游 susfs_alloc_non_unshare_ksu_vfsmnt()
+#    上游用 ida_alloc_min(DEFAULT_KSU_MNT_ID)；6.18 改成 XA_LIMIT 起点，
+#    id 仍然正常登记进 mnt_id_xa，mnt_free_id() 能照常回收。
+alloc_anchor = (
+    "static int mnt_alloc_id(struct mount *mnt)\n"
+    "{\n"
+    "\tint res;\n"
+    "\n"
+    "\txa_lock(&mnt_id_xa);\n"
+    "\tres = __xa_alloc(&mnt_id_xa, &mnt->mnt_id, mnt, XA_LIMIT(1, INT_MAX), GFP_KERNEL);\n"
+    "\tif (!res)\n"
+    "\t\tmnt->mnt_id_unique = ++mnt_id_ctr;\n"
+    "\txa_unlock(&mnt_id_xa);\n"
+    "\treturn res;\n"
+    "}\n")
 if alloc_anchor not in s:
     sys.exit("!! namespace.c: mnt_alloc_id 锚点没匹配上，终止")
-if "susfs_mount_next_id" not in s:
+if "min_id = 1;" not in s:
     alloc_block = (
         "static int mnt_alloc_id(struct mount *mnt)\n"
         "{\n"
         "\tint res;\n"
+        "\tunsigned int min_id = 1;\n"
         "\n"
-        "\txa_lock(&mnt_id_xa);\n"
         "#ifdef CONFIG_KSU_SUSFS\n"
-        "\tif (susfs_is_current_ksu_domain()) {\n"
-        "\t\tint sus_id = susfs_mount_next_id();\n"
-        "\n"
-        "\t\tif (sus_id > 0) {\n"
-        "\t\t\tmnt->mnt_id = sus_id;\n"
-        "\t\t\tmnt->mnt_id_unique = ++mnt_id_ctr;\n"
-        "\t\t\txa_unlock(&mnt_id_xa);\n"
-        "\t\t\treturn 0;\n"
-        "\t\t}\n"
-        "\t}\n"
+        "\t/* KSU 域的挂载从 DEFAULT_KSU_MNT_ID 起分配；\n"
+        "\t * 这个判断必须放在 xa_lock 之外（自旋锁内不能调用复杂函数）。 */\n"
+        "\tif (susfs_is_current_ksu_domain())\n"
+        "\t\tmin_id = DEFAULT_KSU_MNT_ID;\n"
         "#endif\n"
-    )
+        "\txa_lock(&mnt_id_xa);\n"
+        "\tres = __xa_alloc(&mnt_id_xa, &mnt->mnt_id, mnt, XA_LIMIT(min_id, INT_MAX), GFP_KERNEL);\n"
+        "\tif (!res)\n"
+        "\t\tmnt->mnt_id_unique = ++mnt_id_ctr;\n"
+        "\txa_unlock(&mnt_id_xa);\n"
+        "\treturn res;\n"
+        "}\n")
     s = s.replace(alloc_anchor, alloc_block, 1)
     print("    namespace.c: mnt_alloc_id 已注入")
 else:
     print("    namespace.c: mnt_alloc_id 已注入过")
 
-# 2) mnt_free_id：号段 id 不是 xa 分配的，直接返回
+# 2) mnt_free_id：完全对齐上游
+#    只有 unshare 时复用 old->mnt_id 的挂载（打了 KSU_UNSHARED 标记）没登记进
+#    xa，才跳过回收；其它号段 id 是 __xa_alloc 正常分配的，照常 xa_erase。
 free_anchor = ("static void mnt_free_id(struct mount *mnt)\n"
                "{\n"
                "\txa_erase(&mnt_id_xa, mnt->mnt_id);\n"
                "}\n")
 if free_anchor not in s:
     sys.exit("!! namespace.c: mnt_free_id 锚点没匹配上，终止")
-if "susfs_mount_is_sus_id(mnt->mnt_id)" not in s:
+if "if (unlikely(mnt->mnt.mnt_flags & VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT))" not in s:
     free_block = (
         "static void mnt_free_id(struct mount *mnt)\n"
         "{\n"
         "#ifdef CONFIG_KSU_SUSFS\n"
-        "\tif (susfs_mount_is_sus_id(mnt->mnt_id))\n"
+        "\tif (unlikely(mnt->mnt.mnt_flags & VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT))\n"
         "\t\treturn;\n"
         "#endif\n"
         "\txa_erase(&mnt_id_xa, mnt->mnt_id);\n"
@@ -1034,36 +1059,128 @@ if "susfs_mount_is_sus_id(mnt->mnt_id)" not in s:
 else:
     print("    namespace.c: mnt_free_id 已注入过")
 
-# 3) clone_mnt：克隆 sus 挂载（unshare 场景）时继续用号段 id，
-#    否则 app unshare 后拿到的副本是普通 id，会重新出现在 /proc 里。
-#    注意：这里已经持有 xa_lock，必须用 __xa_erase（调用方持锁版本）；
-#    用 xa_erase 会在同一把非递归自旋锁上自死锁（101 版开机黑屏的根因）。
-clone_anchor = ("\tmnt = alloc_vfsmnt(old->mnt_devname);\n"
-                "\tif (!mnt)\n"
-                "\t\treturn ERR_PTR(-ENOMEM);\n")
-if clone_anchor not in s:
-    sys.exit("!! namespace.c: clone_mnt 锚点没匹配上，终止")
-if "susfs_mount_is_sus_id(old->mnt_id)" not in s:
-    clone_block = clone_anchor + (
-        "#ifdef CONFIG_KSU_SUSFS\n"
-        "\tif (susfs_mount_is_sus_id(old->mnt_id)) {\n"
-        "\t\tint sus_id = susfs_mount_next_id();\n"
+# 2b) mnt_alloc_group_id：对齐上游，KSU 域的 peer group id 从号段起分配
+group_anchor = ("static int mnt_alloc_group_id(struct mount *mnt)\n"
+                "{\n"
+                "\tint res = ida_alloc_min(&mnt_group_ida, 1, GFP_KERNEL);\n"
+                "\n"
+                "\tif (res < 0)\n"
+                "\t\treturn res;\n"
+                "\tmnt->mnt_group_id = res;\n"
+                "\treturn 0;\n"
+                "}\n")
+if group_anchor not in s:
+    sys.exit("!! namespace.c: mnt_alloc_group_id 锚点没匹配上，终止")
+if "ida_alloc_min(&mnt_group_ida, DEFAULT_KSU_MNT_GROUP_ID" not in s:
+    group_block = (
+        "static int mnt_alloc_group_id(struct mount *mnt)\n"
+        "{\n"
+        "\tint res;\n"
         "\n"
-        "\t\tif (sus_id > 0) {\n"
-        "\t\t\txa_lock(&mnt_id_xa);\n"
-        "\t\t\t/* 号段 id 不在 xa 里，别去 erase；普通 id 用 __xa_erase */\n"
-        "\t\t\tif (!susfs_mount_is_sus_id(mnt->mnt_id))\n"
-        "\t\t\t\t__xa_erase(&mnt_id_xa, mnt->mnt_id);\n"
-        "\t\t\tmnt->mnt_id = sus_id;\n"
-        "\t\t\txa_unlock(&mnt_id_xa);\n"
-        "\t\t}\n"
+        "#ifdef CONFIG_KSU_SUSFS\n"
+        "\tif (susfs_is_current_ksu_domain())\n"
+        "\t\tres = ida_alloc_min(&mnt_group_ida, DEFAULT_KSU_MNT_GROUP_ID, GFP_KERNEL);\n"
+        "\telse\n"
+        "#endif\n"
+        "\t\tres = ida_alloc_min(&mnt_group_ida, 1, GFP_KERNEL);\n"
+        "\n"
+        "\tif (res < 0)\n"
+        "\t\treturn res;\n"
+        "\tmnt->mnt_group_id = res;\n"
+        "\treturn 0;\n"
+        "}\n")
+    s = s.replace(group_anchor, group_block, 1)
+    print("    namespace.c: mnt_alloc_group_id 已注入")
+else:
+    print("    namespace.c: mnt_alloc_group_id 已注入过")
+
+# 3) clone_mnt：完全按上游手法
+#    - unshare（CL_COPY_MNT_NS）且是 KSU 域：复用 old->mnt_id（对应上游
+#      susfs_alloc_unshare_ksu_vfsmnt()），并打 KSU_UNSHARED 标记，
+#      mnt_free_id() 见到该标记就不回收（这个 id 没登记进 xa）。
+#    - 其它情况克隆号段挂载：新 id 重新分配到号段内（对应上游
+#      susfs_alloc_non_unshare_ksu_vfsmnt()）。
+#    所有 xa 操作都在 xa_lock 内用 __ 版本，绝不调用会自行加锁的 xa_erase。
+clone_head_anchor = ("{\n"
+                     "\tstruct mount *mnt;\n"
+                     "\tint err;\n"
+                     "\n"
+                     "\tmnt = alloc_vfsmnt(old->mnt_devname);\n"
+                     "\tif (!mnt)\n"
+                     "\t\treturn ERR_PTR(-ENOMEM);\n")
+if clone_head_anchor not in s:
+    sys.exit("!! namespace.c: clone_mnt 头部锚点没匹配上，终止")
+if "is_mnt_ksu_unshared = false;" not in s:
+    clone_head_block = (
+        "{\n"
+        "\tstruct mount *mnt;\n"
+        "\tint err;\n"
+        "#ifdef CONFIG_KSU_SUSFS\n"
+        "\tbool is_mnt_ksu_unshared = false;\n"
+        "\tint sus_res;\n"
+        "#endif\n"
+        "\n"
+        "\tmnt = alloc_vfsmnt(old->mnt_devname);\n"
+        "\tif (!mnt)\n"
+        "\t\treturn ERR_PTR(-ENOMEM);\n"
+        "#ifdef CONFIG_KSU_SUSFS\n"
+        "\tif ((flag & CL_COPY_MNT_NS) && susfs_is_current_ksu_domain()) {\n"
+        "\t\t/* 对齐上游 susfs_alloc_unshare_ksu_vfsmnt()：复用 old->mnt_id */\n"
+        "\t\txa_lock(&mnt_id_xa);\n"
+        "\t\t__xa_erase(&mnt_id_xa, mnt->mnt_id);\n"
+        "\t\tmnt->mnt_id = old->mnt_id;\n"
+        "\t\txa_unlock(&mnt_id_xa);\n"
+        "\t\tis_mnt_ksu_unshared = true;\n"
+        "\t} else if (old->mnt_id >= DEFAULT_KSU_MNT_ID &&\n"
+        "\t\t   mnt->mnt_id < DEFAULT_KSU_MNT_ID) {\n"
+        "\t\t/* 对齐上游 susfs_alloc_non_unshare_ksu_vfsmnt()：新 id 仍在号段内 */\n"
+        "\t\txa_lock(&mnt_id_xa);\n"
+        "\t\t__xa_erase(&mnt_id_xa, mnt->mnt_id);\n"
+        "\t\tsus_res = __xa_alloc(&mnt_id_xa, &mnt->mnt_id, mnt,\n"
+        "\t\t\t\t     XA_LIMIT(DEFAULT_KSU_MNT_ID, INT_MAX),\n"
+        "\t\t\t\t     GFP_KERNEL);\n"
+        "\t\tif (sus_res)\n"
+        "\t\t\tsus_res = __xa_alloc(&mnt_id_xa, &mnt->mnt_id, mnt,\n"
+        "\t\t\t\t\t     XA_LIMIT(1, INT_MAX), GFP_KERNEL);\n"
+        "\t\txa_unlock(&mnt_id_xa);\n"
         "\t}\n"
         "#endif\n"
     )
-    s = s.replace(clone_anchor, clone_block, 1)
-    print("    namespace.c: clone_mnt 已注入")
+    s = s.replace(clone_head_anchor, clone_head_block, 1)
+    print("    namespace.c: clone_mnt 头部已注入")
 else:
-    print("    namespace.c: clone_mnt 已注入过")
+    print("    namespace.c: clone_mnt 头部已注入过")
+
+# 3b) 在 mnt_flags 复制之后打 KSU_UNSHARED 标记（对齐上游位置）
+clone_flag_anchor = ("\tif (flag & (CL_SLAVE | CL_PRIVATE))\n"
+                     "\t\tmnt->mnt_group_id = 0; /* not a peer of original */\n")
+if clone_flag_anchor not in s:
+    sys.exit("!! namespace.c: clone_mnt mnt_flags 锚点没匹配上，终止")
+if "if (unlikely(is_mnt_ksu_unshared))" not in s:
+    s = s.replace(clone_flag_anchor,
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tif (unlikely(is_mnt_ksu_unshared))\n"
+                  "\t\tmnt->mnt.mnt_flags |= VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT;\n"
+                  "#endif\n"
+                  + clone_flag_anchor, 1)
+    print("    namespace.c: clone_mnt 标记已注入")
+else:
+    print("    namespace.c: clone_mnt 标记已注入过")
+
+# 3c) copy_mnt_ns：给 copy_tree 加上 CL_COPY_MNT_NS 标记（完全照上游）
+copy_ns_anchor = ("\tif (user_ns != ns->user_ns)\n"
+                  "\t\tcopy_flags |= CL_SLAVE;\n")
+if copy_ns_anchor not in s:
+    sys.exit("!! namespace.c: copy_mnt_ns 锚点没匹配上，终止")
+if "copy_flags |= CL_COPY_MNT_NS;" not in s:
+    s = s.replace(copy_ns_anchor,
+                  copy_ns_anchor
+                  + "#ifdef CONFIG_KSU_SUSFS\n"
+                  + "\tcopy_flags |= CL_COPY_MNT_NS;\n"
+                  + "#endif\n", 1)
+    print("    namespace.c: copy_mnt_ns 已注入")
+else:
+    print("    namespace.c: copy_mnt_ns 已注入过")
 
 # 4) lookup_mnt_in_ns：statmount/listmount 按 unique id 反查挂载时，
 #    app 视角下号段挂载当作不存在。
