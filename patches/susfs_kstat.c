@@ -110,6 +110,29 @@ void susfs_kstat_override(struct inode *inode, struct kstat *stat)
 	mutex_unlock(&susfs_kstat_mutex);
 }
 
+/* inotify/fanotify fdinfo 用：按 inode 取伪装的 ino/dev（调用方自己判断 uid） */
+bool susfs_kstat_get_spoof(struct inode *inode, u64 *ino, u32 *dev)
+{
+	int i;
+	bool found = false;
+
+	if (!inode || !ino || !dev || !READ_ONCE(susfs_kstat_count))
+		return false;
+
+	mutex_lock(&susfs_kstat_mutex);
+	for (i = 0; i < susfs_kstat_count; i++) {
+		if (susfs_kstats[i].inode != inode)
+			continue;
+		*ino = susfs_kstats[i].kst.ino;
+		*dev = (u32)susfs_kstats[i].kst.dev;
+		found = true;
+		break;
+	}
+	mutex_unlock(&susfs_kstat_mutex);
+
+	return found;
+}
+
 static void susfs_kstat_clear(void)
 {
 	int i;

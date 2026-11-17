@@ -792,6 +792,84 @@ else:
 open(p, "w").write(s)
 PYEOF
 
+echo "==> L1b 阶段4c：sus_kstat 的 inotify/fanotify fdinfo 伪装（对齐上游）"
+python3 - "$SRC" <<'PYEOF'
+import os
+import sys
+
+SRC = sys.argv[1]
+p = os.path.join(SRC, "fs/notify/fdinfo.c")
+s = open(p).read()
+
+if "susfs_kstat.h" not in s:
+    i = s.find("#include")
+    assert i > 0, "fs/notify/fdinfo.c: 没找到 include"
+    s = s[:i] + "#include <linux/susfs_kstat.h>\n" + s[i:]
+if "#include <linux/cred.h>" not in s:
+    i = s.find("#include")
+    assert i > 0, "fs/notify/fdinfo.c: 没找到 include"
+    s = s[:i] + "#include <linux/cred.h>\n" + s[i:]
+
+inotify_anchor = ("\tinode = igrab(fsnotify_conn_inode(mark->connector));\n"
+                  "\tif (inode) {\n")
+inotify_block = (
+    "#ifdef CONFIG_KSU_SUSFS\n"
+    "\t\tif (current_uid().val >= 10000) {\n"
+    "\t\t\tu64 sus_ino;\n"
+    "\t\t\tu32 sus_dev;\n"
+    "\n"
+    "\t\t\tif (susfs_kstat_get_spoof(inode, &sus_ino, &sus_dev)) {\n"
+    "\t\t\t\tseq_printf(m, \"inotify wd:%x ino:%llx sdev:%x mask:%x ignored_mask:0 \",\n"
+    "\t\t\t\t\t   inode_mark->wd, sus_ino, sus_dev,\n"
+    "\t\t\t\t\t   inotify_mark_user_mask(mark));\n"
+    "\t\t\t\tshow_mark_fhandle(m, inode);\n"
+    "\t\t\t\tseq_putc(m, '\\n');\n"
+    "\t\t\t\tiput(inode);\n"
+    "\t\t\t\treturn;\n"
+    "\t\t\t}\n"
+    "\t\t}\n"
+    "#endif\n"
+)
+if "susfs_kstat_get_spoof" in s:
+    print("    fs/notify/fdinfo.c: 已注入过")
+else:
+    if inotify_anchor not in s:
+        sys.exit("!! fs/notify/fdinfo.c: inotify 锚点没匹配上，终止")
+    s = s.replace(inotify_anchor, inotify_anchor + inotify_block, 1)
+    print("    fs/notify/fdinfo.c: inotify 已注入")
+
+fanotify_anchor = ("\t\tinode = igrab(fsnotify_conn_inode(mark->connector));\n"
+                   "\t\tif (!inode)\n"
+                   "\t\t\treturn;\n")
+fanotify_block = (
+    "#ifdef CONFIG_KSU_SUSFS\n"
+    "\t\tif (current_uid().val >= 10000) {\n"
+    "\t\t\tu64 sus_ino;\n"
+    "\t\t\tu32 sus_dev;\n"
+    "\n"
+    "\t\t\tif (susfs_kstat_get_spoof(inode, &sus_ino, &sus_dev)) {\n"
+    "\t\t\t\tseq_printf(m, \"fanotify ino:%llx sdev:%x mflags:%x mask:%x ignored_mask:%x \",\n"
+    "\t\t\t\t\t   sus_ino, sus_dev, mflags, mark->mask,\n"
+    "\t\t\t\t\t   mark->ignore_mask);\n"
+    "\t\t\t\tshow_mark_fhandle(m, inode);\n"
+    "\t\t\t\tseq_putc(m, '\\n');\n"
+    "\t\t\t\tiput(inode);\n"
+    "\t\t\t\treturn;\n"
+    "\t\t\t}\n"
+    "\t\t}\n"
+    "#endif\n"
+)
+if "fanotify ino:%llx" in s:
+    print("    fs/notify/fdinfo.c: fanotify 已注入过")
+else:
+    if fanotify_anchor not in s:
+        sys.exit("!! fs/notify/fdinfo.c: fanotify 锚点没匹配上，终止")
+    s = s.replace(fanotify_anchor, fanotify_anchor + fanotify_block, 1)
+    print("    fs/notify/fdinfo.c: fanotify 已注入")
+
+open(p, "w").write(s)
+PYEOF
+
 echo "==> L2 阶段4b：do_proc_readlink 伪装（/proc/<pid>/fd 的 readlink，对齐上游）"
 python3 - "$SRC" <<'PYEOF'
 import os
@@ -955,6 +1033,84 @@ if "susfs_mount_is_sus_id(mnt->mnt_id)" not in s:
     print("    namespace.c: mnt_free_id 已注入")
 else:
     print("    namespace.c: mnt_free_id 已注入过")
+
+# 3) clone_mnt：克隆 sus 挂载（unshare 场景）时继续用号段 id，
+#    否则 app unshare 后拿到的副本是普通 id，会重新出现在 /proc 里。
+clone_anchor = ("\tmnt = alloc_vfsmnt(old->mnt_devname);\n"
+                "\tif (!mnt)\n"
+                "\t\treturn ERR_PTR(-ENOMEM);\n")
+if clone_anchor not in s:
+    sys.exit("!! namespace.c: clone_mnt 锚点没匹配上，终止")
+if "susfs_mount_is_sus_id(old->mnt_id)" not in s:
+    clone_block = clone_anchor + (
+        "#ifdef CONFIG_KSU_SUSFS\n"
+        "\tif (susfs_mount_is_sus_id(old->mnt_id)) {\n"
+        "\t\tint sus_id = susfs_mount_next_id();\n"
+        "\n"
+        "\t\tif (sus_id > 0) {\n"
+        "\t\t\txa_lock(&mnt_id_xa);\n"
+        "\t\t\txa_erase(&mnt_id_xa, mnt->mnt_id);\n"
+        "\t\t\tmnt->mnt_id = sus_id;\n"
+        "\t\t\txa_unlock(&mnt_id_xa);\n"
+        "\t\t}\n"
+        "\t}\n"
+        "#endif\n"
+    )
+    s = s.replace(clone_anchor, clone_block, 1)
+    print("    namespace.c: clone_mnt 已注入")
+else:
+    print("    namespace.c: clone_mnt 已注入过")
+
+# 4) lookup_mnt_in_ns：statmount/listmount 按 unique id 反查挂载时，
+#    app 视角下号段挂载当作不存在。
+lookup_anchor = ("static struct vfsmount *lookup_mnt_in_ns(u64 id, struct mnt_namespace *ns)\n"
+                 "{\n"
+                 "\tstruct mount *mnt = mnt_find_id_at(ns, id);\n"
+                 "\n"
+                 "\tif (!mnt || mnt->mnt_id_unique != id)\n"
+                 "\t\treturn NULL;\n"
+                 "\n"
+                 "\treturn &mnt->mnt;\n"
+                 "}\n")
+if lookup_anchor not in s:
+    sys.exit("!! namespace.c: lookup_mnt_in_ns 锚点没匹配上，终止")
+if "susfs_mount_is_sus_id(mnt->mnt_id)" not in s:
+    lookup_block = ("static struct vfsmount *lookup_mnt_in_ns(u64 id, struct mnt_namespace *ns)\n"
+                    "{\n"
+                    "\tstruct mount *mnt = mnt_find_id_at(ns, id);\n"
+                    "\n"
+                    "\tif (!mnt || mnt->mnt_id_unique != id)\n"
+                    "\t\treturn NULL;\n"
+                    "#ifdef CONFIG_KSU_SUSFS\n"
+                    "\tif (susfs_mount_is_sus_id(mnt->mnt_id) &&\n"
+                    "\t    current_uid().val >= 10000)\n"
+                    "\t\treturn NULL;\n"
+                    "#endif\n"
+                    "\n"
+                    "\treturn &mnt->mnt;\n"
+                    "}\n")
+    s = s.replace(lookup_anchor, lookup_block, 1)
+    print("    namespace.c: lookup_mnt_in_ns 已注入")
+else:
+    print("    namespace.c: lookup_mnt_in_ns 已注入过")
+
+# 5) do_listmount：遍历时跳过号段挂载（app 视角）
+list_anchor = ("\t\tif (r->mnt_id_unique == mnt_parent_id)\n"
+               "\t\t\tcontinue;\n")
+if list_anchor not in s:
+    sys.exit("!! namespace.c: do_listmount 锚点没匹配上，终止")
+if "susfs_mount_is_sus_id(r->mnt_id)" not in s:
+    list_block = list_anchor + (
+        "#ifdef CONFIG_KSU_SUSFS\n"
+        "\t\tif (susfs_mount_is_sus_id(r->mnt_id) &&\n"
+        "\t\t    current_uid().val >= 10000)\n"
+        "\t\t\tcontinue;\n"
+        "#endif\n"
+    )
+    s = s.replace(list_anchor, list_block, 1)
+    print("    namespace.c: do_listmount 已注入")
+else:
+    print("    namespace.c: do_listmount 已注入过")
 
 open(p, "w").write(s)
 PYEOF
