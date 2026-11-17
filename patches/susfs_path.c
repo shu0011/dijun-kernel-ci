@@ -21,6 +21,7 @@
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/limits.h>
+#include <linux/mnt_idmapping.h>
 #include <linux/mutex.h>
 #include <linux/namei.h>
 #include <linux/path.h>
@@ -31,6 +32,8 @@
 #include <linux/susfs_path.h>
 #include <linux/susfs_extra.h>
 #include <linux/uaccess.h>
+#include <linux/uidgid.h>
+#include <linux/user_namespace.h>
 #include <linux/version.h>
 #include <linux/workqueue.h>
 
@@ -55,6 +58,7 @@
 
 struct susfs_path_entry {
 	struct inode *inode;
+	kuid_t owner;			/* 加入时按挂载 idmap 映射后的属主 uid */
 	char path[SUSFS_PATH_MAX_LEN];	/* 仅用于回读展示 */
 };
 
@@ -128,23 +132,19 @@ bool susfs_is_inode_sus_path(struct inode *inode)
 		return false;
 
 	/*
-	 * 应用自己的数据目录不隐藏。
-	 *
-	 * susfs4ksu 模块的 "模拟 vold 应用数据隔离"（emulate_vold_app_data）会把
-	 * /sdcard/Android/data/<pkg> 整条路径加进 sus_path。FUSE/scoped storage 下
-	 * 这些目录的 inode->i_uid 就是该应用的 uid；如果连属主自己一起隐藏，QQ/TIM
-	 * 就读不到自己的聊天图片目录。
-	 * 属主 uid 放行后：应用自己正常访问，其它 uid（检测软件）仍然看不到。
+	 * 属主放行：susfs4ksu 模块的 emulate_vold_app_data 会把
+	 * /sdcard/Android/data/<pkg> 加进 sus_path；如果连属主一起隐藏，
+	 * QQ/TIM 就读不到自己的聊天图片目录。
+	 * 注意这里必须用加入时按挂载 idmap 映射后的 owner：/sdcard 是
+	 * idmapped FUSE 挂载，inode->i_uid 是未映射的原始值，直接和
+	 * current_uid() 比会永远不相等。
 	 */
-	if (inode->i_uid.val == current_uid().val)
-		return false;
-
 	mutex_lock(&susfs_path_mutex);
 	for (i = 0; i < susfs_path_count; i++) {
-		if (susfs_paths[i].inode == inode) {
-			found = true;
-			break;
-		}
+		if (susfs_paths[i].inode != inode)
+			continue;
+		found = !uid_eq(susfs_paths[i].owner, current_uid());
+		break;
 	}
 	mutex_unlock(&susfs_path_mutex);
 
@@ -178,7 +178,8 @@ static void susfs_path_clear(void)
 }
 
 /* 已拿到 inode 时直接并入表；调用方负责 path_put 与偏移/权限检查 */
-static int susfs_path_add_inode(struct inode *inode, const char *path)
+static int susfs_path_add_inode(struct inode *inode, kuid_t owner,
+				const char *path)
 {
 	int i, ret;
 
@@ -198,6 +199,7 @@ static int susfs_path_add_inode(struct inode *inode, const char *path)
 
 			ihold(inode);
 			susfs_paths[i].inode = inode;
+			susfs_paths[i].owner = owner;
 			mutex_unlock(&susfs_path_mutex);
 			if (old)
 				iput(old);
@@ -214,11 +216,21 @@ static int susfs_path_add_inode(struct inode *inode, const char *path)
 
 	ihold(inode);
 	susfs_paths[susfs_path_count].inode = inode;
+	susfs_paths[susfs_path_count].owner = owner;
 	strscpy(susfs_paths[susfs_path_count].path, path, SUSFS_PATH_MAX_LEN);
 	susfs_path_count++;
 	mutex_unlock(&susfs_path_mutex);
 
 	return 0;
+}
+
+/*
+ * 取应用视角的属主 uid：/sdcard 是 idmapped FUSE 挂载，inode->i_uid 是
+ * 未映射的原始值，必须按该挂载的 idmap 映射后才是应用看到的 uid。
+ */
+static kuid_t susfs_path_owner_of(struct path *p)
+{
+	return i_uid_into_mnt(mnt_idmap(p->mnt), d_inode(p->dentry));
 }
 
 static int susfs_path_add(const char *path)
@@ -233,7 +245,8 @@ static int susfs_path_add(const char *path)
 	if (ret)
 		return ret;
 
-	ret = susfs_path_add_inode(d_backing_inode(p.dentry), path);
+	ret = susfs_path_add_inode(d_backing_inode(p.dentry),
+				   susfs_path_owner_of(&p), path);
 	path_put(&p);
 	return ret;
 }
@@ -282,7 +295,8 @@ static int susfs_loop_try_entry(struct susfs_loop_entry *e)
 	if (ret)
 		return ret;
 
-	ret = susfs_path_add_inode(d_backing_inode(p.dentry), e->path);
+	ret = susfs_path_add_inode(d_backing_inode(p.dentry),
+				   susfs_path_owner_of(&p), e->path);
 	path_put(&p);
 	return ret;
 }
@@ -415,41 +429,50 @@ static ssize_t susfs_path_read(struct file *file, char __user *ubuf,
 			       size_t count, loff_t *ppos)
 {
 	char *out;
-	size_t used = 0;
+	size_t used = 0, total, chunk;
 	int i, n;
 
-	if (*ppos)
-		return 0;
+	/*
+	 * 一次把所有条目渲染到内存，再按 *ppos 拷对应片段。
+	 * 之前用固定 PAGE_SIZE 缓冲 + "if (*ppos) return 0"，列表超过 4KB
+	 * 时后续读取直接返回 0，回显被截断（199 条只能看到 99 条）。
+	 */
+	mutex_lock(&susfs_path_mutex);
+	total = (size_t)susfs_path_count * (SUSFS_PATH_MAX_LEN + 16) + 1;
+	mutex_unlock(&susfs_path_mutex);
 
-	out = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	out = kvzalloc(total, GFP_KERNEL);
 	if (!out)
 		return -ENOMEM;
 
 	mutex_lock(&susfs_path_mutex);
 	for (i = 0; i < susfs_path_count; i++) {
-		/* Keep filling the page: the previous "PAGE_SIZE - used <
-		 * PATH_MAX" test was always true after the first entry, so the
-		 * readback only ever showed one line. */
-		if (used >= PAGE_SIZE - 1)
-			break;
-		n = scnprintf(out + used, PAGE_SIZE - used, "%s\n",
-			      susfs_paths[i].path);
-		if (n <= 0)
+		n = scnprintf(out + used, total - used, "%s %u\n",
+			      susfs_paths[i].path,
+			      from_kuid_munged(&init_user_ns,
+					       susfs_paths[i].owner));
+		if (n <= 0 || used + n >= total)
 			break;
 		used += n;
 	}
 	mutex_unlock(&susfs_path_mutex);
 
-	if (used > count)
-		used = count;
-	if (copy_to_user(ubuf, out, used)) {
-		kfree(out);
+	if (*ppos >= used) {
+		kvfree(out);
+		return 0;
+	}
+	chunk = used - *ppos;
+	if (chunk > count)
+		chunk = count;
+
+	if (copy_to_user(ubuf, out + *ppos, chunk)) {
+		kvfree(out);
 		return -EFAULT;
 	}
 
-	kfree(out);
-	*ppos += used;
-	return used;
+	kvfree(out);
+	*ppos += chunk;
+	return chunk;
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
