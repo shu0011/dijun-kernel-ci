@@ -88,7 +88,7 @@ static struct susfs_loop_entry susfs_loop_entries[SUSFS_PATH_LOOP_MAX];
 static int susfs_loop_count;
 static DEFINE_MUTEX(susfs_loop_mutex);
 static struct delayed_work susfs_path_loop_work;
-static struct cred *susfs_loop_cred;
+static const struct cred *susfs_loop_cred;
 
 /* Doubling growth; caller must hold susfs_path_mutex. */
 static int susfs_path_grow_locked(void)
@@ -125,6 +125,18 @@ bool susfs_is_inode_sus_path(struct inode *inode)
 	 * With no filter configured this keeps the legacy "hide for all app
 	 * uids" behaviour (see susfs_uid_hidden_for_sus_path()). */
 	if (!susfs_uid_hidden_for_sus_path(current_uid().val))
+		return false;
+
+	/*
+	 * 应用自己的数据目录不隐藏。
+	 *
+	 * susfs4ksu 模块的 "模拟 vold 应用数据隔离"（emulate_vold_app_data）会把
+	 * /sdcard/Android/data/<pkg> 整条路径加进 sus_path。FUSE/scoped storage 下
+	 * 这些目录的 inode->i_uid 就是该应用的 uid；如果连属主自己一起隐藏，QQ/TIM
+	 * 就读不到自己的聊天图片目录。
+	 * 属主 uid 放行后：应用自己正常访问，其它 uid（检测软件）仍然看不到。
+	 */
+	if (inode->i_uid.val == current_uid().val)
 		return false;
 
 	mutex_lock(&susfs_path_mutex);
