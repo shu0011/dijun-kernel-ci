@@ -109,6 +109,10 @@ s = s.replace("bool susfs_is_current_ksu_domain(void);", "/* [upstream-align] �
 s = s.replace("bool susfs_is_sus_type_rcu(u32 sid);", "/* [upstream-align] 由官方 susfs.c 提供 */", 1)
 s = s.replace("""void susfs_spoof_avd_allowed_rcu(u32 s_type, u32 t_type, u32 c_type,
 				 u32 *avd_allowed);""", "/* [upstream-align] 由官方 susfs.c 提供 */", 1)
+# 该 include 仅为上面已删除的 susfs_set_avc_log_spoofing(bool) 原型而存在；
+# upstream 模式不拷 susfs_extra.h，留着会 file not found。官方 susfs.c 已提供同名符号。
+s = s.replace("#include <linux/susfs_extra.h>\t/* susfs_set_avc_log_spoofing 原型 */",
+              "/* [upstream-align] 不再需要 susfs_extra.h：AVC spoof 由官方 susfs.c 提供 */", 1)
 s += "\n/* SUSFS_BRIDGE_TRIMMED */\n"
 open(p, "w").write(s)
 print("    bridge 已瘦身")
