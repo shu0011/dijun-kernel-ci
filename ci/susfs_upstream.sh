@@ -165,6 +165,30 @@ PYA
 
 echo "    官方补丁已应用（15 个文件）"
 
+echo "==> [upstream] 6.18 适配：statfs.c 两个 wrapper 补前置原型（-Wmissing-prototypes）"
+python3 - "$SRC/fs/statfs.c" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+proto = (
+    "#ifdef CONFIG_KSU_SUSFS_SUS_KSTAT\n"
+    "/* 6.18 -Werror,-Wmissing-prototypes：官方 6.12 只在 susfs.c(使用方)声明这两个\n"
+    " * wrapper，定义方 statfs.c 自身无原型。补定义侧原型，签名与官方 extern 一致。 */\n"
+    "extern int statfs_by_dentry_wrapper(struct dentry *dentry, struct kstatfs *buf);\n"
+    "extern int calculate_f_flags_wrapper(struct vfsmount *mnt);\n"
+    "#endif\n"
+)
+anchor = "int statfs_by_dentry_wrapper(struct dentry *dentry, struct kstatfs *buf)"
+if "extern int statfs_by_dentry_wrapper" in s:
+    print("    statfs.c 原型已存在，跳过")
+elif anchor in s:
+    s = s.replace(anchor, proto + anchor, 1)
+    open(p, "w").write(s)
+    print("    statfs.c 已补 2 个 wrapper 原型")
+else:
+    print("    !! statfs.c 没找到 wrapper 定义，跳过")
+PY
+
 echo "==> [upstream] 6.18 适配：susfs_def.h 的三个 TIF 闸门"
 python3 - "$SRC/include/linux/susfs_def.h" <<'PY'
 import sys
