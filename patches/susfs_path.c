@@ -153,17 +153,28 @@ bool susfs_is_inode_sus_path(struct inode *inode)
 
 static void susfs_path_clear(void)
 {
-	int i;
+	struct inode *inode;
 
-	mutex_lock(&susfs_path_mutex);
-	for (i = 0; i < susfs_path_count; i++) {
-		if (susfs_paths[i].inode)
-			iput(susfs_paths[i].inode);
-		susfs_paths[i].inode = NULL;
-		susfs_paths[i].path[0] = '\0';
+	/*
+	 * iput() 可能触发 inode evict；在 FUSE 上会发出 forget 请求并等待
+	 * MediaProvider 处理，此时若持有 susfs_path_mutex，MediaProvider 的
+	 * namei/stat 钩子会来抢同一把锁，形成环。所以每次只取一个、放锁后再
+	 * iput。
+	 */
+	for (;;) {
+		mutex_lock(&susfs_path_mutex);
+		if (susfs_path_count == 0) {
+			mutex_unlock(&susfs_path_mutex);
+			break;
+		}
+		susfs_path_count--;
+		inode = susfs_paths[susfs_path_count].inode;
+		susfs_paths[susfs_path_count].inode = NULL;
+		susfs_paths[susfs_path_count].path[0] = '\0';
+		mutex_unlock(&susfs_path_mutex);
+		if (inode)
+			iput(inode);
 	}
-	susfs_path_count = 0;
-	mutex_unlock(&susfs_path_mutex);
 }
 
 /* 已拿到 inode 时直接并入表；调用方负责 path_put 与偏移/权限检查 */
@@ -183,10 +194,13 @@ static int susfs_path_add_inode(struct inode *inode, const char *path)
 		/* 同一路径被删除后重建：inode 变了，替换旧 inode 并释放引用，
 		 * 否则 LOOP 重试会把同一路径越积越多、且旧 inode 永远泄漏。 */
 		if (!strcmp(susfs_paths[i].path, path)) {
+			struct inode *old = susfs_paths[i].inode;
+
 			ihold(inode);
-			iput(susfs_paths[i].inode);
 			susfs_paths[i].inode = inode;
 			mutex_unlock(&susfs_path_mutex);
+			if (old)
+				iput(old);
 			return 0;
 		}
 	}
