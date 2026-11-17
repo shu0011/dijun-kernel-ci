@@ -38,6 +38,48 @@ if ! grep -q 'susfs\.o' "$SRC/fs/Makefile"; then
     printf 'obj-$(CONFIG_KSU_SUSFS) += susfs.o susfs_upstream.o\n' >> "$SRC/fs/Makefile"
 fi
 
+echo "==> [upstream] susfs.c 自动生成全局函数前置原型（-Wmissing-prototypes）"
+# 官方 6.12 的 fs/susfs.c 里几十个全局函数没有定义侧原型（使用方各自 extern），
+# 6.18 把 -Wmissing-prototypes 当 error 后集中爆 17+ 处。这里从源码提取所有
+# 非 static 全局函数签名，在所有 include 之后生成一个原型块，签名与定义完全一致，
+# 一次覆盖全部，避免逐个人工补导致遗漏。
+python3 - "$SRC/fs/susfs.c" <<'PYP'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+if "[upstream-align] auto prototypes" in s:
+    print("    susfs.c 原型块已存在，跳过")
+    raise SystemExit(0)
+# 去掉注释/字符串避免误匹配，保留行结构
+clean = re.sub(r'/\*.*?\*/', lambda m: '\n'*m.group(0).count('\n'), s, flags=re.S)
+clean = re.sub(r'//[^\n]*', '', clean)
+# __attribute__((...)) 前缀不属签名，剥掉（否则带 hot/cold 的函数提取不到）
+clean = re.sub(r'__attribute__\s*\(\(.*?\)\)', '', clean)
+pat = re.compile(
+    r'^[ \t]*(?P<sig>(?!static\b|#|typedef\b|extern\b)[A-Za-z_][\w\s\*]*?\b(?P<name>(?:susfs|ksu)_\w+)\s*\((?P<params>[^;{}]*?)\))\s*\{',
+    re.M)
+protos = []
+seen = set()
+for m in pat.finditer(clean):
+    name = m.group('name')
+    if name in seen: continue
+    seen.add(name)
+    sig = ' '.join(m.group('sig').split())
+    protos.append(sig + ';')
+protos.sort()
+assert protos, "susfs.c: 没提取到任何全局函数，拒绝继续"
+# 插在最后一个 #include 之后（含 #include "..."）
+lines = s.split('\n')
+last = max(i for i, ln in enumerate(lines[:80]) if ln.startswith('#include'))
+block = ("\n/* [upstream-align] auto prototypes: 6.18 -Wmissing-prototypes 需要定义侧原型，\n"
+         " * 从本文件的全局函数定义自动提取，签名与定义一致。 */\n"
+         "#ifdef CONFIG_KSU_SUSFS\n"
+         + '\n'.join(protos) + "\n#endif\n")
+lines.insert(last + 1, block.rstrip('\n'))
+open(p, 'w').write('\n'.join(lines))
+print("    susfs.c 已插入 %d 个全局函数原型" % len(protos))
+PYP
+
 echo "==> [upstream] 补齐官方 CONFIG 开关"
 python3 - "$SRC/drivers/Kconfig" <<'PY'
 import sys
