@@ -64,17 +64,31 @@ static int susfs_path_cap;
 static DEFINE_MUTEX(susfs_path_mutex);
 
 /*
- * ADD_SUS_PATH_LOOP：路径可能稍后才创建、或被删除后重建。这里保存路径字符串，
- * 由 delayed work 周期性地重新 kern_path() 解析；解析成功就并入普通 sus_path 表。
- * 与上游 LOOP 变体的目标一致（上游由 susfs.c 里的定时任务实现）。
+ * ADD_SUS_PATH_LOOP：路径可能稍后才创建、或被删除后重建。
+ *
+ * 两个 6.18 上必须处理的问题：
+ *  1) delayed work 跑在 workqueue 里，cred 是 kernel 域（u:r:kernel:s0），
+ *     直接 kern_path 读 /data、/sdcard 会被 SELinux 拒绝 → 必须临时
+ *     override_creds() 成加入者（ksu 域/root）的 cred。
+ *  2) kworker 的 mount namespace 是 init ns，/sdcard（/storage/self/...）
+ *     这类按进程解析的路径在 init ns 里不可用 → 加入时先记下「最深的已存在
+ *     父目录」的 struct path，重试时用 vfs_path_lookup() 从该 base 往下解析，
+ *     不再依赖 kworker 的 namespace。
  */
 #define SUSFS_PATH_LOOP_MAX 256
 #define SUSFS_PATH_LOOP_INTERVAL_MS 30000
 
-static char *susfs_loop_paths[SUSFS_PATH_LOOP_MAX];
+struct susfs_loop_entry {
+	char *path;		/* 原始绝对路径（回显用） */
+	char *remainder;	/* 相对 base 的剩余路径 */
+	struct path base;	/* 最深已存在父目录；base.mnt 为空表示直接用 kern_path */
+};
+
+static struct susfs_loop_entry susfs_loop_entries[SUSFS_PATH_LOOP_MAX];
 static int susfs_loop_count;
 static DEFINE_MUTEX(susfs_loop_mutex);
 static struct delayed_work susfs_path_loop_work;
+static struct cred *susfs_loop_cred;
 
 /* Doubling growth; caller must hold susfs_path_mutex. */
 static int susfs_path_grow_locked(void)
@@ -140,30 +154,18 @@ static void susfs_path_clear(void)
 	mutex_unlock(&susfs_path_mutex);
 }
 
-static int susfs_path_add(const char *path)
+/* 已拿到 inode 时直接并入表；调用方负责 path_put 与偏移/权限检查 */
+static int susfs_path_add_inode(struct inode *inode, const char *path)
 {
-	struct path p;
-	struct inode *inode;
 	int i, ret;
 
-	if (path[0] != '/')
-		return -EINVAL;
-
-	ret = kern_path(path, 0, &p);
-	if (ret)
-		return ret;
-
-	inode = d_backing_inode(p.dentry);
-	if (!inode) {
-		path_put(&p);
+	if (!inode)
 		return -ENOENT;
-	}
 
 	mutex_lock(&susfs_path_mutex);
 	for (i = 0; i < susfs_path_count; i++) {
 		if (susfs_paths[i].inode == inode) {
 			mutex_unlock(&susfs_path_mutex);
-			path_put(&p);
 			return 0;	/* 已存在 */
 		}
 		/* 同一路径被删除后重建：inode 变了，替换旧 inode 并释放引用，
@@ -173,7 +175,6 @@ static int susfs_path_add(const char *path)
 			iput(susfs_paths[i].inode);
 			susfs_paths[i].inode = inode;
 			mutex_unlock(&susfs_path_mutex);
-			path_put(&p);
 			return 0;
 		}
 	}
@@ -181,7 +182,6 @@ static int susfs_path_add(const char *path)
 		ret = susfs_path_grow_locked();
 		if (ret) {
 			mutex_unlock(&susfs_path_mutex);
-			path_put(&p);
 			return ret;
 		}
 	}
@@ -192,13 +192,73 @@ static int susfs_path_add(const char *path)
 	susfs_path_count++;
 	mutex_unlock(&susfs_path_mutex);
 
-	path_put(&p);
 	return 0;
+}
+
+static int susfs_path_add(const char *path)
+{
+	struct path p;
+	int ret;
+
+	if (path[0] != '/')
+		return -EINVAL;
+
+	ret = kern_path(path, 0, &p);
+	if (ret)
+		return ret;
+
+	ret = susfs_path_add_inode(d_backing_inode(p.dentry), path);
+	path_put(&p);
+	return ret;
 }
 
 int susfs_path_abi_add(const char *path)
 {
 	return susfs_path_add(path);
+}
+
+/* 记录「最深的已存在父目录」，用于绕过 kworker 的 mount namespace */
+static void susfs_loop_capture_base(struct susfs_loop_entry *e, const char *path)
+{
+	char buf[SUSFS_PATH_MAX_LEN];
+	char *slash;
+	struct path p;
+
+	if (strlen(path) >= sizeof(buf))
+		return;
+
+	strscpy(buf, path, sizeof(buf));
+	while ((slash = strrchr(buf, '/')) != NULL) {
+		if (slash == buf)	/* 根目录本来就是存在的，不需要 base */
+			break;
+		*slash = '\0';
+		if (!kern_path(buf, 0, &p)) {
+			e->base = p;
+			e->remainder = kstrdup(path + strlen(buf) + 1,
+					       GFP_KERNEL);
+			return;
+		}
+	}
+}
+
+static int susfs_loop_try_entry(struct susfs_loop_entry *e)
+{
+	struct path p;
+	int ret;
+
+	if (e->base.mnt && e->remainder && e->remainder[0]) {
+		/* 从捕获的父目录往下解析，不依赖当前进程的 namespace */
+		ret = vfs_path_lookup(e->base.dentry, e->base.mnt,
+				      e->remainder, 0, &p);
+	} else {
+		ret = kern_path(e->path, 0, &p);
+	}
+	if (ret)
+		return ret;
+
+	ret = susfs_path_add_inode(d_backing_inode(p.dentry), e->path);
+	path_put(&p);
+	return ret;
 }
 
 /* 调用方持 susfs_loop_mutex：把所有待定路径重新解析并入普通表 */
@@ -207,9 +267,9 @@ static int susfs_path_loop_resolve_locked(void)
 	int i, resolved = 0;
 
 	for (i = 0; i < susfs_loop_count; i++) {
-		if (!susfs_loop_paths[i])
+		if (!susfs_loop_entries[i].path)
 			continue;
-		if (!susfs_path_add(susfs_loop_paths[i]))
+		if (!susfs_loop_try_entry(&susfs_loop_entries[i]))
 			resolved++;
 	}
 	return resolved;
@@ -219,16 +279,23 @@ static void susfs_path_loop_work_fn(struct work_struct *work)
 {
 	int resolved;
 	bool pending;
+	const struct cred *old = NULL;
 
 	/* susfs_path_add() 只取 susfs_path_mutex，这里持 loop 锁在外层，
 	 * 不存在反向加锁路径。 */
 	mutex_lock(&susfs_loop_mutex);
+	/* workqueue 的 cred 是 kernel 域，读 /data、/sdcard 会被 SELinux 拒绝；
+	 * 临时切到加入者（ksu 域/root）的 cred 才能解析。 */
+	if (susfs_loop_cred)
+		old = override_creds(susfs_loop_cred);
 	resolved = susfs_path_loop_resolve_locked();
+	if (old)
+		revert_creds(old);
 	pending = susfs_loop_count > 0;
 	mutex_unlock(&susfs_loop_mutex);
 
 	susfs_path_log("sus_path loop: tick, %d pending, %d resolved\n",
-		  susfs_loop_count, resolved);
+		       susfs_loop_count, resolved);
 
 	if (pending)
 		schedule_delayed_work(&susfs_path_loop_work,
@@ -237,6 +304,7 @@ static void susfs_path_loop_work_fn(struct work_struct *work)
 
 int susfs_path_abi_add_loop(const char *path)
 {
+	struct susfs_loop_entry *e;
 	int i, ret;
 
 	if (!path || path[0] != '/')
@@ -246,7 +314,8 @@ int susfs_path_abi_add_loop(const char *path)
 
 	mutex_lock(&susfs_loop_mutex);
 	for (i = 0; i < susfs_loop_count; i++) {
-		if (!strcmp(susfs_loop_paths[i], path)) {
+		if (susfs_loop_entries[i].path &&
+		    !strcmp(susfs_loop_entries[i].path, path)) {
 			mutex_unlock(&susfs_loop_mutex);
 			return 0;	/* 已登记 */
 		}
@@ -255,11 +324,16 @@ int susfs_path_abi_add_loop(const char *path)
 		mutex_unlock(&susfs_loop_mutex);
 		return -ENOSPC;
 	}
-	susfs_loop_paths[susfs_loop_count] = kstrdup(path, GFP_KERNEL);
-	if (!susfs_loop_paths[susfs_loop_count]) {
+	e = &susfs_loop_entries[susfs_loop_count];
+	e->path = kstrdup(path, GFP_KERNEL);
+	if (!e->path) {
 		mutex_unlock(&susfs_loop_mutex);
 		return -ENOMEM;
 	}
+	/* 深父目录 + 剩余部分：kworker 里 /sdcard 解析不了，靠这个绕开 */
+	susfs_loop_capture_base(e, path);
+	if (!susfs_loop_cred)
+		susfs_loop_cred = get_current_cred();
 	susfs_loop_count++;
 	mutex_unlock(&susfs_loop_mutex);
 
@@ -394,7 +468,8 @@ static ssize_t susfs_path_loop_proc_read(struct file *file, char __user *ubuf,
 		if (used >= PAGE_SIZE - 1)
 			break;
 		n = scnprintf(out + used, PAGE_SIZE - used, "%s\n",
-			      susfs_loop_paths[i] ? susfs_loop_paths[i] : "-");
+			      susfs_loop_entries[i].path ?
+				      susfs_loop_entries[i].path : "-");
 		if (n <= 0)
 			break;
 		used += n;
