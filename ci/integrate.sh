@@ -851,9 +851,12 @@ if "susfs_mount.h" not in s:
     assert i > 0, "proc_namespace.c: 没找到 include"
     s = s[:i] + "#include <linux/susfs_mount.h>\n" + s[i:]
 if "susfs_is_current_ksu_domain" not in s:
-    i = s.find("#include")
-    assert i > 0, "proc_namespace.c: 没找到 include"
-    s = s[:i] + "extern bool susfs_is_current_ksu_domain(void);\n" + s[i:]
+    # 必须插在 include 之后：namespace.c 第一个 include 是 syscalls.h，
+    # 在它之前声明 bool 会报 unknown type name 'bool'
+    brid_anchor = "#include <linux/sched/task.h>\n"
+    assert brid_anchor in s, "proc_namespace.c: 找不到 sched/task.h 锚点"
+    s = s.replace(brid_anchor,
+                  brid_anchor + "extern bool susfs_is_current_ksu_domain(void);\n", 1)
 
 # 在 3 个 show 函数体第一行插判断，命中就整行跳过（return 0）：
 #   1) 显式路径列表（/proc/susfs_add_sus_mount）
@@ -890,9 +893,11 @@ if "susfs_mount.h" not in s:
     assert i > 0, "namespace.c: 没找到 include"
     s = s[:i] + "#include <linux/susfs_mount.h>\n" + s[i:]
 if "susfs_is_current_ksu_domain" not in s:
-    i = s.find("#include")
-    assert i > 0, "namespace.c: 没找到 include"
-    s = s[:i] + "extern bool susfs_is_current_ksu_domain(void);\n" + s[i:]
+    # 同上：必须放在 types.h 可达的 include 之后
+    brid_anchor = "#include <linux/sched/task.h>\n"
+    assert brid_anchor in s, "namespace.c: 找不到 sched/task.h 锚点"
+    s = s.replace(brid_anchor,
+                  brid_anchor + "extern bool susfs_is_current_ksu_domain(void);\n", 1)
 
 # 1) mnt_alloc_id：KSU 域进程 -> 号段 id，不登记进 mnt_id_xa
 alloc_anchor = ("static int mnt_alloc_id(struct mount *mnt)\n"

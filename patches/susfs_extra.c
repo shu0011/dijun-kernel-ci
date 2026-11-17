@@ -23,6 +23,7 @@
 #include <linux/gfp.h>
 #include <linux/init.h>
 #include <linux/jump_label.h>
+#include <linux/kernel.h>
 #include <linux/kstrtox.h>
 #include <linux/list.h>
 #include <linux/mm.h>
