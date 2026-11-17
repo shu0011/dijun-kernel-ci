@@ -18,8 +18,10 @@ python3 - "$SRC" <<'PY'
 import os, sys, re
 p = os.path.join(sys.argv[1], "fs/Makefile")
 s = open(p).read()
+# 注意：susfs_bridge 必须继续编译 —— 阶段 D 的 SELinux 补丁 extern 了
+# susfs_ksu_sid / susfs_priv_app_sid，且 SID 解析在它的 late_initcall 里。
 for m in ("susfs_path", "susfs_kstat", "susfs_maps", "susfs_mount",
-          "susfs_proc", "susfs_uname", "susfs_extra", "susfs_reboot", "susfs_bridge"):
+          "susfs_proc", "susfs_uname", "susfs_extra", "susfs_reboot"):
     s = re.sub(r"^(obj-\$\(CONFIG_KSU_SUSFS\) \+= %s\.o)$" % m,
                r"# [upstream-align] \1", s, flags=re.M)
 open(p, "w").write(s)
@@ -90,6 +92,16 @@ for old in [
 	(void)avd_allowed;
 }""",
 """DEFINE_STATIC_KEY_FALSE(susfs_is_avc_log_spoofing_enabled);""",
+# 官方版本签名是 (void __user **)，与 bridge 的 (bool) 不同名不同参，共存必报重定义
+"""void susfs_set_avc_log_spoofing(bool enabled)
+{
+	if (enabled)
+		static_branch_enable(&susfs_is_avc_log_spoofing_enabled);
+	else
+		static_branch_disable(&susfs_is_avc_log_spoofing_enabled);
+
+	pr_info("susfs: avc_log_spoofing %s\\n", enabled ? "enabled" : "disabled");
+}""",
 ]:
     assert old in s, "bridge: 待删符号没找到:\n" + old[:40]
     s = s.replace(old, "/* [upstream-align] 由官方 fs/susfs.c 提供: " + old.split("(")[0].split()[-1] + " */", 1)
