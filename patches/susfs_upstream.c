@@ -27,6 +27,14 @@ extern bool is_ksu_domain(void);
  * （已经排除了管理器自身与已授权 su 的应用）*/
 extern bool ksu_uid_should_umount(uid_t uid);
 
+/* 6.18 -Werror,-Wmissing-prototypes：本文件的全局函数需要定义侧原型。
+ * 前两个官方头文件可能已声明（兼容重复声明无害），reboot_handler 是本地新增、
+ * 无任何头文件声明，必须在这里给出原型。 */
+bool susfs_is_current_ksu_domain(void);
+bool susfs_ksu_proc_umounted(void);
+int susfs_reboot_handler(int magic1, int magic2, unsigned int cmd,
+			 void __user **arg);
+
 bool susfs_is_current_ksu_domain(void)
 {
 	return is_ksu_domain();
