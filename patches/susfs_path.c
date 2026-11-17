@@ -45,6 +45,14 @@
 #define SUSFS_PATH_MAX_LEN 256	/* upstream SUSFS_MAX_LEN_PATHNAME */
 #define SUSFS_PATH_PROC "susfs_add_sus_path"
 
+/* susfs_log() 是 susfs_extra.c 内部的宏，跨文件用不了；这里基于导出的
+ * susfs_log_enabled() 做同样的事（enable_log 关闭时零输出）。 */
+#define susfs_path_log(fmt, ...)					\
+	do {								\
+		if (susfs_log_enabled())				\
+			pr_info("susfs: " fmt, ##__VA_ARGS__);		\
+	} while (0)
+
 struct susfs_path_entry {
 	struct inode *inode;
 	char path[SUSFS_PATH_MAX_LEN];	/* 仅用于回读展示 */
@@ -219,7 +227,7 @@ static void susfs_path_loop_work_fn(struct work_struct *work)
 	pending = susfs_loop_count > 0;
 	mutex_unlock(&susfs_loop_mutex);
 
-	susfs_log("sus_path loop: tick, %d pending, %d resolved\n",
+	susfs_path_log("sus_path loop: tick, %d pending, %d resolved\n",
 		  susfs_loop_count, resolved);
 
 	if (pending)
@@ -255,7 +263,7 @@ int susfs_path_abi_add_loop(const char *path)
 	susfs_loop_count++;
 	mutex_unlock(&susfs_loop_mutex);
 
-	susfs_log("sus_path loop: queued %s\n", path);
+	susfs_path_log("sus_path loop: queued %s\n", path);
 
 	/* 立刻试一次；路径还不存在属于正常情况，LOOP 语义下仍返回成功。 */
 	ret = susfs_path_add(path);
@@ -414,7 +422,7 @@ static ssize_t susfs_path_loop_proc_write(struct file *file,
 	resolved = susfs_path_loop_resolve_locked();
 	mutex_unlock(&susfs_loop_mutex);
 
-	susfs_log("sus_path loop: manual retry, %d resolved\n", resolved);
+	susfs_path_log("sus_path loop: manual retry, %d resolved\n", resolved);
 	return count;
 }
 
