@@ -103,13 +103,46 @@ print("    bridge 已瘦身")
 PYB
 
 echo "==> [upstream] 应用官方内核补丁（排除 6.18 需适配与 KSU 专属 hunk）"
-git -C "$SRC" rev-parse --git-dir >/dev/null 2>&1 || git -C "$SRC" init -q
-git -C "$SRC" apply -p1 \
-  --exclude='fs/exec.c' --exclude='fs/open.c' --exclude='fs/read_write.c' \
-  --exclude='drivers/input/input.c' --exclude='fs/namei.c' --exclude='fs/readdir.c' \
-  --exclude='fs/stat.c' --exclude='fs/namespace.c' --exclude='mm/memory.c' \
-  --exclude='fs/Makefile' --exclude='security/selinux/hooks.c' --exclude='kernel/reboot.c' \
-  "$UP/kernel_patches/50_add_susfs_in_gki-android16-6.12.patch"
+python3 - "$UP/kernel_patches/50_add_susfs_in_gki-android16-6.12.patch" "$SRC" <<'PYA'
+import os, re, subprocess, sys, tempfile
+
+patch_file, src = sys.argv[1], sys.argv[2]
+# 不打：KSU 专属 hunk（exec/open/read_write/input）+ 6.18 需手工适配的文件
+# + 我们保留自研实现的文件（namei/readdir/stat/namespace/memory/Makefile/reboot）
+skip = {
+    "fs/exec.c", "fs/open.c", "fs/read_write.c", "drivers/input/input.c",
+    "fs/namei.c", "fs/readdir.c", "fs/stat.c", "fs/namespace.c",
+    "mm/memory.c", "fs/Makefile", "security/selinux/hooks.c", "kernel/reboot.c",
+}
+chunks, cur, name = [], [], None
+for ln in open(patch_file).read().split("\n"):
+    m = re.match(r"^diff --git a/(\S+) b/", ln)
+    if m:
+        if cur:
+            chunks.append((name, "\n".join(cur) + "\n"))
+        name, cur = m.group(1), []
+    if name:
+        cur.append(ln)
+if cur:
+    chunks.append((name, "\n".join(cur) + "\n"))
+
+applied = 0
+for name, body in chunks:
+    if name in skip:
+        continue
+    with tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False) as fh:
+        fh.write(body)
+        tmp = fh.name
+    r = subprocess.run(["patch", "-p1", "-f", "-s", "-N", "-d", src],
+                       stdin=open(tmp), capture_output=True, text=True)
+    os.unlink(tmp)
+    if r.returncode != 0:
+        print("!! patch 失败: %s\n%s%s" % (name, r.stdout, r.stderr))
+        sys.exit(1)
+    applied += 1
+print("    官方补丁已应用 %d 个文件（按 cwd 解析，避开仓库根）" % applied)
+PYA
+
 echo "    官方补丁已应用（15 个文件）"
 
 echo "==> [upstream] 6.18 适配：susfs_def.h 的三个 TIF 闸门"
