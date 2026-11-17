@@ -21,7 +21,7 @@
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/limits.h>
-#include <linux/mnt_idmapping.h>
+#include <linux/magic.h>
 #include <linux/mutex.h>
 #include <linux/namei.h>
 #include <linux/path.h>
@@ -32,10 +32,10 @@
 #include <linux/susfs_path.h>
 #include <linux/susfs_extra.h>
 #include <linux/uaccess.h>
-#include <linux/uidgid.h>
-#include <linux/user_namespace.h>
 #include <linux/version.h>
 #include <linux/workqueue.h>
+/* 官方 susfs.c 就是直接包含 fuse_i.h 来拿 struct fuse_inode / get_fuse_inode */
+#include "fuse/fuse_i.h"
 
 /*
  * The entry list grows on demand.  A fixed 64-entry array is far too small in
@@ -56,10 +56,13 @@
 			pr_info("susfs: " fmt, ##__VA_ARGS__);		\
 	} while (0)
 
+#ifndef AS_FLAGS_SUS_PATH
+#define AS_FLAGS_SUS_PATH 33	/* 官方 susfs_def.h */
+#endif
+
 struct susfs_path_entry {
 	struct inode *inode;
-	kuid_t owner;			/* 加入时按挂载 idmap 映射后的属主 uid */
-	char path[SUSFS_PATH_MAX_LEN];	/* 仅用于回读展示 */
+	char path[SUSFS_PATH_MAX_LEN];	/* 仅用于回读展示 / clear */
 };
 
 static struct susfs_path_entry *susfs_paths;
@@ -117,38 +120,71 @@ static int susfs_path_grow_locked(void)
 	return 0;
 }
 
+/*
+ * 完全对齐官方：隐藏状态不靠指针表，而是打在 inode 的 i_mapping->flags 上。
+ * FUSE 下同时标记 fuse_inode 的 backing inode（官方 susfs_add_sus_path 同款）。
+ */
+static void susfs_path_flag_inode(struct inode *inode, bool set)
+{
+	struct fuse_inode *fi;
+
+	if (!inode || !inode->i_mapping)
+		return;
+
+	if (inode->i_sb->s_magic == FUSE_SUPER_MAGIC) {
+		fi = get_fuse_inode(inode);
+		if (!fi || !fi->inode.i_mapping)
+			return;
+		if (set) {
+			set_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_mapping->flags);
+			set_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags);
+		} else {
+			clear_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_mapping->flags);
+			clear_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags);
+		}
+		return;
+	}
+
+	if (set)
+		set_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags);
+	else
+		clear_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags);
+}
+
+/*
+ * 官方 susfs_is_inode_sus_path() 的 6.18 版本：
+ *  - uid 先 % 100000（工作资料/多用户）
+ *  - FUSE 分支只看 backing inode（fi->inode.i_mapping），命中即返回
+ *  - 非 FUSE 看 inode->i_mapping
+ *  - uid 规则交给 susfs_uid_hidden_for_sus_path()（<10000 / >=90000 / 位图）
+ */
 bool susfs_is_inode_sus_path(struct inode *inode)
 {
-	int i;
-	bool found = false;
+	uid_t uid = current_uid().val % 100000;
+	struct fuse_inode *fi = NULL;
 
-	if (!inode || !READ_ONCE(susfs_path_count))
+	if (!inode || !inode->i_mapping)
 		return false;
 
-	/* SUS_PATH_UID_FILTER: allow-list of uids that may see the real path.
-	 * With no filter configured this keeps the legacy "hide for all app
-	 * uids" behaviour (see susfs_uid_hidden_for_sus_path()). */
-	if (!susfs_uid_hidden_for_sus_path(current_uid().val))
+	if (uid < 10000)
 		return false;
 
-	/*
-	 * 属主放行：susfs4ksu 模块的 emulate_vold_app_data 会把
-	 * /sdcard/Android/data/<pkg> 加进 sus_path；如果连属主一起隐藏，
-	 * QQ/TIM 就读不到自己的聊天图片目录。
-	 * 注意这里必须用加入时按挂载 idmap 映射后的 owner：/sdcard 是
-	 * idmapped FUSE 挂载，inode->i_uid 是未映射的原始值，直接和
-	 * current_uid() 比会永远不相等。
-	 */
-	mutex_lock(&susfs_path_mutex);
-	for (i = 0; i < susfs_path_count; i++) {
-		if (susfs_paths[i].inode != inode)
-			continue;
-		found = !uid_eq(susfs_paths[i].owner, current_uid());
-		break;
+	if (inode->i_sb->s_magic == FUSE_SUPER_MAGIC) {
+		fi = get_fuse_inode(inode);
+		if (!fi || !fi->inode.i_mapping)
+			return false;
+
+		if (test_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_mapping->flags) &&
+		    susfs_uid_hidden_for_sus_path(uid))
+			return true;
+		return false;
 	}
-	mutex_unlock(&susfs_path_mutex);
 
-	return found;
+	if (test_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags) &&
+	    susfs_uid_hidden_for_sus_path(uid))
+		return true;
+
+	return false;
 }
 
 static void susfs_path_clear(void)
@@ -172,19 +208,23 @@ static void susfs_path_clear(void)
 		susfs_paths[susfs_path_count].inode = NULL;
 		susfs_paths[susfs_path_count].path[0] = '\0';
 		mutex_unlock(&susfs_path_mutex);
-		if (inode)
+		if (inode) {
+			susfs_path_flag_inode(inode, false);
 			iput(inode);
+		}
 	}
 }
 
-/* 已拿到 inode 时直接并入表；调用方负责 path_put 与偏移/权限检查 */
-static int susfs_path_add_inode(struct inode *inode, kuid_t owner,
-				const char *path)
+/* 已拿到 inode 时直接加入；调用方负责 path_put 与偏移/权限检查 */
+static int susfs_path_add_inode(struct inode *inode, const char *path)
 {
 	int i, ret;
 
 	if (!inode)
 		return -ENOENT;
+
+	/* 官方做法：标记在 inode 的 i_mapping->flags 上，幂等 */
+	susfs_path_flag_inode(inode, true);
 
 	mutex_lock(&susfs_path_mutex);
 	for (i = 0; i < susfs_path_count; i++) {
@@ -199,7 +239,6 @@ static int susfs_path_add_inode(struct inode *inode, kuid_t owner,
 
 			ihold(inode);
 			susfs_paths[i].inode = inode;
-			susfs_paths[i].owner = owner;
 			mutex_unlock(&susfs_path_mutex);
 			if (old)
 				iput(old);
@@ -216,21 +255,11 @@ static int susfs_path_add_inode(struct inode *inode, kuid_t owner,
 
 	ihold(inode);
 	susfs_paths[susfs_path_count].inode = inode;
-	susfs_paths[susfs_path_count].owner = owner;
 	strscpy(susfs_paths[susfs_path_count].path, path, SUSFS_PATH_MAX_LEN);
 	susfs_path_count++;
 	mutex_unlock(&susfs_path_mutex);
 
 	return 0;
-}
-
-/*
- * 取应用视角的属主 uid：/sdcard 是 idmapped FUSE 挂载，inode->i_uid 是
- * 未映射的原始值，必须按该挂载的 idmap 映射后才是应用看到的 uid。
- */
-static kuid_t susfs_path_owner_of(struct path *p)
-{
-	return i_uid_into_mnt(mnt_idmap(p->mnt), d_inode(p->dentry));
 }
 
 static int susfs_path_add(const char *path)
@@ -241,12 +270,11 @@ static int susfs_path_add(const char *path)
 	if (path[0] != '/')
 		return -EINVAL;
 
-	ret = kern_path(path, 0, &p);
+	ret = kern_path(path, LOOKUP_FOLLOW, &p);
 	if (ret)
 		return ret;
 
-	ret = susfs_path_add_inode(d_backing_inode(p.dentry),
-				   susfs_path_owner_of(&p), path);
+	ret = susfs_path_add_inode(d_backing_inode(p.dentry), path);
 	path_put(&p);
 	return ret;
 }
@@ -295,8 +323,7 @@ static int susfs_loop_try_entry(struct susfs_loop_entry *e)
 	if (ret)
 		return ret;
 
-	ret = susfs_path_add_inode(d_backing_inode(p.dentry),
-				   susfs_path_owner_of(&p), e->path);
+	ret = susfs_path_add_inode(d_backing_inode(p.dentry), e->path);
 	path_put(&p);
 	return ret;
 }
@@ -447,10 +474,8 @@ static ssize_t susfs_path_read(struct file *file, char __user *ubuf,
 
 	mutex_lock(&susfs_path_mutex);
 	for (i = 0; i < susfs_path_count; i++) {
-		n = scnprintf(out + used, total - used, "%s %u\n",
-			      susfs_paths[i].path,
-			      from_kuid_munged(&init_user_ns,
-					       susfs_paths[i].owner));
+		n = scnprintf(out + used, total - used, "%s\n",
+			      susfs_paths[i].path);
 		if (n <= 0 || used + n >= total)
 			break;
 		used += n;
