@@ -16,6 +16,7 @@
 #include <linux/gfp.h>
 #include <linux/init.h>
 #include <linux/jump_label.h>
+#include <linux/susfs_extra.h>	/* susfs_set_avc_log_spoofing 原型 */
 
 /* KernelSU built-in 后与内核同镜像，直接声明即可 */
 #if IS_ENABLED(CONFIG_KSU)
@@ -47,6 +48,22 @@ DEFINE_STATIC_KEY_FALSE(susfs_is_avc_log_spoofing_enabled);
 bool susfs_is_current_ksu_domain(void)
 {
 	return is_ksu_domain();
+}
+
+/*
+ * AVC 日志伪装的唯一开关。真正的过滤在 patches/susfs-selinux.patch 的
+ * security/selinux/avc.c 里（tsid == ksu_sid 时把上下文改写成 priv_app）。
+ * 之前只定义了 static key、没人打开它，导致 CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING
+ * 回 err=0 但功能完全不生效。
+ */
+void susfs_set_avc_log_spoofing(bool enabled)
+{
+	if (enabled)
+		static_branch_enable(&susfs_is_avc_log_spoofing_enabled);
+	else
+		static_branch_disable(&susfs_is_avc_log_spoofing_enabled);
+
+	pr_info("susfs: avc_log_spoofing %s\n", enabled ? "enabled" : "disabled");
 }
 
 /* 没有 sus_path 表，任何 sid 都不算"要伪造的类型" */

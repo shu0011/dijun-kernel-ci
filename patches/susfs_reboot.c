@@ -239,9 +239,10 @@ out:
 	kfree(info);
 }
 
-/* bool-style commands with no-op / state-absorbing handling.  We still read
- * the payload and write err=0 so the official scripts see success. */
-static void susfs_abi_bool_ok(void __user **arg)
+/* bool-style command that actually drives state: AVC 日志伪装。
+ * 之前这里用 susfs_abi_bool_ok() 只回 err=0，static key 永远不打开，
+ * 于是 SELinux 补丁里那段过滤代码成了死代码。 */
+static void susfs_abi_set_avc_spoof(void __user **arg)
 {
 	struct susfs_abi_bool info = {0};
 
@@ -250,6 +251,7 @@ static void susfs_abi_bool_ok(void __user **arg)
 		info.err = -EFAULT;
 		goto out;
 	}
+	susfs_set_avc_log_spoofing(info.enabled);
 	info.err = 0;
 out:
 	if (copy_to_user((struct susfs_abi_bool __user *)*arg, &info,
@@ -349,11 +351,10 @@ int susfs_reboot_handler(int magic1, int magic2, unsigned int cmd,
 		return 0;
 	}
 
-	/* avc_log_spoofing: bridge exposes a spoofing static key but this build
-	 * has no av-rule table; absorb so official scripts see success.
-	 * 实测与 SukiSU 管理器的实现不冲突，保持现状（不接管日志内容）。 */
+	/* avc_log_spoofing: 打开/关闭 security/selinux/avc.c 里的过滤分支
+	 * （tsid == ksu_sid 时把 tcontext 改写成 priv_app）。 */
 	case SUSFS_ABI_CMD_ENABLE_AVC_SPOOF:
-		susfs_abi_bool_ok(arg);
+		susfs_abi_set_avc_spoof(arg);
 		return 0;
 
 	/* uid filters (SUS_PATH allow-list + PRIORITY deny-list).

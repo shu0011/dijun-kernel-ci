@@ -53,4 +53,12 @@ int susfs_extra_set_sus_path_uid_filter(const char __user *app_strings);
 int susfs_extra_set_priority_uid_filter(const char __user *app_strings);
 int susfs_extra_add_open_redirect(const void __user *payload);
 
+/* ---- AVC log spoofing ----
+ * The filtering itself lives in patches/susfs-selinux.patch
+ * (security/selinux/avc.c: ksu sid -> priv_app context).  The static key is
+ * defined in susfs_bridge.c; this is the only place that flips it, driven by
+ * CMD_SUSFS_ENABLE_AVC_LOG_SPOOFING.  Without this call the feature is dead
+ * code even though the command returns err=0. */
+void susfs_set_avc_log_spoofing(bool enabled);
+
 #endif /* _LINUX_SUSFS_EXTRA_H */
