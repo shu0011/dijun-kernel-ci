@@ -992,9 +992,9 @@ if "DEFAULT_KSU_MNT_ID" not in s:
                   + "#define CL_COPY_MNT_NS BIT(25) /* 对齐上游：copy_mnt_ns() 专用标记 */\n"
                   + "#endif\n", 1)
 
-# 1) mnt_alloc_id：对齐上游 susfs_alloc_non_unshare_ksu_vfsmnt()
-#    上游用 ida_alloc_min(DEFAULT_KSU_MNT_ID)；6.18 改成 XA_LIMIT 起点，
-#    id 仍然正常登记进 mnt_id_xa，mnt_free_id() 能照常回收。
+# 1) mnt_alloc_id：号段 id 用独立计数器，**不登记进 mnt_id_xa**
+#    上游 6.12 用的是独立 IDA 范围（不动 mnt_id_ida）；6.18 这里同理，不碰 xa。
+#    绝不能在 xa_lock 内做 GFP_KERNEL 分配（曾经的做法）——见下方注释。
 alloc_anchor = ("static int mnt_alloc_id(struct mount *mnt)\n"
                 "{\n"
                 "\tint res;\n"
@@ -1002,23 +1002,27 @@ alloc_anchor = ("static int mnt_alloc_id(struct mount *mnt)\n"
                 "\txa_lock(&mnt_id_xa);\n")
 if alloc_anchor not in s:
     sys.exit("!! namespace.c: mnt_alloc_id 锚点没匹配上，终止")
-if "susfs_mnt_alloc_id_high" not in s:
+if "susfs_mnt_alloc_id_range" not in s:
     alloc_block = (
         "#ifdef CONFIG_KSU_SUSFS\n"
-        "/* 对齐上游 susfs_alloc_non_unshare_ksu_vfsmnt()：\n"
-        " * KSU 域进程创建的挂载从 DEFAULT_KSU_MNT_ID 起分配，\n"
-        " * id 仍然正常登记进 mnt_id_xa，mnt_free_id() 能照常回收。 */\n"
-        "static int susfs_mnt_alloc_id_high(struct mount *mnt)\n"
+        "/* 号段挂载的 mnt_id 用独立计数器分配，不登记进 mnt_id_xa（对齐上游：\n"
+        " * 上游用独立 IDA 范围，完全不碰 mnt_id_ida）。\n"
+        " *\n"
+        " * 绝不要在这里调用 __xa_alloc(GFP_KERNEL)：copy_mnt_ns() 是持有\n"
+        " * namespace_sem 时走到这儿的，而高号段首次分配需要在 index≈2e9 处\n"
+        " * 新建 xarray 节点 → 进入内存回收 → 与 unshare 互锁，全系统应用启动\n"
+        " * 卡死在 D 状态（build#107/#109 实测现象：copy_mnt_ns 里 wchan 卡住）。\n"
+        " * mnt_free_id() 见到 KSU_UNSHARED 标记即跳过回收，配对正确。 */\n"
+        "static int susfs_mnt_alloc_id_range(struct mount *mnt)\n"
         "{\n"
-        "\tint res;\n"
+        "\tint id = susfs_mount_next_id();\n"
         "\n"
-        "\txa_lock(&mnt_id_xa);\n"
-        "\tres = __xa_alloc(&mnt_id_xa, &mnt->mnt_id, mnt,\n"
-        "\t\t\t XA_LIMIT(DEFAULT_KSU_MNT_ID, INT_MAX), GFP_KERNEL);\n"
-        "\tif (!res)\n"
-        "\t\tmnt->mnt_id_unique = ++mnt_id_ctr;\n"
-        "\txa_unlock(&mnt_id_xa);\n"
-        "\treturn res;\n"
+        "\tif (id < 0)\n"
+        "\t\treturn id;\n"
+        "\tmnt->mnt_id = id;\n"
+        "\tmnt->mnt_id_unique = ++mnt_id_ctr;\n"
+        "\tmnt->mnt.mnt_flags |= VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT;\n"
+        "\treturn 0;\n"
         "}\n"
         "#endif\n"
         "\n"
@@ -1028,7 +1032,7 @@ if "susfs_mnt_alloc_id_high" not in s:
         "\n"
         "#ifdef CONFIG_KSU_SUSFS\n"
         "\tif (susfs_is_current_ksu_domain())\n"
-        "\t\treturn susfs_mnt_alloc_id_high(mnt);\n"
+        "\t\treturn susfs_mnt_alloc_id_range(mnt);\n"
         "#endif\n"
         "\txa_lock(&mnt_id_xa);\n"
     )
@@ -1094,30 +1098,28 @@ clone_head_anchor = ("\tmnt = alloc_vfsmnt(old->mnt_devname);\n"
                      "\t\treturn ERR_PTR(-ENOMEM);\n")
 if clone_head_anchor not in s:
     sys.exit("!! namespace.c: clone_mnt 头部锚点没匹配上，终止")
-if "susfs clone unshare" not in s:
+if "susfs clone mount id" not in s:
     clone_head_block = clone_head_anchor + (
         "#ifdef CONFIG_KSU_SUSFS\n"
-        "\t/* susfs clone unshare: 复用 old->mnt_id，不经过分配器 */\n"
-        "\tif ((flag & CL_COPY_MNT_NS) && susfs_is_current_ksu_domain()) {\n"
+        "\t/* susfs clone mount id: 克隆号段挂载时绝不能在 xa_lock 里分配。\n"
+        "\t * 先退掉自己在 xa 里的临时 id（只 erase，不分配），再按上游语义：\n"
+        "\t *  - CL_COPY_MNT_NS（copy_mnt_ns 建新 namespace）→ 沿用 old->mnt_id；\n"
+        "\t *  - 其它（bind mount 等，同一 namespace）→ 取号段新 id，避免同\n"
+        "\t *    namespace 内 id 重复。\n"
+        "\t * 这些 id 都不在 mnt_id_xa 里，打 KSU_UNSHARED 让 mnt_free_id() 跳过回收。 */\n"
+        "\tif (mnt->mnt_id < DEFAULT_KSU_MNT_ID &&\n"
+        "\t    old->mnt_id >= DEFAULT_KSU_MNT_ID) {\n"
         "\t\txa_lock(&mnt_id_xa);\n"
         "\t\t__xa_erase(&mnt_id_xa, mnt->mnt_id);\n"
-        "\t\tmnt->mnt_id = old->mnt_id;\n"
         "\t\txa_unlock(&mnt_id_xa);\n"
-        "\t} else if (old->mnt_id >= DEFAULT_KSU_MNT_ID &&\n"
-        "\t\t   mnt->mnt_id < DEFAULT_KSU_MNT_ID) {\n"
-        "\t\tint sus_res;\n"
+        "\t\tif (flag & CL_COPY_MNT_NS) {\n"
+        "\t\t\tmnt->mnt_id = old->mnt_id;\n"
+        "\t\t} else {\n"
+        "\t\t\tint sus_id = susfs_mount_next_id();\n"
         "\n"
-        "\t\t/* 对齐上游：克隆号段挂载时新 id 仍落在号段内 */\n"
-        "\t\txa_lock(&mnt_id_xa);\n"
-        "\t\t__xa_erase(&mnt_id_xa, mnt->mnt_id);\n"
-        "\t\tsus_res = __xa_alloc(&mnt_id_xa, &mnt->mnt_id, mnt,\n"
-        "\t\t\t\t     XA_LIMIT(DEFAULT_KSU_MNT_ID, INT_MAX),\n"
-        "\t\t\t\t     GFP_KERNEL);\n"
-        "\t\tif (sus_res)\n"
-        "\t\t\tsus_res = __xa_alloc(&mnt_id_xa, &mnt->mnt_id, mnt,\n"
-        "\t\t\t\t\t     XA_LIMIT(1, INT_MAX), GFP_KERNEL);\n"
-        "\t\t(void)sus_res;\n"
-        "\t\txa_unlock(&mnt_id_xa);\n"
+        "\t\t\tmnt->mnt_id = sus_id > 0 ? sus_id : old->mnt_id;\n"
+        "\t\t}\n"
+        "\t\tmnt->mnt.mnt_flags |= VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT;\n"
         "\t}\n"
         "#endif\n"
     )
