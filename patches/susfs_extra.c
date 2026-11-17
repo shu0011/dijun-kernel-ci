@@ -14,6 +14,7 @@
 #include <linux/susfs_extra.h>
 #include <linux/susfs_abi.h>
 
+#include <linux/atomic.h>
 #include <linux/bitmap.h>
 #include <linux/bitops.h>
 #include <linux/cred.h>
@@ -109,9 +110,14 @@ bool susfs_uid_hidden_for_sus_path(uid_t uid)
 	if (uid < SUSFS_UID_MIN || uid > SUSFS_UID_MAX)
 		return true;
 
-	mutex_lock(&sus_path_filter_mutex);
+	/*
+	 * 锁无关读：susfs_is_inode_sus_path() 会在 lookup_fast() 的 RCU 分支
+	 * 里调用本函数（见 ci/integrate.sh 的 namei 注入），在这里拿互斥锁会
+	 * 触发 "sleeping function called from invalid context"。
+	 * 位图很小、每个 uid 只落在一个 word 上，写侧是 memcpy + smp_wmb()
+	 * 之后才置 active，所以读侧最坏看到短暂旧值，不会读到非法内存。
+	 */
 	allowed = test_bit(uid - SUSFS_UID_MIN, sus_path_allow.bits);
-	mutex_unlock(&sus_path_filter_mutex);
 	/* allow-list member sees the real path (not hidden); others hidden. */
 	return !allowed;
 }
@@ -281,6 +287,8 @@ static int susfs_apply_uid_filter(char *apps, struct susfs_uid_bitmap *map,
 
 	mutex_lock(lock);
 	memcpy(map->bits, newmap->bits, sizeof(map->bits));
+	/* 位图先可见，再置 active：读侧是无锁的（见 susfs_uid_hidden_for_sus_path） */
+	smp_wmb();
 	WRITE_ONCE(*active, true);
 	mutex_unlock(lock);
 	kfree(newmap);

@@ -13,6 +13,7 @@
  *
  * 只对 app uid（>= 10000）生效：系统进程若被隐藏，开机阶段会找不到 /data/adb 而崩。
  */
+#include <linux/atomic.h>
 #include <linux/cred.h>
 #include <linux/dcache.h>
 #include <linux/err.h>
@@ -22,6 +23,7 @@
 #include <linux/kernel.h>
 #include <linux/limits.h>
 #include <linux/magic.h>
+#include <linux/mnt_idmapping.h>
 #include <linux/mutex.h>
 #include <linux/namei.h>
 #include <linux/path.h>
@@ -69,6 +71,109 @@ static struct susfs_path_entry *susfs_paths;
 static int susfs_path_count;
 static int susfs_path_cap;
 static DEFINE_MUTEX(susfs_path_mutex);
+
+/*
+ * 属主放行（owner bypass）
+ * ----------------------
+ * susfs4ksu 模块的 emulate_vold_app_data 会给每个第三方应用加一条
+ * /sdcard/Android/data/<pkg>。如果连属主一起隐藏，应用读不到自己的外部数据
+ * 目录：QQ/TIM 聊天图片全挂、很多应用启动即崩（实测 #93/#107）。
+ *
+ * 上游 v1.x 的 susfs_is_inode_sus_path() 就是带属主判定的：
+ *     is_i_uid_not_allowed(i_uid) = 是 app 进程 && current_uid() != i_uid
+ * 即"自己拥有的文件永远看得见，别人的才隐藏"。v2.x 把 sus_path 抽成纯
+ * inode flag 后这条判定丢了，这里按 v1.x 语义补回来（可用
+ * `echo owner_bypass=0 > /proc/susfs_add_sus_path` 关掉做 A/B 对比）。
+ *
+ * 实现约束：susfs_is_inode_sus_path() 会在 lookup_fast() 的 RCU 分支里被调用
+ * （见 ci/integrate.sh 的 namei 注入），所以查属主**不能加锁、不能睡眠**。
+ * 因此这里用固定大小的环状槽位 + 尾部追加 + smp_store_release 发布，
+ * 永远不 realloc，读者只做 READ_ONCE 线性扫描。
+ */
+#define SUSFS_OWNER_SLOTS 2048
+
+struct susfs_owner_slot {
+	struct inode *inode;	/* 发布标志：非空表示该槽有效 */
+	uid_t raw;		/* inode->i_uid（未按 idmap 映射的原始值） */
+	uid_t mapped;		/* 按加入时挂载 idmap 映射后的 uid */
+};
+
+static struct susfs_owner_slot susfs_owner_slots[SUSFS_OWNER_SLOTS];
+static int susfs_owner_slot_count;
+static bool susfs_owner_bypass = true;
+/* 只保护写侧（proc 写入与 LOOP 定时任务可能并发）；读侧无锁。 */
+static DEFINE_MUTEX(susfs_owner_mutex);
+
+static void susfs_owner_forget(struct inode *inode)
+{
+	int i, n;
+
+	mutex_lock(&susfs_owner_mutex);
+	n = smp_load_acquire(&susfs_owner_slot_count);
+	for (i = 0; i < n; i++) {
+		if (READ_ONCE(susfs_owner_slots[i].inode) == inode) {
+			/* 先摘发布标志，避免 inode 释放后被复用造成误判 */
+			WRITE_ONCE(susfs_owner_slots[i].inode, NULL);
+			break;
+		}
+	}
+	mutex_unlock(&susfs_owner_mutex);
+}
+
+static void susfs_owner_record(struct inode *inode, uid_t raw, uid_t mapped)
+{
+	int i, n;
+
+	mutex_lock(&susfs_owner_mutex);
+	n = smp_load_acquire(&susfs_owner_slot_count);
+
+	for (i = 0; i < n; i++) {
+		if (READ_ONCE(susfs_owner_slots[i].inode) == inode) {
+			WRITE_ONCE(susfs_owner_slots[i].raw, raw);
+			WRITE_ONCE(susfs_owner_slots[i].mapped, mapped);
+			goto out;
+		}
+	}
+	if (n >= SUSFS_OWNER_SLOTS) {
+		susfs_path_log("sus_path: owner table full (%d)\n",
+			       SUSFS_OWNER_SLOTS);
+		goto out;
+	}
+	WRITE_ONCE(susfs_owner_slots[n].raw, raw);
+	WRITE_ONCE(susfs_owner_slots[n].mapped, mapped);
+	/* inode 是"已发布"标志，必须最后写；计数再 release 递增 */
+	smp_store_release(&susfs_owner_slots[n].inode, inode);
+	smp_store_release(&susfs_owner_slot_count, n + 1);
+out:
+	mutex_unlock(&susfs_owner_mutex);
+}
+
+/*
+ * 调用者是该 inode 的属主吗？比较两个口径：
+ *  - raw   ：inode->i_uid，/sdcard 这类 FUSE 挂载上就是应用 uid
+ *  - mapped：按加入时那个挂载的 idmap 映射后的 uid（idmapped mount 场景）
+ * 任一相等即放行。两者都做 %100000（工作资料/多用户）。
+ * 注意 raw 为 0 时不会误判：调用方已经排除了 uid < 10000。
+ */
+static bool susfs_owner_is_caller(struct inode *inode, uid_t uid)
+{
+	int i, n;
+
+	if (!READ_ONCE(susfs_owner_bypass))
+		return false;
+
+	n = smp_load_acquire(&susfs_owner_slot_count);
+	for (i = 0; i < n; i++) {
+		uid_t raw, mapped;
+
+		if (READ_ONCE(susfs_owner_slots[i].inode) != inode)
+			continue;
+		raw = READ_ONCE(susfs_owner_slots[i].raw);
+		mapped = READ_ONCE(susfs_owner_slots[i].mapped);
+		return (raw && raw == uid) || (mapped && mapped == uid);
+	}
+	return false;
+}
 
 /*
  * ADD_SUS_PATH_LOOP：路径可能稍后才创建、或被删除后重建。
@@ -157,11 +262,13 @@ static void susfs_path_flag_inode(struct inode *inode, bool set)
  *  - FUSE 分支只看 backing inode（fi->inode.i_mapping），命中即返回
  *  - 非 FUSE 看 inode->i_mapping
  *  - uid 规则交给 susfs_uid_hidden_for_sus_path()（<10000 / >=90000 / 位图）
+ *  - 额外：属主放行（见上面 owner bypass 的说明）
  */
 bool susfs_is_inode_sus_path(struct inode *inode)
 {
 	uid_t uid = current_uid().val % 100000;
 	struct fuse_inode *fi = NULL;
+	unsigned long *flags;
 
 	if (!inode || !inode->i_mapping)
 		return false;
@@ -173,18 +280,22 @@ bool susfs_is_inode_sus_path(struct inode *inode)
 		fi = get_fuse_inode(inode);
 		if (!fi || !fi->inode.i_mapping)
 			return false;
-
-		if (test_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_mapping->flags) &&
-		    susfs_uid_hidden_for_sus_path(uid))
-			return true;
-		return false;
+		flags = &fi->inode.i_mapping->flags;
+	} else {
+		flags = &inode->i_mapping->flags;
 	}
 
-	if (test_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags) &&
-	    susfs_uid_hidden_for_sus_path(uid))
-		return true;
+	if (!test_bit(AS_FLAGS_SUS_PATH, flags))
+		return false;
 
-	return false;
+	if (!susfs_uid_hidden_for_sus_path(uid))
+		return false;
+
+	/* 属主永远看得见自己拥有的文件（emulate_vold_app_data 靠这条才可用） */
+	if (susfs_owner_is_caller(inode, uid))
+		return false;
+
+	return true;
 }
 
 static void susfs_path_clear(void)
@@ -209,14 +320,42 @@ static void susfs_path_clear(void)
 		susfs_paths[susfs_path_count].path[0] = '\0';
 		mutex_unlock(&susfs_path_mutex);
 		if (inode) {
+			susfs_owner_forget(inode);
 			susfs_path_flag_inode(inode, false);
 			iput(inode);
 		}
 	}
+
+	mutex_lock(&susfs_owner_mutex);
+	memset(susfs_owner_slots, 0, sizeof(susfs_owner_slots));
+	smp_store_release(&susfs_owner_slot_count, 0);
+	mutex_unlock(&susfs_owner_mutex);
+}
+
+/*
+ * 取应用视角的属主 uid。两个口径都记：
+ *   raw    = inode->i_uid.val        —— 普通文件系统、FUSE 上就是应用 uid
+ *   mapped = i_uid_into_vfsuid(idmap) —— idmapped mount 下的应用视角
+ */
+static void susfs_path_owner_uid(struct path *p, uid_t *raw, uid_t *mapped)
+{
+	struct inode *inode = d_backing_inode(p->dentry);
+	vfsuid_t vfsuid;
+
+	if (!inode) {
+		*raw = 0;
+		*mapped = 0;
+		return;
+	}
+
+	*raw = inode->i_uid.val % 100000;
+	vfsuid = i_uid_into_vfsuid(mnt_idmap(p->mnt), inode);
+	*mapped = vfsuid_into_kuid(vfsuid).val % 100000;
 }
 
 /* 已拿到 inode 时直接加入；调用方负责 path_put 与偏移/权限检查 */
-static int susfs_path_add_inode(struct inode *inode, const char *path)
+static int susfs_path_add_inode(struct inode *inode, uid_t owner_raw,
+				uid_t owner_mapped, const char *path)
 {
 	int i, ret;
 
@@ -225,6 +364,8 @@ static int susfs_path_add_inode(struct inode *inode, const char *path)
 
 	/* 官方做法：标记在 inode 的 i_mapping->flags 上，幂等 */
 	susfs_path_flag_inode(inode, true);
+	/* 属主表是热路径查询用的，先登记，再入展示表 */
+	susfs_owner_record(inode, owner_raw, owner_mapped);
 
 	mutex_lock(&susfs_path_mutex);
 	for (i = 0; i < susfs_path_count; i++) {
@@ -240,8 +381,10 @@ static int susfs_path_add_inode(struct inode *inode, const char *path)
 			ihold(inode);
 			susfs_paths[i].inode = inode;
 			mutex_unlock(&susfs_path_mutex);
-			if (old)
+			if (old) {
+				susfs_owner_forget(old);
 				iput(old);
+			}
 			return 0;
 		}
 	}
@@ -265,6 +408,7 @@ static int susfs_path_add_inode(struct inode *inode, const char *path)
 static int susfs_path_add(const char *path)
 {
 	struct path p;
+	uid_t raw = 0, mapped = 0;
 	int ret;
 
 	if (path[0] != '/')
@@ -274,7 +418,9 @@ static int susfs_path_add(const char *path)
 	if (ret)
 		return ret;
 
-	ret = susfs_path_add_inode(d_backing_inode(p.dentry), path);
+	susfs_path_owner_uid(&p, &raw, &mapped);
+	ret = susfs_path_add_inode(d_backing_inode(p.dentry), raw, mapped,
+				   path);
 	path_put(&p);
 	return ret;
 }
@@ -311,6 +457,7 @@ static void susfs_loop_capture_base(struct susfs_loop_entry *e, const char *path
 static int susfs_loop_try_entry(struct susfs_loop_entry *e)
 {
 	struct path p;
+	uid_t raw = 0, mapped = 0;
 	int ret;
 
 	if (e->base.mnt && e->remainder && e->remainder[0]) {
@@ -323,7 +470,9 @@ static int susfs_loop_try_entry(struct susfs_loop_entry *e)
 	if (ret)
 		return ret;
 
-	ret = susfs_path_add_inode(d_backing_inode(p.dentry), e->path);
+	susfs_path_owner_uid(&p, &raw, &mapped);
+	ret = susfs_path_add_inode(d_backing_inode(p.dentry), raw, mapped,
+				   e->path);
 	path_put(&p);
 	return ret;
 }
@@ -442,6 +591,16 @@ static ssize_t susfs_path_write(struct file *file, const char __user *ubuf,
 
 	if (!strcmp(kbuf, "clear")) {
 		susfs_path_clear();
+		kfree(kbuf);
+		return count;
+	}
+
+	/* 调试开关：echo owner_bypass=0 > /proc/susfs_add_sus_path
+	 * 关掉属主放行即可复现"连属主一起隐藏"的上游 v2.x 行为，用于 A/B 对比。 */
+	if (!strncmp(kbuf, "owner_bypass=", 13)) {
+		WRITE_ONCE(susfs_owner_bypass, kbuf[13] != '0');
+		susfs_path_log("sus_path: owner_bypass=%d\n",
+			       READ_ONCE(susfs_owner_bypass));
 		kfree(kbuf);
 		return count;
 	}
