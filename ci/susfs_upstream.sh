@@ -192,8 +192,20 @@ static inline bool susfs_is_current_proc_no_su(void) {
 }"""
 assert old2 in s, "susfs_def.h: no_su 闸门锚点没找到"
 s = s.replace(old2, new2, 1)
+
+# 第三个闸门：SUSFS_IS_INODE_OPEN_REDIRECT / SUSFS_IS_INODE_SUS_MAP 都依赖它，
+# 同样要看 TIF_PROC_UMOUNTED，不换掉这两个宏就永远为 false（功能静默失效）。
+old3 = """static inline bool susfs_is_current_proc_umounted_app(void) {
+	return (likely(test_thread_flag(TIF_PROC_UMOUNTED)) &&
+			current_uid().val >= 10000);
+}"""
+new3 = """static inline bool susfs_is_current_proc_umounted_app(void) {
+	return susfs_ksu_proc_umounted() && current_uid().val >= 10000;
+}"""
+assert old3 in s, "susfs_def.h: umounted_app 闸门锚点没找到"
+s = s.replace(old3, new3, 1)
 open(p, "w").write(s)
-print("    闸门已替换为 KSU 判定")
+print("    闸门已替换为 KSU 判定（含 umounted_app）")
 PY
 
 echo "==> [upstream] 6.18 适配：fs/stat.c（SUS_KSTAT 官方钩子）"
@@ -459,5 +471,117 @@ hook = anchor + """#ifdef CONFIG_KSU_SUSFS_SUS_MAP
 s = s.replace(anchor, hook, 1)
 open(p, "w").write(s)
 print("    __access_remote_vm 已注入")
+PY
+
+
+echo "==> [upstream] 6.18 适配：fs/namei.c 的 open_redirect（path_openat + vfs_readlink）"
+python3 - "$SRC" <<'PY'
+import os, sys
+
+SRC = sys.argv[1]
+p = os.path.join(SRC, "fs/namei.c")
+s = open(p).read()
+if "susfs_open_redirect_spoof_do_sys_openat" in s:
+    print("    已注入过")
+    raise SystemExit(0)
+
+# 需要 def.h 里的 SUSFS_IS_INODE_OPEN_REDIRECT* 和官方两个函数的声明。
+# 插在 include 块末尾：def.h 里用到 current_uid()/set_thread_flag()，放最前面会报隐式声明。
+lines = s.split("\n")
+last = max(i for i, ln in enumerate(lines[:120]) if ln.startswith("#include <linux/"))
+decl = (
+    "#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n"
+    "#include <linux/susfs_def.h>\n"
+    "extern struct filename *susfs_open_redirect_spoof_do_sys_openat(struct inode *inode);\n"
+    "extern int susfs_open_redirect_spoof_vfs_readlink(struct inode *inode,\n"
+    "\t\t\t\t\t\t  char __user *buffer, int buflen);\n"
+    "#endif")
+lines.insert(last + 1, decl)
+s = "\n".join(lines)
+
+# (1) path_openat 局部变量
+anchor = ("static struct file *path_openat(struct nameidata *nd,\n"
+          "\t\t\tconst struct open_flags *op, unsigned flags)\n"
+          "{\n")
+assert anchor in s, "namei.c: path_openat 签名锚点没找到"
+s = s.replace(anchor, anchor +
+              "#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n"
+              "\tint sus_old_dfd = nd->dfd;\n"
+              "\tbool sus_root_preset = (nd->state & ND_ROOT_PRESET);\n"
+              "\tstruct filename *sus_fake_name = NULL;\n"
+              "\tstruct filename *sus_old_name = nd->name;\n"
+              "#endif\n", 1)
+
+# (2) open 前重定向
+loop_anchor = ("\t\tconst char *s = path_init(nd, flags);\n"
+               "\t\twhile (!(error = link_path_walk(s, nd)) &&\n"
+               "\t\t       (s = open_last_lookups(nd, file, op)) != NULL)\n"
+               "\t\t\t;\n"
+               "\t\tif (!error)\n"
+               "\t\t\terror = do_open(nd, file, op);\n")
+assert loop_anchor in s, "namei.c: path_openat 循环锚点没找到"
+s = s.replace(loop_anchor,
+              "\t\tconst char *s = path_init(nd, flags);\n"
+              "\t\twhile (!(error = link_path_walk(s, nd)) &&\n"
+              "\t\t       (s = open_last_lookups(nd, file, op)) != NULL)\n"
+              "\t\t\t;\n"
+              "#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n"
+              "\t\t/* 官方语义：命中 open_redirect 规则就换成 redirected 路径重走一遍 */\n"
+              "\t\tif (!error && !sus_root_preset &&\n"
+              "\t\t    SUSFS_IS_INODE_OPEN_REDIRECT_WITHOUT_UID_CHECK(\n"
+              "\t\t\tnd->path.dentry ? d_inode(nd->path.dentry) : NULL)) {\n"
+              "\t\t\tsus_fake_name = susfs_open_redirect_spoof_do_sys_openat(\n"
+              "\t\t\t\td_inode(nd->path.dentry));\n"
+              "\t\t\tif (sus_fake_name && !IS_ERR(sus_fake_name)) {\n"
+              "\t\t\t\tconst char *new_s = NULL;\n"
+              "\n"
+              "\t\t\t\tterminate_walk(nd);\n"
+              "\t\t\t\trestore_nameidata();\n"
+              "\t\t\t\tset_nameidata(nd, sus_old_dfd, sus_fake_name, NULL);\n"
+              "\t\t\t\tnew_s = path_init(nd, flags);\n"
+              "\t\t\t\twhile (!(error = link_path_walk(new_s, nd)) &&\n"
+              "\t\t\t\t       (new_s = open_last_lookups(nd, file, op)) != NULL)\n"
+              "\t\t\t\t\t;\n"
+              "\t\t\t}\n"
+              "\t\t}\n"
+              "#endif\n"
+              "\t\tif (!error)\n"
+              "\t\t\terror = do_open(nd, file, op);\n", 1)
+
+# (3) 收尾：还原 nd->name
+cleanup_anchor = ("\t\tterminate_walk(nd);\n"
+                  "\t}\n"
+                  "\tif (likely(!error)) {\n")
+assert cleanup_anchor in s, "namei.c: path_openat 收尾锚点没找到"
+s = s.replace(cleanup_anchor,
+              "\t\tterminate_walk(nd);\n"
+              "\t}\n"
+              "#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n"
+              "\tif (sus_fake_name && !IS_ERR(sus_fake_name)) {\n"
+              "\t\tnd->name = sus_old_name;\n"
+              "\t\tputname(sus_fake_name);\n"
+              "\t}\n"
+              "#endif\n"
+              "\tif (likely(!error)) {\n", 1)
+
+# (4) vfs_readlink：命中规则时用 redirected 路径回填，防止反查出真实位置
+rl_anchor = ("\tstruct inode *inode = d_inode(dentry);\n"
+             "\tDEFINE_DELAYED_CALL(done);\n"
+             "\tconst char *link;\n"
+             "\tint res;\n")
+assert rl_anchor in s, "namei.c: vfs_readlink 声明锚点没找到"
+s = s.replace(rl_anchor, rl_anchor +
+              "#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n"
+              "\tif (SUSFS_IS_INODE_OPEN_REDIRECT(inode)) {\n"
+              "\t\tint sus_rl = susfs_open_redirect_spoof_vfs_readlink(inode, buffer, buflen);\n"
+              "\n"
+              "\t\t/* 官方成功时返回 0（已直接写入用户缓冲），失败返回负值 */\n"
+              "\t\tif (!sus_rl)\n"
+              "\t\t\treturn 0;\n"
+              "\t}\n"
+              "#endif\n", 1)
+
+open(p, "w").write(s)
+print("    namei.c: open_redirect 已注入（path_openat + vfs_readlink）")
 PY
 
