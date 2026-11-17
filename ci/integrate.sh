@@ -1036,6 +1036,8 @@ else:
 
 # 3) clone_mnt：克隆 sus 挂载（unshare 场景）时继续用号段 id，
 #    否则 app unshare 后拿到的副本是普通 id，会重新出现在 /proc 里。
+#    注意：这里已经持有 xa_lock，必须用 __xa_erase（调用方持锁版本）；
+#    用 xa_erase 会在同一把非递归自旋锁上自死锁（101 版开机黑屏的根因）。
 clone_anchor = ("\tmnt = alloc_vfsmnt(old->mnt_devname);\n"
                 "\tif (!mnt)\n"
                 "\t\treturn ERR_PTR(-ENOMEM);\n")
@@ -1049,7 +1051,9 @@ if "susfs_mount_is_sus_id(old->mnt_id)" not in s:
         "\n"
         "\t\tif (sus_id > 0) {\n"
         "\t\t\txa_lock(&mnt_id_xa);\n"
-        "\t\t\txa_erase(&mnt_id_xa, mnt->mnt_id);\n"
+        "\t\t\t/* 号段 id 不在 xa 里，别去 erase；普通 id 用 __xa_erase */\n"
+        "\t\t\tif (!susfs_mount_is_sus_id(mnt->mnt_id))\n"
+        "\t\t\t\t__xa_erase(&mnt_id_xa, mnt->mnt_id);\n"
         "\t\t\tmnt->mnt_id = sus_id;\n"
         "\t\t\txa_unlock(&mnt_id_xa);\n"
         "\t\t}\n"
