@@ -112,7 +112,12 @@ patch_file, src = sys.argv[1], sys.argv[2]
 skip = {
     "fs/exec.c", "fs/open.c", "fs/read_write.c", "drivers/input/input.c",
     "fs/namei.c", "fs/readdir.c", "fs/stat.c", "fs/namespace.c",
-    "mm/memory.c", "fs/Makefile", "security/selinux/hooks.c", "kernel/reboot.c",
+    "mm/memory.c", "fs/Makefile", "kernel/reboot.c",
+    # 阶段 D 的 SELinux 补丁已经改过这 5 个文件（同一份官方补丁的旧版本），
+    # 再打官方新版必然冲突；功能由 D 提供。
+    "security/selinux/avc.c", "security/selinux/hooks.c",
+    "security/selinux/selinuxfs.c", "security/selinux/ss/services.c",
+    "security/selinux/status.c",
 }
 chunks, cur, name = [], [], None
 for ln in open(patch_file).read().split("\n"):
@@ -192,7 +197,31 @@ decl = inc + """
 #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
 extern bool susfs_is_inode_sus_kstat(struct inode *inode, bool *out_is_fuse);
 extern void susfs_sus_kstat_spoof_generic_fillattr(struct inode *inode, struct kstat *stat, u32 result_mask);
-extern u64 susfs_get_non_sus_mnt_id_unique_from_mnt(struct mount *orig_mnt);
+extern struct vfsmount *susfs_get_non_sus_vfsmnt_from_vfsmnt(struct vfsmount *vfsmnt)
+{
+	struct mount *mnt = real_mount(vfsmnt);
+
+	if (mnt->mnt_id < DEFAULT_KSU_MNT_ID) {
+		mntget(&mnt->mnt);
+		dget(mnt->mnt.mnt_root);
+		return &mnt->mnt;
+	}
+
+	lock_mount_hash();
+	for (; mnt && mnt->mnt_parent && mnt != mnt->mnt_parent &&
+	       mnt->mnt_id >= DEFAULT_KSU_MNT_ID; mnt = mnt->mnt_parent) { }
+	mntget(&mnt->mnt);
+	if (!mnt->mnt.mnt_root || IS_ERR(mnt->mnt.mnt_root)) {
+		mntput(&mnt->mnt);
+		unlock_mount_hash();
+		return vfsmnt;
+	}
+	dget(mnt->mnt.mnt_root);
+	unlock_mount_hash();
+	return &mnt->mnt;
+}
+
+u64 susfs_get_non_sus_mnt_id_unique_from_mnt(struct mount *orig_mnt);
 #endif
 """
 s = s.replace(inc, decl, 1)

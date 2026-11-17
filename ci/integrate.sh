@@ -551,6 +551,7 @@ if [ "${SUSFS_UPSTREAM:-0}" = "1" ]; then
     bash "$HERE/ci/susfs_upstream.sh" "$SRC" "$HERE"
 fi
 
+if ! [ "${SUSFS_UPSTREAM:-0}" = "1" ]; then
 echo "==> I 阶段1：SUSFS spoof_uname（built-in，proc 接口，零运行期改写）"
 cp "$HERE/patches/susfs_uname.c" "$SRC/fs/susfs_uname.c"
 cp "$HERE/patches/susfs_uname.h" "$SRC/include/linux/susfs_uname.h"
@@ -626,6 +627,9 @@ inject("fs/proc/version.c", "version_proc_show",
 inject("fs/proc/bootconfig.c", "boot_config_proc_show",
        "\tif (susfs_spoof_cmdline_show(m))\n\t\treturn 0;\n")
 PYEOF
+
+
+fi
 
 echo "==> K 阶段3：sus_path（inode 匹配）"
 if ! [ "${SUSFS_UPSTREAM:-0}" = "1" ]; then
