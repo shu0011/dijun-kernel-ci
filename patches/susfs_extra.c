@@ -21,7 +21,6 @@
 #include <linux/errno.h>
 #include <linux/fs.h>
 #include <linux/gfp.h>
-#include <linux/init_task.h>	/* init_cred */
 #include <linux/jump_label.h>
 #include <linux/kstrtox.h>
 #include <linux/list.h>
@@ -129,24 +128,28 @@ bool susfs_uid_priority_filtered(uid_t uid)
 }
 
 /*
- * Resolve a package name to its app uid by reading /data/system/packages.list
- * under init_cred (the file is world-readable; root cred is sufficient and
- * avoids any dependency on KernelSU-internal setup_selinux()).
- * Format: <package> <uid> <gid> [flags...] ; uid is "app uid", already in the
- * [10000,19999] range on a stock Android build (100000 offset not present in
- * packages.list).  We mirror upstream by taking uid % 100000.
+ * Resolve package names to app uids via /data/system/packages.list.
+ *
+ * The read deliberately uses the *caller's* credentials.  This ABI is
+ * root-only (see susfs_reboot_handler), and the caller (ksu_susfs launched
+ * from a su shell) runs in the KernelSU domain, which is allowed to read
+ * packages_list_file.  Overriding with init_cred would switch the SELinux
+ * context to u:r:kernel:s0, which is *denied* read on that file.
+ *
+ * Format: <package> <uid> <gid> [flags...].  We take uid % 100000 like
+ * upstream so a 100000-offset uid still lands in [10000,19999].
  */
 #define PACKAGES_LIST "/data/system/packages.list"
+#define SUSFS_PKG_LINE_MAX 512
 
-static int susfs_resolve_app_uid(const char *name, uid_t *out_uid)
+/* Read the whole file once; callers scan it for every requested package. */
+static int susfs_read_packages_list(char **out)
 {
 	struct file *fp;
 	loff_t pos = 0;
 	char *buf;
-	char *line, *next, *pkg, *uid_str;
 	size_t size;
-	unsigned long val;
-	int ret = -ENOENT;
+	ssize_t n;
 
 	fp = filp_open(PACKAGES_LIST, O_RDONLY | O_LARGEFILE, 0);
 	if (IS_ERR(fp))
@@ -164,70 +167,91 @@ static int susfs_resolve_app_uid(const char *name, uid_t *out_uid)
 		return -ENOMEM;
 	}
 
-	{
-		const struct cred *old = override_creds(&init_cred);
-
-		ret = kernel_read(fp, buf, size, &pos);
-		revert_creds(old);
-	}
+	n = kernel_read(fp, buf, size, &pos);
 	filp_close(fp, NULL);
-
-	if (ret != (int)size) {
+	if (n != (ssize_t)size) {
 		vfree(buf);
-		return ret < 0 ? ret : -EIO;
+		return n < 0 ? (int)n : -EIO;
 	}
 	buf[size] = '\0';
+	*out = buf;
+	return 0;
+}
 
-	for (line = buf; line && *line; line = next) {
-		char *p = strchr(line, '\n');
+/* Find @name in an already-loaded packages.list image. */
+static int susfs_lookup_uid_in_list(const char *list, const char *name,
+				    uid_t *out_uid)
+{
+	const char *line = list;
 
-		if (p) {
-			*p = '\0';
-			next = p + 1;
-		} else {
-			next = NULL;
-		}
-		if (*line == '\0' || *line == '\r')
-			continue;
+	while (line && *line) {
+		char tmp[SUSFS_PKG_LINE_MAX];
+		char *cursor = tmp, *pkg, *uid_str;
+		unsigned long val;
+		size_t len = 0;
 
-		pkg = strsep(&line, " \t");
-		uid_str = strsep(&line, " \t");
+		while (line[len] && line[len] != '\n' &&
+		       len < sizeof(tmp) - 1)
+			len++;
+		memcpy(tmp, line, len);
+		tmp[len] = '\0';
+
+		line = strchr(line, '\n');
+		if (line)
+			line++;
+
+		pkg = strsep(&cursor, " \t");
+		uid_str = strsep(&cursor, " \t");
 		if (!pkg || !*pkg || !uid_str || !*uid_str)
 			continue;
 		if (strcmp(pkg, name))
 			continue;
-		if (kstrtoul(uid_str, 10, &val)) {
-			vfree(buf);
+		if (kstrtoul(uid_str, 10, &val))
 			return -EINVAL;
-		}
 		*out_uid = (uid_t)(val % 100000);
-		vfree(buf);
 		return 0;
 	}
-
-	vfree(buf);
 	return -ENOENT;
 }
 
-/* Parse a comma-separated package list into the provided bitmap.
- * Empty items are tolerated.  A package that cannot be resolved is ignored
- * (mirrors upstream skip_failed=true for the re-parse path). */
-static void susfs_parse_app_list(char *apps, struct susfs_uid_bitmap *map)
+/*
+ * Parse a comma-separated package list into the bitmap.
+ * Returns 0 when at least one entry resolved (skipped entries are tolerated),
+ * the read error when packages.list is unreadable, or -ENOENT when nothing at
+ * all resolved — so userspace sees a failure instead of a silently empty
+ * filter.
+ */
+static int susfs_parse_app_list(char *apps, struct susfs_uid_bitmap *map)
 {
 	char *token, *save = apps;
-	uid_t uid;
+	char *list;
+	int resolved = 0, tokens = 0;
+	int ret;
+
+	ret = susfs_read_packages_list(&list);
+	if (ret)
+		return ret;
 
 	while ((token = strsep(&save, ",")) != NULL) {
+		uid_t uid;
+
 		token = strim(token);
 		if (!*token)
 			continue;
-		if (susfs_resolve_app_uid(token, &uid))
+		tokens++;
+		if (susfs_lookup_uid_in_list(list, token, &uid))
 			continue;
 		if (uid < SUSFS_UID_MIN || uid > SUSFS_UID_MAX)
 			continue;
 		set_bit(uid - SUSFS_UID_MIN, map->bits);
+		resolved++;
 		susfs_log("resolved app '%s' -> uid %u\n", token, uid);
 	}
+	vfree(list);
+
+	if (tokens && !resolved)
+		return -ENOENT;
+	return 0;
 }
 
 static int susfs_set_uid_filter(const char __user *app_strings,
@@ -259,8 +283,14 @@ static int susfs_set_uid_filter(const char __user *app_strings,
 		kvfree(info);
 		return -ENOMEM;
 	}
-	susfs_parse_app_list(info->app_strings, newmap);
+	ret = susfs_parse_app_list(info->app_strings, newmap);
 	kvfree(info);
+	if (ret) {
+		/* Unreadable packages.list or nothing resolved: do not silently
+		 * install an empty filter — leave the previous state untouched. */
+		kfree(newmap);
+		return ret;
+	}
 
 	mutex_lock(lock);
 	memcpy(map->bits, newmap->bits, sizeof(map->bits));
@@ -361,10 +391,14 @@ struct filename *susfs_open_redirect_filename(struct inode *inode)
 }
 
 /*
- * Called from vfs_readlink() before the cached-link fast path.  Writes the
- * spoofed target straight into the caller's user buffer with readlink_copy(),
- * so the hook needs no stack buffer of its own (a PATH_MAX local inside
- * vfs_readlink() trips -Wframe-larger-than=2048).
+ * Called from vfs_readlink() before the cached-link fast path.
+ *
+ * Direction matches upstream susfs_open_redirect_spoof_vfs_readlink(): when the
+ * *target* inode is readlinked, report the redirected pathname, so the real
+ * location of the hidden target is never exposed.  Writes straight into the
+ * caller's user buffer via readlink_copy(), which keeps the hook free of any
+ * stack buffer (a PATH_MAX local inside vfs_readlink() trips
+ * -Wframe-larger-than=2048).
  * Returns >= 0 (bytes copied) when handled, -ENOENT when there is no rule.
  */
 int susfs_open_redirect_readlink(struct inode *inode, char __user *buffer,
@@ -378,9 +412,10 @@ int susfs_open_redirect_readlink(struct inode *inode, char __user *buffer,
 
 	mutex_lock(&susfs_redirect_mutex);
 	list_for_each_entry(e, &susfs_redirect_list, list) {
-		if (e->redirect_inode == inode) {
-			ret = readlink_copy(buffer, buflen, e->target_path,
-					    strlen(e->target_path));
+		if (e->target_inode == inode &&
+		    susfs_uid_scheme_match(e->uid_scheme)) {
+			ret = readlink_copy(buffer, buflen, e->redirect_path,
+					    strlen(e->redirect_path));
 			break;
 		}
 	}
