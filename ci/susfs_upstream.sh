@@ -200,31 +200,7 @@ decl = inc + """
 #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
 extern bool susfs_is_inode_sus_kstat(struct inode *inode, bool *out_is_fuse);
 extern void susfs_sus_kstat_spoof_generic_fillattr(struct inode *inode, struct kstat *stat, u32 result_mask);
-extern struct vfsmount *susfs_get_non_sus_vfsmnt_from_vfsmnt(struct vfsmount *vfsmnt)
-{
-	struct mount *mnt = real_mount(vfsmnt);
-
-	if (mnt->mnt_id < DEFAULT_KSU_MNT_ID) {
-		mntget(&mnt->mnt);
-		dget(mnt->mnt.mnt_root);
-		return &mnt->mnt;
-	}
-
-	lock_mount_hash();
-	for (; mnt && mnt->mnt_parent && mnt != mnt->mnt_parent &&
-	       mnt->mnt_id >= DEFAULT_KSU_MNT_ID; mnt = mnt->mnt_parent) { }
-	mntget(&mnt->mnt);
-	if (!mnt->mnt.mnt_root || IS_ERR(mnt->mnt.mnt_root)) {
-		mntput(&mnt->mnt);
-		unlock_mount_hash();
-		return vfsmnt;
-	}
-	dget(mnt->mnt.mnt_root);
-	unlock_mount_hash();
-	return &mnt->mnt;
-}
-
-u64 susfs_get_non_sus_mnt_id_unique_from_mnt(struct mount *orig_mnt);
+extern u64 susfs_get_non_sus_mnt_id_unique_from_mnt(struct mount *orig_mnt);
 #endif
 """
 s = s.replace(inc, decl, 1)
@@ -279,13 +255,20 @@ if "susfs_get_non_sus_mnt_id_from_mnt" in s:
     print("    已注入过")
     raise SystemExit(0)
 
-# 1) 头文件 + 号段常量
-inc = "#include <linux/mount.h>\n"
-if inc not in s:
-    i = s.find("#include")
-    s = s[:i] + "#include <linux/susfs_def.h>\n" + s[i:]
-else:
-    s = s.replace(inc, inc + "#include <linux/susfs_def.h>\n", 1)
+# 1) 头文件 + 号段常量（M 阶段在上游模式被跳过，这里自己补齐）
+preamble = (
+    "#include <linux/susfs_def.h>\n"
+    "#include <linux/atomic.h>\n"
+    "extern bool susfs_is_current_ksu_domain(void);\n"
+    "#ifndef VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT\n"
+    "#define VFSMOUNT_MNT_FLAGS_KSU_UNSHARED_MNT 0x80000000u\n"
+    "#endif\n"
+    "#ifndef CL_COPY_MNT_NS\n"
+    "#define CL_COPY_MNT_NS BIT(25)\n"
+    "#endif\n")
+i = s.find("#include")
+assert i > 0, "namespace.c: include 锚点没找到"
+s = s[:i] + preamble + s[i:]
 
 # 2) 号段计数器（官方用独立 IDA；6.18 的 xarray 不能在里面做 GFP_KERNEL 分配）
 alloc_anchor = ("static int mnt_alloc_id(struct mount *mnt)\n"
@@ -383,6 +366,30 @@ int susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt)
 	mnt_id = mnt->mnt_id;
 	unlock_mount_hash();
 	return mnt_id;
+}
+
+struct vfsmount *susfs_get_non_sus_vfsmnt_from_vfsmnt(struct vfsmount *vfsmnt)
+{
+	struct mount *mnt = real_mount(vfsmnt);
+
+	if (mnt->mnt_id < DEFAULT_KSU_MNT_ID) {
+		mntget(&mnt->mnt);
+		dget(mnt->mnt.mnt_root);
+		return &mnt->mnt;
+	}
+
+	lock_mount_hash();
+	for (; mnt && mnt->mnt_parent && mnt != mnt->mnt_parent &&
+	       mnt->mnt_id >= DEFAULT_KSU_MNT_ID; mnt = mnt->mnt_parent) { }
+	mntget(&mnt->mnt);
+	if (!mnt->mnt.mnt_root || IS_ERR(mnt->mnt.mnt_root)) {
+		mntput(&mnt->mnt);
+		unlock_mount_hash();
+		return vfsmnt;
+	}
+	dget(mnt->mnt.mnt_root);
+	unlock_mount_hash();
+	return &mnt->mnt;
 }
 
 u64 susfs_get_non_sus_mnt_id_unique_from_mnt(struct mount *orig_mnt)
