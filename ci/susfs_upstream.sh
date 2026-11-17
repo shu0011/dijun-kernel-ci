@@ -198,6 +198,7 @@ inc = '#include "mount.h"\n'
 assert inc in s, "stat.c: 找不到 #include \"mount.h\""
 decl = inc + """
 #ifdef CONFIG_KSU_SUSFS_SUS_KSTAT
+#include <linux/susfs_def.h>	/* STATX_SUS_KSTAT / susfs_is_current_app_uid */
 extern bool susfs_is_inode_sus_kstat(struct inode *inode, bool *out_is_fuse);
 extern void susfs_sus_kstat_spoof_generic_fillattr(struct inode *inode, struct kstat *stat, u32 result_mask);
 extern u64 susfs_get_non_sus_mnt_id_unique_from_mnt(struct mount *orig_mnt);
