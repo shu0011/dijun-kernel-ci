@@ -1,18 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * SUSFS stage-4: sus_kstat（built-in）
+ * SUSFS stage-4: sus_kstat（built-in，全字段伪装）
  *
- * 控制接口：/proc/susfs_add_sus_kstat  0600
- *   写 "<绝对路径> <size> [mode]"  -> 加入伪装（mode 为八进制，可省略）
- *   写 "clear"                     -> 清空并 iput
- *   读                             -> 每行 "<path> <size> <mode>"
+ * 控制接口：
+ *   /proc/susfs_add_sus_kstat  0600
+ *     写 "<绝对路径> <size> [mode(八进制)]" -> 以当前 stat 为底，覆盖 size（可选 mode）
+ *     写 "clear"                            -> 清空并 iput
+ *     读                                    -> 每行 "<path> <size> <mode>"
+ *
+ * 官方命令字 ABI（CMD_SUSFS_ADD_SUS_KSTAT / UPDATE_SUS_KSTAT /
+ * ADD_SUS_KSTAT_STATICALLY）走 susfs_kstat_abi_add()：
+ *   - ADD / UPDATE：以路径当前的真实 stat 为快照（generic_fillattr）
+ *   - STATICALLY ：直接采用 userspace 传来的 ino/dev/nlink/size/atime/mtime/
+ *                  ctime/blocks/blksize（CLI 会把 "default" 字段先填成真实值）
  *
  * 与 sus_path 共用同一套 inode 匹配思路：加入时 kern_path() 拿 inode 并 ihold()，
  * 之后按指针比较。只对 app uid（>= 10000）生效。
  *
- * 伪造方式：不调用文件系统自身的 getattr，而是 generic_fillattr() 填基础字段后
- * 覆盖 size / blocks /（可选）mode。文件系统专有的扩展字段（如 f2fs 的压缩标志）
- * 不参与，检测软件看的是 size/ino/mode 这些常规项。
+ * 伪装方式：vfs_getattr() 里先 generic_fillattr() 填基础字段，再用本表覆盖
+ * ino / dev / nlink / size / blocks / blksize / atime / mtime / ctime。
+ * 对齐上游 susfs4ksu 的 sus_kstat 字段集合（上游同样不覆盖 rdev/uid/gid）。
  */
 #include <linux/cred.h>
 #include <linux/dcache.h>
@@ -22,6 +29,7 @@
 #include <linux/kernel.h>
 #include <linux/limits.h>
 #include <linux/mutex.h>
+#include <linux/mnt_idmapping.h>
 #include <linux/namei.h>
 #include <linux/path.h>
 #include <linux/proc_fs.h>
@@ -29,18 +37,20 @@
 #include <linux/slab.h>
 #include <linux/stat.h>
 #include <linux/string.h>
+#include <linux/susfs_abi.h>
 #include <linux/susfs_kstat.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
 
 #define SUSFS_MAX_KSTAT 64
+#define SUSFS_KSTAT_PATH_MAX SUSFS_ABI_MAX_LEN_PATHNAME
 #define SUSFS_KSTAT_PROC "susfs_add_sus_kstat"
 
 struct susfs_kstat_entry {
 	struct inode *inode;
-	u64 size;
-	unsigned int mode;	/* 0 表示不改 mode */
-	char path[PATH_MAX];
+	char path[SUSFS_KSTAT_PATH_MAX];	/* 仅用于回读展示 */
+	struct kstat kst;			/* 完整伪装值 */
+	bool mode_valid;			/* false 时保持真实 mode */
 };
 
 static struct susfs_kstat_entry susfs_kstats[SUSFS_MAX_KSTAT];
@@ -79,12 +89,22 @@ void susfs_kstat_override(struct inode *inode, struct kstat *stat)
 
 	mutex_lock(&susfs_kstat_mutex);
 	for (i = 0; i < susfs_kstat_count; i++) {
-		if (susfs_kstats[i].inode != inode)
+		struct susfs_kstat_entry *e = &susfs_kstats[i];
+
+		if (e->inode != inode)
 			continue;
-		stat->size = susfs_kstats[i].size;
-		stat->blocks = (susfs_kstats[i].size + 511) >> 9;
-		if (susfs_kstats[i].mode)
-			stat->mode = susfs_kstats[i].mode;
+
+		stat->ino = e->kst.ino;
+		stat->dev = e->kst.dev;
+		stat->nlink = e->kst.nlink;
+		stat->size = e->kst.size;
+		stat->blocks = e->kst.blocks;
+		stat->blksize = e->kst.blksize;
+		stat->atime = e->kst.atime;
+		stat->mtime = e->kst.mtime;
+		stat->ctime = e->kst.ctime;
+		if (e->mode_valid)
+			stat->mode = e->kst.mode;
 		break;
 	}
 	mutex_unlock(&susfs_kstat_mutex);
@@ -105,11 +125,44 @@ static void susfs_kstat_clear(void)
 	mutex_unlock(&susfs_kstat_mutex);
 }
 
-static int susfs_kstat_add(const char *path, u64 size, unsigned int mode)
+/* caller holds susfs_kstat_mutex */
+static int susfs_kstat_store_locked(struct inode *inode, const char *path,
+				    const struct kstat *kst, bool mode_valid)
+{
+	int i;
+
+	for (i = 0; i < susfs_kstat_count; i++) {
+		if (susfs_kstats[i].inode == inode) {
+			susfs_kstats[i].kst = *kst;
+			susfs_kstats[i].mode_valid = mode_valid;
+			strscpy(susfs_kstats[i].path, path,
+				SUSFS_KSTAT_PATH_MAX);
+			return 0;
+		}
+	}
+	if (susfs_kstat_count >= SUSFS_MAX_KSTAT)
+		return -ENOSPC;
+
+	ihold(inode);
+	susfs_kstats[susfs_kstat_count].inode = inode;
+	susfs_kstats[susfs_kstat_count].kst = *kst;
+	susfs_kstats[susfs_kstat_count].mode_valid = mode_valid;
+	strscpy(susfs_kstats[susfs_kstat_count].path, path, SUSFS_KSTAT_PATH_MAX);
+	susfs_kstat_count++;
+	return 0;
+}
+
+/*
+ * 官方 ABI 入口。
+ * info->is_statically == true 时采用 payload 里的数值字段；
+ * 否则以路径当前真实 stat 为快照（ADD / UPDATE 语义）。
+ */
+int susfs_kstat_abi_add(const char *path, const struct susfs_abi_kstat *info)
 {
 	struct path p;
 	struct inode *inode;
-	int i, ret;
+	struct kstat kst = {};
+	int ret;
 
 	ret = kern_path(path, 0, &p);
 	if (ret)
@@ -121,43 +174,68 @@ static int susfs_kstat_add(const char *path, u64 size, unsigned int mode)
 		return -ENOENT;
 	}
 
-	mutex_lock(&susfs_kstat_mutex);
-	for (i = 0; i < susfs_kstat_count; i++) {
-		if (susfs_kstats[i].inode == inode) {
-			susfs_kstats[i].size = size;
-			susfs_kstats[i].mode = mode;
-			mutex_unlock(&susfs_kstat_mutex);
-			path_put(&p);
-			return 0;
-		}
-	}
-	if (susfs_kstat_count >= SUSFS_MAX_KSTAT) {
-		mutex_unlock(&susfs_kstat_mutex);
-		path_put(&p);
-		return -ENOSPC;
+	generic_fillattr(mnt_idmap(p.mnt), STATX_BASIC_STATS, inode, &kst);
+
+	if (info && info->is_statically) {
+		kst.ino = (u64)info->spoofed_ino;
+		kst.dev = (dev_t)info->spoofed_dev;
+		kst.nlink = info->spoofed_nlink;
+		kst.size = (loff_t)info->spoofed_size;
+		kst.atime.tv_sec = info->spoofed_atime_tv_sec;
+		kst.atime.tv_nsec = info->spoofed_atime_tv_nsec;
+		kst.mtime.tv_sec = info->spoofed_mtime_tv_sec;
+		kst.mtime.tv_nsec = info->spoofed_mtime_tv_nsec;
+		kst.ctime.tv_sec = info->spoofed_ctime_tv_sec;
+		kst.ctime.tv_nsec = info->spoofed_ctime_tv_nsec;
+		kst.blocks = (u64)info->spoofed_blocks;
+		kst.blksize = (u32)info->spoofed_blksize;
 	}
 
-	ihold(inode);
-	susfs_kstats[susfs_kstat_count].inode = inode;
-	susfs_kstats[susfs_kstat_count].size = size;
-	susfs_kstats[susfs_kstat_count].mode = mode;
-	strscpy(susfs_kstats[susfs_kstat_count].path, path, PATH_MAX);
-	susfs_kstat_count++;
+	mutex_lock(&susfs_kstat_mutex);
+	ret = susfs_kstat_store_locked(inode, path, &kst, false);
 	mutex_unlock(&susfs_kstat_mutex);
 
 	path_put(&p);
-	return 0;
+	return ret;
 }
 
-int susfs_kstat_abi_add(const char *path, u64 size, unsigned int mode)
+/* /proc 接口：<path> <size> [mode] —— 以真实 stat 为底只覆盖 size（可选 mode） */
+static int susfs_kstat_add_simple(const char *path, u64 size, unsigned int mode)
 {
-	return susfs_kstat_add(path, size, mode);
+	struct path p;
+	struct inode *inode;
+	struct kstat kst = {};
+	int ret;
+
+	ret = kern_path(path, 0, &p);
+	if (ret)
+		return ret;
+
+	inode = d_backing_inode(p.dentry);
+	if (!inode) {
+		path_put(&p);
+		return -ENOENT;
+	}
+
+	generic_fillattr(mnt_idmap(p.mnt), STATX_BASIC_STATS, inode, &kst);
+	kst.size = (loff_t)size;
+	kst.blocks = (size + 511) >> 9;
+	if (mode)
+		kst.mode = (umode_t)mode;
+
+	mutex_lock(&susfs_kstat_mutex);
+	ret = susfs_kstat_store_locked(inode, path, &kst, mode != 0);
+	mutex_unlock(&susfs_kstat_mutex);
+
+	path_put(&p);
+	return ret;
 }
 
 static ssize_t susfs_kstat_write(struct file *file, const char __user *ubuf,
 				 size_t count, loff_t *ppos)
 {
-	char *kbuf, *sep, *mode_str;
+	char *kbuf, *sep;
+	char path[SUSFS_KSTAT_PATH_MAX];
 	u64 size = 0;
 	unsigned long mode = 0;
 	size_t len;
@@ -193,20 +271,18 @@ static ssize_t susfs_kstat_write(struct file *file, const char __user *ubuf,
 		return -EINVAL;
 	}
 	*sep = '\0';
-	if (strlen(kbuf) >= PATH_MAX) {
+	if (strlen(kbuf) >= SUSFS_KSTAT_PATH_MAX) {
 		kfree(kbuf);
 		return -ENAMETOOLONG;
 	}
-	/* kbuf 已在堆上，*sep='\0' 后其前半段即 path，直接复用，避免栈上 PATH_MAX 缓冲 */
+	strscpy(path, kbuf, sizeof(path));
 
 	if (sscanf(sep + 1, "%llu %lo", &size, &mode) < 1) {
 		kfree(kbuf);
 		return -EINVAL;
 	}
-	mode_str = strchr(sep + 1, ' ');
-	(void)mode_str;
 
-	ret = susfs_kstat_add(kbuf, size, (unsigned int)mode);
+	ret = susfs_kstat_add_simple(path, size, (unsigned int)mode);
 	kfree(kbuf);
 
 	return ret ? ret : count;
@@ -230,10 +306,11 @@ static ssize_t susfs_kstat_read(struct file *file, char __user *ubuf,
 	for (i = 0; i < susfs_kstat_count; i++) {
 		if (used >= PAGE_SIZE - 1)
 			break;
-		n = scnprintf(out + used, PAGE_SIZE - used, "%s %llu %o\n",
+		n = scnprintf(out + used, PAGE_SIZE - used, "%s %lld %o\n",
 			      susfs_kstats[i].path,
-			      (unsigned long long)susfs_kstats[i].size,
-			      susfs_kstats[i].mode);
+			      (long long)susfs_kstats[i].kst.size,
+			      susfs_kstats[i].mode_valid ?
+				      (unsigned int)susfs_kstats[i].kst.mode : 0);
 		if (n <= 0)
 			break;
 		used += n;

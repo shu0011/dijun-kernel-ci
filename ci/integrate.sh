@@ -678,51 +678,75 @@ else:
     print("    fs/namei.c: link_path_walk 已注入")
 open(p, "w").write(s)
 
-# 3) fs/readdir.c: getdents64 取 sb；filldir64 入口按 inode 跳过
+# 3) fs/readdir.c: 4 个 filldir 变体全部按 inode 过滤（对齐上游 5 处钩子里的
+#    readdir 部分；上游的 dir_emit 路径在 6.18 不存在）
 p = os.path.join(SRC, "fs/readdir.c")
 s = add_include(p, "linux/susfs_path.h")
 
-i = s.find("struct getdents_callback64 {")
-if i < 0:
-    print("    fs/readdir.c: getdents_callback64 没匹配上，readdir 跳过")
-else:
-    j = s.find("{", i) + 1
-    s = s[:j] + "\n\tstruct super_block *sb;" + s[j:]
+# (回调结构体, filler 函数, 对应 syscall 标记)
+variants = [
+    ("readdir_callback", "fillonedir", "SYSCALL_DEFINE3(old_readdir,"),
+    ("getdents_callback", "filldir", "SYSCALL_DEFINE3(getdents,"),
+    ("getdents_callback64", "filldir64", "SYSCALL_DEFINE3(getdents64,"),
+    ("compat_readdir_callback", "compat_fillonedir",
+     "COMPAT_SYSCALL_DEFINE3(old_readdir,"),
+    ("compat_getdents_callback", "compat_filldir",
+     "COMPAT_SYSCALL_DEFINE3(getdents,"),
+]
 
-    k = s.find("SYSCALL_DEFINE3(getdents64")
-    it = s.find("error = iterate_dir(fd_file(f), &buf.ctx);", k if k >= 0 else 0)
-    if it < 0:
-        print("    fs/readdir.c: iterate_dir 没匹配上")
+filter_block = (
+    "\tif (buf->sb) {\n"
+    "\t\tstruct inode *sus_inode = ilookup(buf->sb, ino);\n"
+    "\n"
+    "\t\tif (sus_inode) {\n"
+    "\t\t\tbool sus_hidden = susfs_is_inode_sus_path(sus_inode);\n"
+    "\n"
+    "\t\t\tiput(sus_inode);\n"
+    "\t\t\tif (sus_hidden)\n"
+    "\t\t\t\treturn true;\n"
+    "\t\t}\n"
+    "\t}\n\n"
+)
+
+for cb, fn, sysmark in variants:
+    st = s.find("struct %s {" % cb)
+    if st < 0:
+        print("    fs/readdir.c: %s 不存在（内核未开 CONFIG_COMPAT？），跳过 %s"
+              % (cb, fn))
+        continue
+
+    # 回调结构体加 sb 字段（幂等）
+    j = s.find("{", st) + 1
+    if "struct super_block *sb;" not in s[j:j + 80]:
+        s = s[:j] + "\n\tstruct super_block *sb;" + s[j:]
+
+    # syscall 里填 sb
+    k = s.find(sysmark)
+    if k < 0:
+        print("    fs/readdir.c: %s 没找到，%s 跳过填充" % (sysmark, fn))
     else:
-        s = s[:it] + "buf.sb = fd_file(f)->f_inode->i_sb;\n\t" + s[it:]
+        it = s.find("error = iterate_dir(fd_file(f), &buf.ctx);", k)
+        if it < 0:
+            print("    fs/readdir.c: %s 的 iterate_dir 没找到" % fn)
+        elif "buf.sb = fd_file(f)->f_inode->i_sb;" not in s[k:it]:
+            s = s[:it] + "buf.sb = fd_file(f)->f_inode->i_sb;\n\t" + s[it:]
 
-    # filldir64 插在 buf 声明之后：只在 buf 已存在的位置插入，避免 undeclared identifier
-    f = s.find("static bool filldir64(")
+    # filler 里按 inode 过滤：插在 container_of 声明之后，保证 buf 已声明
+    f = s.find("static bool %s(" % fn)
     if f < 0:
-        print("    fs/readdir.c: filldir64 没找到")
-    else:
-        anc = "container_of(ctx, struct getdents_callback64, ctx);"
-        a = s.find(anc, f)
-        if a < 0:
-            print("    fs/readdir.c: filldir64 的 buf 声明没匹配上")
-        else:
-            a = s.find("\n", a + len(anc))
-            a += 1
-            block = (
-                "\t{\n"
-                "\t\tstruct inode *sus_inode = ilookup(buf->sb, ino);\n"
-                "\n"
-                "\t\tif (sus_inode) {\n"
-                "\t\t\tbool sus_hidden = susfs_is_inode_sus_path(sus_inode);\n"
-                "\n"
-                "\t\t\tiput(sus_inode);\n"
-                "\t\t\tif (sus_hidden)\n"
-                "\t\t\t\treturn true;\n"
-                "\t\t}\n"
-                "\t}\n\n"
-            )
-            s = s[:a] + block + s[a:]
-            print("    fs/readdir.c: filldir64 已注入（buf 声明之后）")
+        print("    fs/readdir.c: %s 没找到" % fn)
+        continue
+    anc = "container_of(ctx, struct %s, ctx);" % cb
+    a = s.find(anc, f)
+    if a < 0:
+        print("    fs/readdir.c: %s 的 buf 声明没匹配上" % fn)
+        continue
+    a = s.find("\n", a + len(anc)) + 1
+    if "ilookup(buf->sb, ino)" in s[a:a + 400]:
+        print("    fs/readdir.c: %s 已注入过" % fn)
+        continue
+    s = s[:a] + filter_block + s[a:]
+    print("    fs/readdir.c: %s 已注入" % fn)
 
 open(p, "w").write(s)
 PYEOF
@@ -766,6 +790,47 @@ else:
 open(p, "w").write(s)
 PYEOF
 
+echo "==> L2 阶段4b：do_proc_readlink 伪装（/proc/<pid>/fd 的 readlink，对齐上游）"
+python3 - "$SRC" <<'PYEOF'
+import os
+import sys
+
+SRC = sys.argv[1]
+p = os.path.join(SRC, "fs/proc/base.c")
+s = open(p).read()
+
+if "susfs_extra.h" not in s:
+    i = s.find("#include")
+    assert i > 0, "fs/proc/base.c: 没找到 include"
+    s = s[:i] + "#include <linux/susfs_extra.h>\n" + s[i:]
+
+i = s.find("static int do_proc_readlink(")
+assert i > 0, "fs/proc/base.c: do_proc_readlink 没找到"
+anc = "\tif (!tmp)\n\t\treturn -ENOMEM;\n"
+j = s.find(anc, i)
+assert j > 0, "fs/proc/base.c: do_proc_readlink 的 tmp 分配锚点没找到"
+
+block = (
+    "#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT\n"
+    "\t{\n"
+    "\t\tint sus_rl = susfs_open_redirect_readlink(\n"
+    "\t\t\td_inode(path->dentry), buffer, buflen);\n"
+    "\n"
+    "\t\tif (sus_rl >= 0) {\n"
+    "\t\t\tkfree(tmp);\n"
+    "\t\t\treturn sus_rl;\n"
+    "\t\t}\n"
+    "\t}\n"
+    "#endif\n"
+)
+if "susfs_open_redirect_readlink" not in s:
+    s = s[:j + len(anc)] + block + s[j + len(anc):]
+    open(p, "w").write(s)
+    print("    fs/proc/base.c: do_proc_readlink 已注入")
+else:
+    print("    fs/proc/base.c: do_proc_readlink 已注入过")
+PYEOF
+
 echo "==> M 阶段5：sus_mount（隐藏挂载点，inode 匹配，改 proc_namespace.c show 函数）"
 cp "$HERE/patches/susfs_mount.c" "$SRC/fs/susfs_mount.c"
 cp "$HERE/patches/susfs_mount.h" "$SRC/include/linux/susfs_mount.h"
@@ -785,20 +850,105 @@ if "susfs_mount.h" not in s:
     i = s.find("#include")
     assert i > 0, "proc_namespace.c: 没找到 include"
     s = s[:i] + "#include <linux/susfs_mount.h>\n" + s[i:]
+if "susfs_is_current_ksu_domain" not in s:
+    i = s.find("#include")
+    assert i > 0, "proc_namespace.c: 没找到 include"
+    s = s[:i] + "extern bool susfs_is_current_ksu_domain(void);\n" + s[i:]
 
-# 在 3 个 show 函数体第一行插判断：命中就把该挂载行整行跳过（return 0）。
-# 只改 show 本体，不复制函数、不改 open 回调、不碰 fs/namespace.c 的 mount ID。
+# 在 3 个 show 函数体第一行插判断，命中就整行跳过（return 0）：
+#   1) 显式路径列表（/proc/susfs_add_sus_mount）
+#   2) 号段式隐藏：KSU 域进程创建的挂载 mnt_id >= 2000000000，
+#      对非 KSU 域进程隐藏（对齐上游 DEFAULT_KSU_MNT_ID 方案）
 funcs = ["show_vfsmnt", "show_mountinfo", "show_vfsstat"]
 for fn in funcs:
     pat = re.compile(r"(static int " + fn + r"\(struct seq_file \*m, struct vfsmount \*mnt\)\s*\{\n)")
     m = pat.search(s)
     if not m:
         sys.exit("!! proc_namespace.c: %s 锚点没匹配上（6.18 源码变了？），终止以免静默漏功能" % fn)
-    if "susfs_is_mnt_sus(mnt)" in s[m.end():m.end() + 120]:
+    if "susfs_mount_is_sus_id" in s[m.end():m.end() + 400]:
         print("    proc_namespace.c: %s 已注入过" % fn)
         continue
-    s = s[:m.end()] + "\tif (susfs_is_mnt_sus(mnt))\n\t\treturn 0;\n\n" + s[m.end():]
+    block = (
+        "\tif (susfs_is_mnt_sus(mnt))\n"
+        "\t\treturn 0;\n"
+        "\tif (susfs_mount_is_sus_id(real_mount(mnt)->mnt_id) &&\n"
+        "\t    susfs_mount_hide_for_non_su() &&\n"
+        "\t    !susfs_is_current_ksu_domain())\n"
+        "\t\treturn 0;\n\n"
+    )
+    s = s[:m.end()] + block + s[m.end():]
     print("    proc_namespace.c: %s 已注入" % fn)
+
+open(p, "w").write(s)
+
+# ---- fs/namespace.c：KSU 域进程创建的挂载分配号段内 mnt_id ----
+p = os.path.join(SRC, "fs/namespace.c")
+s = open(p).read()
+
+if "susfs_mount.h" not in s:
+    i = s.find("#include")
+    assert i > 0, "namespace.c: 没找到 include"
+    s = s[:i] + "#include <linux/susfs_mount.h>\n" + s[i:]
+if "susfs_is_current_ksu_domain" not in s:
+    i = s.find("#include")
+    assert i > 0, "namespace.c: 没找到 include"
+    s = s[:i] + "extern bool susfs_is_current_ksu_domain(void);\n" + s[i:]
+
+# 1) mnt_alloc_id：KSU 域进程 -> 号段 id，不登记进 mnt_id_xa
+alloc_anchor = ("static int mnt_alloc_id(struct mount *mnt)\n"
+                "{\n"
+                "\tint res;\n"
+                "\n"
+                "\txa_lock(&mnt_id_xa);\n")
+if alloc_anchor not in s:
+    sys.exit("!! namespace.c: mnt_alloc_id 锚点没匹配上，终止")
+if "susfs_mount_next_id" not in s:
+    alloc_block = (
+        "static int mnt_alloc_id(struct mount *mnt)\n"
+        "{\n"
+        "\tint res;\n"
+        "\n"
+        "\txa_lock(&mnt_id_xa);\n"
+        "#ifdef CONFIG_KSU_SUSFS\n"
+        "\tif (susfs_is_current_ksu_domain()) {\n"
+        "\t\tint sus_id = susfs_mount_next_id();\n"
+        "\n"
+        "\t\tif (sus_id > 0) {\n"
+        "\t\t\tmnt->mnt_id = sus_id;\n"
+        "\t\t\tmnt->mnt_id_unique = ++mnt_id_ctr;\n"
+        "\t\t\txa_unlock(&mnt_id_xa);\n"
+        "\t\t\treturn 0;\n"
+        "\t\t}\n"
+        "\t}\n"
+        "#endif\n"
+    )
+    s = s.replace(alloc_anchor, alloc_block, 1)
+    print("    namespace.c: mnt_alloc_id 已注入")
+else:
+    print("    namespace.c: mnt_alloc_id 已注入过")
+
+# 2) mnt_free_id：号段 id 不是 xa 分配的，直接返回
+free_anchor = ("static void mnt_free_id(struct mount *mnt)\n"
+               "{\n"
+               "\txa_erase(&mnt_id_xa, mnt->mnt_id);\n"
+               "}\n")
+if free_anchor not in s:
+    sys.exit("!! namespace.c: mnt_free_id 锚点没匹配上，终止")
+if "susfs_mount_is_sus_id(mnt->mnt_id)" not in s:
+    free_block = (
+        "static void mnt_free_id(struct mount *mnt)\n"
+        "{\n"
+        "#ifdef CONFIG_KSU_SUSFS\n"
+        "\tif (susfs_mount_is_sus_id(mnt->mnt_id))\n"
+        "\t\treturn;\n"
+        "#endif\n"
+        "\txa_erase(&mnt_id_xa, mnt->mnt_id);\n"
+        "}\n"
+    )
+    s = s.replace(free_anchor, free_block, 1)
+    print("    namespace.c: mnt_free_id 已注入")
+else:
+    print("    namespace.c: mnt_free_id 已注入过")
 
 open(p, "w").write(s)
 PYEOF
@@ -942,6 +1092,52 @@ else:
     else:
         print("    namei.c: __lookup_slow 末尾 return 锚点没匹配上")
 
+# 3.5) lookup_dcache：d_lookup 命中但属于 sus_path -> 当作 dcache 未命中，
+#      让后续真实 lookup 走 __lookup_slow / lookup_open 的隐藏分支
+i = s.find("static struct dentry *lookup_dcache(")
+if i < 0:
+    print("    namei.c: lookup_dcache 没找到")
+else:
+    k = s.find("struct dentry *lookup_one_qstr_excl(", i)
+    assert k > i, "namei.c: 找不到 lookup_dcache 的结束边界"
+    anc = "\tstruct dentry *dentry = d_lookup(dir, name);\n"
+    j = s.find(anc, i, k)
+    block35 = (
+        "\tif (dentry && !IS_ERR(dentry) && dentry->d_inode &&\n"
+        "\t    susfs_is_inode_sus_path(dentry->d_inode)) {\n"
+        "\t\tdput(dentry);\n"
+        "\t\treturn NULL;\n"
+        "\t}\n"
+    )
+    if j > 0 and block35 not in s[i:k]:
+        s = s[:j + len(anc)] + block35 + s[j + len(anc):]
+        count += 1
+        print("    namei.c: lookup_dcache 已注入")
+    else:
+        print("    namei.c: lookup_dcache 锚点缺失或已注入")
+
+# 3.6) lookup_one_qstr_excl：末尾 return 前隐藏（覆盖 *at / handle 类路径）
+i = s.find("struct dentry *lookup_one_qstr_excl(")
+if i < 0:
+    print("    namei.c: lookup_one_qstr_excl 没找到")
+else:
+    k = s.find("EXPORT_SYMBOL(lookup_one_qstr_excl);", i)
+    assert k > i, "namei.c: 找不到 lookup_one_qstr_excl 的结束边界"
+    j = s.rfind("\treturn dentry;\n", i, k)
+    block36 = (
+        "\tif (d_is_positive(dentry) && dentry->d_inode &&\n"
+        "\t    susfs_is_inode_sus_path(dentry->d_inode)) {\n"
+        "\t\tdput(dentry);\n"
+        "\t\treturn ERR_PTR(-ENOENT);\n"
+        "\t}\n"
+    )
+    if j > i and block36 not in s[i:k]:
+        s = s[:j] + block36 + s[j:]
+        count += 1
+        print("    namei.c: lookup_one_qstr_excl 已注入")
+    else:
+        print("    namei.c: lookup_one_qstr_excl 锚点缺失或已注入")
+
 # 4) lookup_open：d_lookup(dir, &nd->last) 之后，命中则 dput + ENOENT
 anchor4 = "\tdentry = d_lookup(dir, &nd->last);\n"
 block4 = (
@@ -967,11 +1163,13 @@ markers = {
     "lookup_fast 非RCU":   "\t\t\tdput(dentry);\n\t\t\tdentry = NULL;\n\t\t}\n",
     "__lookup_slow":       "susfs_is_inode_sus_path(dentry->d_inode)) {\n\t\tif (d_in_lookup(dentry))",
     "lookup_open":         "\t\tdput(dentry);\n\t\treturn ERR_PTR(-ENOENT);\n\t}\n",
+    "lookup_dcache":       "\t\tdput(dentry);\n\t\treturn NULL;\n\t}\n",
+    "lookup_one_qstr_excl": "d_is_positive(dentry) && dentry->d_inode &&",
 }
 missing = [name for name, mk in markers.items() if mk not in s]
 if missing:
     sys.exit("!! namei.c 注入块缺失: %s（锚点对不上），终止" % ", ".join(missing))
-print("    namei.c: 4/4 注入块校验通过")
+print("    namei.c: %d/%d 注入块校验通过" % (len(markers), len(markers)))
 PYEOF
 
 echo "==> P 阶段8：SUSFS reboot-magic 查询 ABI（让管理器/ksu_susfs 识别版本）"

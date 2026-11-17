@@ -21,6 +21,7 @@
 #include <linux/errno.h>
 #include <linux/fs.h>
 #include <linux/gfp.h>
+#include <linux/init.h>
 #include <linux/jump_label.h>
 #include <linux/kstrtox.h>
 #include <linux/list.h>
@@ -28,10 +29,12 @@
 #include <linux/mutex.h>
 #include <linux/namei.h>	/* kern_path() */
 #include <linux/printk.h>
+#include <linux/proc_fs.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+#include <linux/version.h>
 #include <linux/vmalloc.h>
 
 /* Provided by susfs_bridge.c (built-in SukiSU).  Declared before first use. */
@@ -254,37 +257,20 @@ static int susfs_parse_app_list(char *apps, struct susfs_uid_bitmap *map)
 	return 0;
 }
 
-static int susfs_set_uid_filter(const char __user *app_strings,
-				struct susfs_uid_bitmap *map,
-				struct mutex *lock,
-				bool *active,
-				const char *tag)
+/* 从可写的 kernel 缓冲安装过滤器；成功后才替换旧状态。
+ * apps 必须是可修改的缓冲区（strsep 会写它）。 */
+static int susfs_apply_uid_filter(char *apps, struct susfs_uid_bitmap *map,
+				  struct mutex *lock, bool *active,
+				  const char *tag)
 {
-	/* 65540-byte payload — must be heap/vmalloc, never on the kernel stack. */
-	struct susfs_abi_uid_filter *info;
 	struct susfs_uid_bitmap *newmap;
-	int ret = 0;
+	int ret;
 
-	info = kvzalloc(sizeof(*info), GFP_KERNEL);
-	if (!info)
-		return -ENOMEM;
-	if (copy_from_user(info, (const void __user *)app_strings, sizeof(*info))) {
-		kvfree(info);
-		return -EFAULT;
-	}
-	if (!memchr(info->app_strings, '\0', sizeof(info->app_strings))) {
-		kvfree(info);
-		return -EINVAL;
-	}
-
-	/* strsep() modifies the buffer; parse directly from the kvzalloc copy. */
 	newmap = kzalloc(sizeof(*newmap), GFP_KERNEL);
-	if (!newmap) {
-		kvfree(info);
+	if (!newmap)
 		return -ENOMEM;
-	}
-	ret = susfs_parse_app_list(info->app_strings, newmap);
-	kvfree(info);
+
+	ret = susfs_parse_app_list(apps, newmap);
 	if (ret) {
 		/* Unreadable packages.list or nothing resolved: do not silently
 		 * install an empty filter — leave the previous state untouched. */
@@ -299,6 +285,33 @@ static int susfs_set_uid_filter(const char __user *app_strings,
 	kfree(newmap);
 
 	susfs_log("%s filter updated\n", tag);
+	return 0;
+}
+
+static int susfs_set_uid_filter(const char __user *app_strings,
+				struct susfs_uid_bitmap *map,
+				struct mutex *lock,
+				bool *active,
+				const char *tag)
+{
+	/* 65540-byte payload — must be heap/vmalloc, never on the kernel stack. */
+	struct susfs_abi_uid_filter *info;
+	int ret;
+
+	info = kvzalloc(sizeof(*info), GFP_KERNEL);
+	if (!info)
+		return -ENOMEM;
+	if (copy_from_user(info, (const void __user *)app_strings, sizeof(*info))) {
+		kvfree(info);
+		return -EFAULT;
+	}
+	if (!memchr(info->app_strings, '\0', sizeof(info->app_strings))) {
+		kvfree(info);
+		return -EINVAL;
+	}
+
+	ret = susfs_apply_uid_filter(info->app_strings, map, lock, active, tag);
+	kvfree(info);
 	return ret;
 }
 
@@ -501,3 +514,111 @@ out:
 	path_put(&redirect);
 	return ret;
 }
+
+/* ======================================================================= */
+/* /proc/susfs_set_sus_path_uid                                            */
+/* ======================================================================= */
+/*
+ * SET_SUS_PATH_UID_FILTER（0x55554）在官方 CLI 里没有暴露（ksu_susfs --help
+ * 里看不到），只能走 reboot-magic ABI。这里补一个功能等价的 proc 入口，
+ * 写逗号分隔的包名即可（"pkg.a,pkg.b"），便于在 shell 里直接下发和验证。
+ *
+ * 语义与 ABI 完全一致：uid 在名单内 -> 看得到真实路径；名单外 -> 照常隐藏；
+ * 未配置时沿用旧行为（所有 app uid 都隐藏）。
+ */
+#define SUSFS_UID_PROC "susfs_set_sus_path_uid"
+#define SUSFS_UID_TEXT_MAX 1024
+
+static char susfs_uid_filter_text[SUSFS_UID_TEXT_MAX];
+
+static ssize_t susfs_uid_proc_write(struct file *file, const char __user *ubuf,
+				    size_t count, loff_t *ppos)
+{
+	char *kbuf;
+	size_t len;
+	int ret;
+
+	if (!count || count >= SUSFS_UID_TEXT_MAX)
+		return -EINVAL;
+
+	kbuf = memdup_user_nul(ubuf, count);
+	if (IS_ERR(kbuf))
+		return PTR_ERR(kbuf);
+
+	len = strnlen(kbuf, count);
+	while (len && (kbuf[len - 1] == '\n' || kbuf[len - 1] == '\r' ||
+		       kbuf[len - 1] == ' ' || kbuf[len - 1] == '\t'))
+		kbuf[--len] = '\0';
+
+	if (!len) {
+		kfree(kbuf);
+		return -EINVAL;
+	}
+
+	ret = susfs_apply_uid_filter(kbuf, &sus_path_allow,
+				     &sus_path_filter_mutex,
+				     &sus_path_filter_active, "sus_path");
+	if (!ret) {
+		mutex_lock(&sus_path_filter_mutex);
+		strscpy(susfs_uid_filter_text, kbuf,
+			sizeof(susfs_uid_filter_text));
+		mutex_unlock(&sus_path_filter_mutex);
+	}
+	kfree(kbuf);
+
+	return ret ? ret : (ssize_t)count;
+}
+
+static ssize_t susfs_uid_proc_read(struct file *file, char __user *ubuf,
+				   size_t count, loff_t *ppos)
+{
+	char *out;
+	int len;
+	size_t n;
+
+	if (*ppos)
+		return 0;
+
+	out = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!out)
+		return -ENOMEM;
+
+	mutex_lock(&sus_path_filter_mutex);
+	len = READ_ONCE(sus_path_filter_active) ?
+		scnprintf(out, PAGE_SIZE, "1\n%s\n", susfs_uid_filter_text) :
+		scnprintf(out, PAGE_SIZE, "0\n");
+	mutex_unlock(&sus_path_filter_mutex);
+
+	n = min((size_t)len, count);
+	if (copy_to_user(ubuf, out, n)) {
+		kfree(out);
+		return -EFAULT;
+	}
+	kfree(out);
+	*ppos += n;
+	return n;
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
+static const struct proc_ops susfs_uid_proc_fops = {
+	.proc_read  = susfs_uid_proc_read,
+	.proc_write = susfs_uid_proc_write,
+	.proc_lseek = noop_llseek,
+};
+#else
+static const struct file_operations susfs_uid_proc_fops = {
+	.read   = susfs_uid_proc_read,
+	.write  = susfs_uid_proc_write,
+	.llseek = noop_llseek,
+};
+#endif
+
+static int __init susfs_uid_proc_init(void)
+{
+	if (!proc_create(SUSFS_UID_PROC, 0600, NULL, &susfs_uid_proc_fops))
+		return -ENOMEM;
+
+	pr_info("susfs: sus_path uid filter ready (/proc/%s)\n", SUSFS_UID_PROC);
+	return 0;
+}
+device_initcall(susfs_uid_proc_init);

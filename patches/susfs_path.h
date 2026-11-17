@@ -15,4 +15,8 @@ bool susfs_is_inode_sus_path(struct inode *inode);
  * 返回 0 成功，负 errno 失败。语义与 /proc/susfs_add_sus_path 写入一致。 */
 int susfs_path_abi_add(const char *path);
 
+/* 官方 CMD_SUSFS_ADD_SUS_PATH_LOOP：路径可稍后出现/被重建，登记后由定时
+ * 任务周期性重试解析并入普通 sus_path 表。路径暂时不存在也返回 0。 */
+int susfs_path_abi_add_loop(const char *path);
+
 #endif /* _LINUX_SUSFS_PATH_H */

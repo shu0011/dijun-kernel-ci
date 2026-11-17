@@ -125,6 +125,25 @@ out:
 		info.err = -EFAULT;
 }
 
+static void susfs_abi_add_sus_path_loop(void __user **arg)
+{
+	struct susfs_abi_sus_path info = {0};
+	int ret;
+
+	if (copy_from_user(&info, (struct susfs_abi_sus_path __user *)*arg,
+			   sizeof(info))) {
+		info.err = -EFAULT;
+		goto out;
+	}
+	info.target_pathname[sizeof(info.target_pathname) - 1] = '\0';
+	ret = susfs_path_abi_add_loop(info.target_pathname);
+	info.err = ret ? ret : 0;
+out:
+	if (copy_to_user((struct susfs_abi_sus_path __user *)*arg, &info,
+			 sizeof(info)))
+		info.err = -EFAULT;
+}
+
 static void susfs_abi_add_sus_map(void __user **arg)
 {
 	struct susfs_abi_sus_map info = {0};
@@ -159,10 +178,12 @@ static void susfs_abi_add_sus_kstat(void __user **arg)
 		goto out;
 	}
 	info->target_pathname[sizeof(info->target_pathname) - 1] = '\0';
-	/* our kstat model overrides size; other stat fields are ignored because
-	 * we match by inode pointer, not by spoofed numeric attributes. */
-	ret = susfs_kstat_abi_add(info->target_pathname,
-				  (u64)info->spoofed_size, 0);
+	/* 官方语义：
+	 *   ADD_SUS_KSTAT / UPDATE_SUS_KSTAT -> 以当前真实 stat 为快照
+	 *   ADD_SUS_KSTAT_STATICALLY         -> 采用载荷里的 ino/dev/nlink/size/
+	 *                                       atime/mtime/ctime/blocks/blksize
+	 * 两种情况都由 susfs_kstat_abi_add() 处理，override 时全字段生效。 */
+	ret = susfs_kstat_abi_add(info->target_pathname, info);
 	info->err = ret ? ret : 0;
 out:
 	if (copy_to_user((struct susfs_abi_kstat __user *)*arg, info,
@@ -278,8 +299,12 @@ int susfs_reboot_handler(int magic1, int magic2, unsigned int cmd,
 
 	/* sus_path */
 	case SUSFS_ABI_CMD_ADD_SUS_PATH:
-	case SUSFS_ABI_CMD_ADD_SUS_PATH_LOOP:
 		susfs_abi_add_sus_path(arg);
+		return 0;
+	/* ADD_SUS_PATH_LOOP：路径可能稍后才出现 / 被重建，登记到 loop 表由定时
+	 * 任务持续重试解析，解析成功后并入普通 sus_path 表（上游 LOOP 语义）。 */
+	case SUSFS_ABI_CMD_ADD_SUS_PATH_LOOP:
+		susfs_abi_add_sus_path_loop(arg);
 		return 0;
 
 	/* sus_map */
@@ -325,7 +350,8 @@ int susfs_reboot_handler(int magic1, int magic2, unsigned int cmd,
 	}
 
 	/* avc_log_spoofing: bridge exposes a spoofing static key but this build
-	 * has no av-rule table; absorb so official scripts see success. */
+	 * has no av-rule table; absorb so official scripts see success.
+	 * 实测与 SukiSU 管理器的实现不冲突，保持现状（不接管日志内容）。 */
 	case SUSFS_ABI_CMD_ENABLE_AVC_SPOOF:
 		susfs_abi_bool_ok(arg);
 		return 0;

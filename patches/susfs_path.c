@@ -18,6 +18,7 @@
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/init.h>
+#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/limits.h>
 #include <linux/mutex.h>
@@ -31,6 +32,7 @@
 #include <linux/susfs_extra.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
+#include <linux/workqueue.h>
 
 /*
  * The entry list grows on demand.  A fixed 64-entry array is far too small in
@@ -52,6 +54,19 @@ static struct susfs_path_entry *susfs_paths;
 static int susfs_path_count;
 static int susfs_path_cap;
 static DEFINE_MUTEX(susfs_path_mutex);
+
+/*
+ * ADD_SUS_PATH_LOOP：路径可能稍后才创建、或被删除后重建。这里保存路径字符串，
+ * 由 delayed work 周期性地重新 kern_path() 解析；解析成功就并入普通 sus_path 表。
+ * 与上游 LOOP 变体的目标一致（上游由 susfs.c 里的定时任务实现）。
+ */
+#define SUSFS_PATH_LOOP_MAX 256
+#define SUSFS_PATH_LOOP_INTERVAL_MS 30000
+
+static char *susfs_loop_paths[SUSFS_PATH_LOOP_MAX];
+static int susfs_loop_count;
+static DEFINE_MUTEX(susfs_loop_mutex);
+static struct delayed_work susfs_path_loop_work;
 
 /* Doubling growth; caller must hold susfs_path_mutex. */
 static int susfs_path_grow_locked(void)
@@ -143,6 +158,16 @@ static int susfs_path_add(const char *path)
 			path_put(&p);
 			return 0;	/* 已存在 */
 		}
+		/* 同一路径被删除后重建：inode 变了，替换旧 inode 并释放引用，
+		 * 否则 LOOP 重试会把同一路径越积越多、且旧 inode 永远泄漏。 */
+		if (!strcmp(susfs_paths[i].path, path)) {
+			ihold(inode);
+			iput(susfs_paths[i].inode);
+			susfs_paths[i].inode = inode;
+			mutex_unlock(&susfs_path_mutex);
+			path_put(&p);
+			return 0;
+		}
 	}
 	if (susfs_path_count >= susfs_path_cap) {
 		ret = susfs_path_grow_locked();
@@ -166,6 +191,64 @@ static int susfs_path_add(const char *path)
 int susfs_path_abi_add(const char *path)
 {
 	return susfs_path_add(path);
+}
+
+static void susfs_path_loop_work_fn(struct work_struct *work)
+{
+	int i;
+	bool pending;
+
+	/* susfs_path_add() 只取 susfs_path_mutex，这里持 loop 锁在外层，
+	 * 不存在反向加锁路径。 */
+	mutex_lock(&susfs_loop_mutex);
+	for (i = 0; i < susfs_loop_count; i++) {
+		if (susfs_loop_paths[i])
+			susfs_path_add(susfs_loop_paths[i]);
+	}
+	pending = susfs_loop_count > 0;
+	mutex_unlock(&susfs_loop_mutex);
+
+	if (pending)
+		schedule_delayed_work(&susfs_path_loop_work,
+				      msecs_to_jiffies(SUSFS_PATH_LOOP_INTERVAL_MS));
+}
+
+int susfs_path_abi_add_loop(const char *path)
+{
+	int i, ret;
+
+	if (!path || path[0] != '/')
+		return -EINVAL;
+	if (strlen(path) >= SUSFS_PATH_MAX_LEN)
+		return -ENAMETOOLONG;
+
+	mutex_lock(&susfs_loop_mutex);
+	for (i = 0; i < susfs_loop_count; i++) {
+		if (!strcmp(susfs_loop_paths[i], path)) {
+			mutex_unlock(&susfs_loop_mutex);
+			return 0;	/* 已登记 */
+		}
+	}
+	if (susfs_loop_count >= SUSFS_PATH_LOOP_MAX) {
+		mutex_unlock(&susfs_loop_mutex);
+		return -ENOSPC;
+	}
+	susfs_loop_paths[susfs_loop_count] = kstrdup(path, GFP_KERNEL);
+	if (!susfs_loop_paths[susfs_loop_count]) {
+		mutex_unlock(&susfs_loop_mutex);
+		return -ENOMEM;
+	}
+	susfs_loop_count++;
+	mutex_unlock(&susfs_loop_mutex);
+
+	/* 立刻试一次；路径还不存在属于正常情况，LOOP 语义下仍返回成功。 */
+	ret = susfs_path_add(path);
+	if (ret && ret != -ENOENT)
+		return ret;
+
+	schedule_delayed_work(&susfs_path_loop_work,
+			      msecs_to_jiffies(SUSFS_PATH_LOOP_INTERVAL_MS));
+	return 0;
 }
 
 static ssize_t susfs_path_write(struct file *file, const char __user *ubuf,
@@ -261,6 +344,8 @@ static const struct file_operations susfs_path_fops = {
 
 static int __init susfs_path_init(void)
 {
+	INIT_DELAYED_WORK(&susfs_path_loop_work, susfs_path_loop_work_fn);
+
 	if (!proc_create(SUSFS_PATH_PROC, 0600, NULL, &susfs_path_fops))
 		return -ENOMEM;
 

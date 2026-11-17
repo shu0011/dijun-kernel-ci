@@ -17,9 +17,11 @@
  *
  * 只对 app uid（>= 10000）生效。
  */
+#include <linux/atomic.h>
 #include <linux/cred.h>
 #include <linux/dcache.h>
 #include <linux/err.h>
+#include <linux/errno.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -136,14 +138,35 @@ int susfs_mount_abi_add(const char *path)
 }
 
 /* CMD_SUSFS_HIDE_SUS_MNTS_FOR_NON_SU_PROCS:
- * 官方按 mnt_id >= 2000000000 号段整体隐藏（依赖改 fs/namespace.c 的 mount ID
- * 分配）；本项目用显式路径列表（/proc/susfs_add_sus_mount）实现等价效果，
- * 没有号段开关。此 setter 仅吸收命令、返回成功，避免官方脚本因 unsupported
- * 报错；实际隐藏由路径列表负责。 */
+ * 与上游一致：KSU 域进程创建的挂载分配 SUSFS_KSU_MNT_ID_BASE 起始的 mnt_id，
+ * /proc/{mounts,mountinfo,mountstats} 对非 KSU 域进程跳过这些号段。
+ * 显式路径列表（/proc/susfs_add_sus_mount）仍然保留，两者互补。 */
+static bool susfs_hide_mnts_non_su = true;
+static atomic_t susfs_mnt_id_ctr = ATOMIC_INIT(0);
+
+int susfs_mount_next_id(void)
+{
+	int idx = atomic_inc_return(&susfs_mnt_id_ctr);
+
+	if (idx <= 0 || idx > SUSFS_KSU_MNT_ID_MAX)
+		return -ENOSPC;
+
+	return SUSFS_KSU_MNT_ID_BASE + idx;
+}
+
+bool susfs_mount_is_sus_id(int mnt_id)
+{
+	return mnt_id >= SUSFS_KSU_MNT_ID_BASE;
+}
+
+bool susfs_mount_hide_for_non_su(void)
+{
+	return READ_ONCE(susfs_hide_mnts_non_su);
+}
+
 void susfs_mount_abi_set_enabled(bool enabled)
 {
-	/* no-op: path-list based implementation has no global id-range toggle */
-	(void)enabled;
+	WRITE_ONCE(susfs_hide_mnts_non_su, enabled);
 }
 
 static ssize_t susfs_mount_write(struct file *file, const char __user *ubuf,
