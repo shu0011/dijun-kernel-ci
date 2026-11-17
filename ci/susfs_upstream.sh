@@ -118,6 +118,9 @@ skip = {
     "security/selinux/avc.c", "security/selinux/hooks.c",
     "security/selinux/selinuxfs.c", "security/selinux/ss/services.c",
     "security/selinux/status.c",
+    # task_mmu.c：官方 hunk 的上下文在 6.18 命中了别的函数（__VM_NO_COMPAT 是 6.12 的），
+    # 模糊匹配插错位置 → 先跳过，sus_map 的展示钩子下一轮单独补。
+    "fs/proc/task_mmu.c",
 }
 chunks, cur, name = [], [], None
 for ln in open(patch_file).read().split("\n"):
