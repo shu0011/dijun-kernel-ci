@@ -794,6 +794,7 @@ else:
     print("    ---- show_smaps_rollup 实际源码 begin ----")
     print(s[i:end + 3] if end > 0 else s[i:i + 6000])
     print("    ---- show_smaps_rollup 实际源码 end ----")
+    snap = s
     try:
         j = s.find("\tdo {\n", i)
         assert j >= 0, "do 循环没找到"
@@ -810,7 +811,7 @@ else:
         print("    rollup 已注入")
     except AssertionError as e:
         print("    WARN: rollup 注入失败（%s），本轮跳过" % e)
-        s = open(p).read()
+        s = snap
 
 # pagemap 是次要路径：锚点找不到就告警跳过，不阻塞构建
 i = s.find("while (count && (start_vaddr < end_vaddr)) {")
