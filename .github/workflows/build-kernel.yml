@@ -3,7 +3,7 @@ name: build-dijun-kernel
 on:
   workflow_dispatch:
   push:
-    branches: [main, upstream-align, feat/kernel-owner-exempt]
+    branches: [main, upstream-align, feat/kernel-owner-exempt, finasu-v23-compat]
 
 concurrency:
   group: build-dijun-${{ github.ref }}
@@ -157,6 +157,43 @@ jobs:
           set -o pipefail
           mkdir -p out
           bash ci/integrate.sh 2>&1 | tee out/integrate.log
+
+      # finasu-v23-compat: 内核信任的管理器签名必须跟随官方最新版，
+      # 不能写死证书 —— 否则编出信任 v1.5 的内核，用户却装了 v1.6 管理器，
+      # 签名对不上就拿不到 root。这里从 releases/latest 现取 APK 解出证书。
+      - name: 抓取 FinaSU 最新管理器签名
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/LyraVoid/FinaSU"
+          AUTH=()
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+          fi
+          get() { curl -fsSL ${AUTH[@]+"${AUTH[@]}"} "$1"; }
+
+          tag=$(get "$api/releases/latest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+          echo "管理器版本: $tag"
+          # 优先挑名字含 release 的 .apk（避开 debug / kernel-bundle）
+          url=$(get "$api/releases/tags/$tag" | python3 -c '
+          import json,sys
+          d=json.load(sys.stdin)
+          a=[x for x in d["assets"] if x["name"].endswith(".apk")]
+          p=[x for x in a if "release" in x["name"]] or a
+          print(p[0]["browser_download_url"] if p else "")')
+          if [ -z "$url" ]; then
+            echo "::error::LyraVoid/FinaSU release $tag 里没有 apk 资产"
+            exit 1
+          fi
+          echo "下载: $url"
+          curl -fsSL --retry 3 --max-time 180 -o "$GITHUB_WORKSPACE/manager.apk" "$url"
+          ls -l "$GITHUB_WORKSPACE/manager.apk"
+          python3 tools/manager_identity.py "$GITHUB_WORKSPACE/manager.apk" | tee "$GITHUB_WORKSPACE/mgr.txt"
+          # manager_identity.py 默认输出 key=value，直接进 $GITHUB_ENV
+          cat "$GITHUB_WORKSPACE/mgr.txt" >> "$GITHUB_ENV"
+          echo "MANAGER_TAG=$tag" >> "$GITHUB_ENV"
+          # 映射到 build.sh 读的变量名
+          echo "MANAGER_CERT_SIZE=$(awk -F= '/^cert_size=/{print $2}' "$GITHUB_WORKSPACE/mgr.txt")" >> "$GITHUB_ENV"
+          echo "MANAGER_CERT_HASH=$(awk -F= '/^cert_sha256=/{print $2}' "$GITHUB_WORKSPACE/mgr.txt")" >> "$GITHUB_ENV"
 
       - name: 编译 Image 并抽取 BTF
         run: |

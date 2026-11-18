@@ -23,6 +23,21 @@ CFG="${CFG:-config/dijun_defconfig}"
 JOBS="${JOBS:-$(nproc)}"
 LLVM_SUFFIX="${LLVM_SUFFIX:--18}"
 
+# ---- finasu-v23-compat: 管理器信任签名（CI 从 releases/latest 现取）----
+# SukiSU-Nova 的 drivers/kernelsu/Kbuild 用 KSU_EXPECTED_SIZE/HASH（单槽位，?= 可覆盖）。
+# 这里用 make 命令行变量覆盖，让内核信任 FinaSU 管理器而非默认的 SukiSU Nova。
+# 值由 workflow 的「抓取 FinaSU 最新管理器签名」一步经环境变量注入；本地直编时
+# 若未提供，就退回官方默认的 com.sukisu.nova 签名（不会破坏其它分支）。
+KSU_SIGN_MAKE_ARGS=()
+if [ -n "${MANAGER_CERT_SIZE:-}" ] && [ -n "${MANAGER_CERT_HASH:-}" ]; then
+    KSU_SIGN_MAKE_ARGS+=("KSU_EXPECTED_SIZE=${MANAGER_CERT_SIZE}")
+    KSU_SIGN_MAKE_ARGS+=("KSU_EXPECTED_HASH=${MANAGER_CERT_HASH}")
+    echo "==> 管理器信任槽: size=${MANAGER_CERT_SIZE} hash=${MANAGER_CERT_HASH}"
+    echo "    ${MANAGER_TAG:-FinaSU@latest}"
+else
+    echo "==> 未提供 MANAGER_CERT_*，使用内核默认签名（SukiSU Nova）"
+fi
+
 # LLVM=1 要求 PATH 里有不带后缀的 clang/ld.lld/llvm-objcopy；
 # 只有 ubuntu 的 clang-18 时要用 LLVM=-18 走带后缀的工具链。
 # AOSP 预编译 clang 自带这些名字，用 LLVM=1 才能让 POR_EL0 之类的
@@ -296,7 +311,7 @@ print("    mkcompile_h 已改为输出官方编译器串")
 PY
 
 echo "==> 5 编译 Image（$JOBS 并发）"
-make -C "$SRC" ARCH=arm64 LLVM="$LLVM_VAL" $RUST_ARGS -j"$JOBS" Image
+make -C "$SRC" ARCH=arm64 LLVM="$LLVM_VAL" $RUST_ARGS "${KSU_SIGN_MAKE_ARGS[@]}" -j"$JOBS" Image
 
 echo "==> 6 抽取 .BTF 与产物"
 cp "$SRC/arch/arm64/boot/Image" "$OUT/Image"

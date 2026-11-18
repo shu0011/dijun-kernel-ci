@@ -26,7 +26,7 @@
 #define SUSFS_CMD_SHOW_VARIANT          0x000555E3
 
 /* This kernel is a GKI port of the 6.12 / susfs v2.4.0 source. */
-#define SUSFS_REPORT_VERSION  "v2.4.0"
+#define SUSFS_REPORT_VERSION  "v2.3.0"
 #define SUSFS_REPORT_VARIANT  "GKI"
 
 /* payload layouts — must match #[repr(C)] structs in userspace types.rs */
