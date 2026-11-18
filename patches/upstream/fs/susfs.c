@@ -883,22 +883,20 @@ static DEFINE_HASHTABLE(SUS_PATH_OWNER_HLIST, 10);
 
 /*
  * Extracts the app package name from a pathname of the form
- * '.../Android/data/<pkg>' or '.../Android/media/<pkg>', resolves its uid
- * and stores it in 'uid'.
+ * '.../Android/data/<pkg>' or '.../Android/media/<pkg>' into 'app_name'.
  * Returns 0 on success, a negative errno if the pathname does not belong to
- * an app data directory or the uid cannot be resolved.
+ * an app data directory or the package name is invalid.
  */
-static int susfs_owner_uid_from_pathname(const char *pathname, uid_t *uid)
+static int susfs_owner_app_name_from_pathname(const char *pathname, char *app_name, size_t size)
 {
 	static const char * const tags[] = { "/Android/data/", "/Android/media/" };
-	char app_name[SUSFS_MAX_LEN_PATHNAME];
 	const char *app = NULL;
 	const char *p = NULL;
 	size_t len = 0;
 	size_t tag_len;
 	int i;
 
-	if (!pathname || !uid)
+	if (!pathname || !app_name || !size)
 		return -EINVAL;
 
 	for (i = 0; i < 2; i++) {
@@ -918,7 +916,7 @@ static int susfs_owner_uid_from_pathname(const char *pathname, uid_t *uid)
 	while (len > 0 && app[len - 1] == '/')
 		len--;
 
-	if (!len || len >= sizeof(app_name))
+	if (!len || len >= size)
 		return -ENOENT;
 
 	memcpy(app_name, app, len);
@@ -931,7 +929,7 @@ static int susfs_owner_uid_from_pathname(const char *pathname, uid_t *uid)
 	if (!susfs_is_valid_sus_path_app_name(app_name))
 		return -EINVAL;
 
-	return susfs_resolve_sus_path_app_uid(app_name, uid);
+	return 0;
 }
 
 /*
@@ -944,6 +942,7 @@ static void susfs_owner_record(struct inode *inode, const char *pathname)
 	struct susfs_sus_path_owner *tmp = NULL;
 	struct hlist_node *tmp_node = NULL;
 	const struct cred *saved = NULL;
+	char app_name[SUSFS_MAX_LEN_PATHNAME];
 	unsigned long key;
 	uid_t uid = 0;
 	int err;
@@ -961,6 +960,11 @@ static void susfs_owner_record(struct inode *inode, const char *pathname)
 	}
 	rcu_read_unlock();
 
+	/* cheap check first: most sus paths are not app data dirs at all */
+	err = susfs_owner_app_name_from_pathname(pathname, app_name, sizeof(app_name));
+	if (err)
+		return;
+
 	/*
 	 * The caller may not be able to read /data/system/packages.list with
 	 * its own credentials (it can even be a kworker), hence the KernelSU
@@ -970,7 +974,7 @@ static void susfs_owner_record(struct inode *inode, const char *pathname)
 	if (!ksu_cred)
 		return;
 	saved = override_creds(ksu_cred);
-	err = susfs_owner_uid_from_pathname(pathname, &uid);
+	err = susfs_resolve_sus_path_app_uid(app_name, &uid);
 	revert_creds(saved);
 	if (err)
 		return;
