@@ -851,3 +851,89 @@ else:
 open(p, "w").write(s)
 print("    task_mmu.c: sus_map 展示隐藏已处理")
 PYP
+echo "==> [upstream] namespace.c 补齐官方 sus_mount 的四个隐藏门"
+# 官方 6.12 补丁在 namespace.c 里除了 alloc/clone/free，还有四处“号段挂载对
+# umounted 进程不可见”的门。缺任何一处，app 都能通过路径解析 / statmount /
+# listmount 看到 KSU 模块挂载。这里一次性补齐。
+python3 - "$SRC/fs/namespace.c" <<'PYP'
+import sys
+
+p = sys.argv[1]
+s = open(p).read()
+if "susfs __lookup_mnt gate" in s:
+    print("    已注入过")
+    raise SystemExit(0)
+
+def warn(msg):
+    print("    WARN: " + msg + "（本轮跳过该项）")
+
+# 1) __lookup_mnt
+i = s.find("struct mount *__lookup_mnt(struct vfsmount *mnt, struct dentry *dentry)")
+a = ("\thlist_for_each_entry_rcu(p, head, mnt_hash)\n"
+     "\t\tif (&p->mnt_parent->mnt == mnt && p->mnt_mountpoint == dentry)\n"
+     "\t\t\treturn p;\n")
+if i < 0:
+    warn("__lookup_mnt 没找到")
+elif a not in s[i:]:
+    warn("__lookup_mnt 循环锚点没找到")
+else:
+    b = ("#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+         "\t/* susfs __lookup_mnt gate: umounted 进程只解析到非号段挂载 */\n"
+         "\tif (susfs_is_current_proc_umounted()) {\n"
+         "\t\thlist_for_each_entry_rcu(p, head, mnt_hash)\n"
+         "\t\t\tif (p->mnt_id < DEFAULT_KSU_MNT_ID &&\n"
+         "\t\t\t    &p->mnt_parent->mnt == mnt && p->mnt_mountpoint == dentry)\n"
+         "\t\t\t\treturn p;\n"
+         "\t\treturn NULL;\n"
+         "\t}\n"
+         "#endif\n")
+    s = s[:i] + b + s[i:]
+
+# 2) mnt_find_id_at
+i = s.find("static struct mount *mnt_find_id_at(struct mnt_namespace *ns, u64 mnt_id)")
+if i < 0:
+    warn("mnt_find_id_at 没找到")
+else:
+    j = s.find("\treturn ret;\n}", i)
+    if j < 0:
+        warn("mnt_find_id_at 返回锚点没找到")
+    else:
+        b = ("#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+             "\tif (ret && ret->mnt_id >= DEFAULT_KSU_MNT_ID &&\n"
+             "\t    susfs_is_current_proc_umounted())\n"
+             "\t\treturn NULL;\n"
+             "#endif\n")
+        s = s[:j] + b + s[j:]
+
+# 3) lookup_mnt_in_ns
+i = s.find("static struct vfsmount *lookup_mnt_in_ns(u64 id, struct mnt_namespace *ns)")
+if i < 0:
+    warn("lookup_mnt_in_ns 没找到")
+else:
+    j = s.find("\treturn &mnt->mnt;\n", i)
+    if j < 0:
+        warn("lookup_mnt_in_ns 返回锚点没找到")
+    else:
+        b = ("#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+             "\tif (mnt->mnt_id >= DEFAULT_KSU_MNT_ID &&\n"
+             "\t    susfs_is_current_proc_umounted())\n"
+             "\t\treturn NULL;\n"
+             "#endif\n")
+        s = s[:j] + b + s[j:]
+
+# 4) do_listmount
+a = ("\t\tif (r->mnt_id_unique == mnt_parent_id)\n"
+     "\t\t\tcontinue;\n")
+if a not in s:
+    warn("do_listmount 锚点没找到")
+else:
+    b = ("#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+         "\t\tif (r->mnt_id >= DEFAULT_KSU_MNT_ID &&\n"
+         "\t\t    susfs_is_current_proc_umounted())\n"
+         "\t\t\tcontinue;\n"
+         "#endif\n")
+    s = s.replace(a, a + b, 1)
+
+open(p, "w").write(s)
+print("    namespace 四个隐藏门处理完成")
+PYP
