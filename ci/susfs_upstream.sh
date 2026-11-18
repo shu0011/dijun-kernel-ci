@@ -719,8 +719,8 @@ open(p, "w").write(s)
 print("    setuid_hook.c: 官方 LOOP 调度已接入")
 PYP
 echo "==> [upstream] 6.18 适配：fs/proc/task_mmu.c（sus_map 展示隐藏）"
-# 官方 6.12 补丁的 task_mmu hunk 在 6.18 上下文对不上（VMA_PAD_START/__VM_NO_COMPAT 等），
-# 这里按 6.18 的实际结构补等价实现：show_map_vma / show_smap / show_smaps_rollup / pagemap_read。
+# 官方 6.12 补丁的 task_mmu hunk 在 6.18 上下文对不上（VMA_PAD_START/__VM_NO_COMPAT 等）。
+# 这里按 6.18 快照分支的实际源码做“按函数定位”的注入，不依赖 include 的具体排列。
 python3 - "$SRC/fs/proc/task_mmu.c" <<'PYP'
 import sys
 
@@ -731,86 +731,75 @@ if "SUSFS_IS_INODE_SUS_MAP" in s:
     print("    已注入过")
     raise SystemExit(0)
 
-inc = "#include <linux/buildid.h>\n\n#include <asm/elf.h>\n"
-assert inc in s, "task_mmu.c: include 锚点没找到"
-s = s.replace(inc,
-              "#include <linux/buildid.h>\n"
+# 1) include：挑一个一定存在的 include，紧跟其后插入
+inc = None
+for cand in ("#include <linux/buildid.h>\n",
+             "#include <linux/overflow.h>\n",
+             "#include <linux/seq_file.h>\n"):
+    if cand in s:
+        inc = cand
+        break
+assert inc, "task_mmu.c: 找不到可用的 include 锚点"
+s = s.replace(inc, inc +
               "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
               "#include <linux/susfs_def.h>\n"
-              "#endif\n\n"
-              "#include <asm/elf.h>\n", 1)
-
-a1 = "\tdev_t dev = 0;\n\n\tif (vma->vm_file) {\n"
-assert a1 in s, "task_mmu.c: show_map_vma 锚点没找到"
-s = s.replace(a1,
-              "\tdev_t dev = 0;\n\n"
-              "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-              "\tif (vma->vm_file &&\n"
-              "\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
-              "\t\treturn;\n"
-              "#endif\n\n"
-              "\tif (vma->vm_file) {\n", 1)
-
-a2 = "\tstruct mem_size_stats mss = {};\n\n\tsmap_gather_stats(vma, &mss, 0);\n"
-assert a2 in s, "task_mmu.c: show_smap 锚点没找到"
-s = s.replace(a2,
-              "\tstruct mem_size_stats mss = {};\n\n"
-              "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-              "\tif (vma->vm_file &&\n"
-              "\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
-              "\t\treturn 0;\n"
-              "#endif\n\n"
-              "\tsmap_gather_stats(vma, &mss, 0);\n", 1)
-
-a3 = ("\tvma_start = vma->vm_start;\n"
-      "\tdo {\n"
-      "\t\tsmap_gather_stats(vma, &mss, 0);\n"
-      "\t\tlast_vma_end = vma->vm_end;\n")
-assert a3 in s, "task_mmu.c: show_smaps_rollup 锚点没找到"
-s = s.replace(a3,
-              "\tvma_start = vma->vm_start;\n"
-              "\tdo {\n"
-              "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-              "\t\tif (vma->vm_file &&\n"
-              "\t\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
-              "\t\t\tgoto bypass_sus_map;\n"
-              "#endif\n"
-              "\t\tsmap_gather_stats(vma, &mss, 0);\n"
-              "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-              "bypass_sus_map:\n"
-              "#endif\n"
-              "\t\tlast_vma_end = vma->vm_end;\n", 1)
-
-a4 = ("\twhile (count && (start_vaddr < end_vaddr)) {\n"
-      "\t\tint len;\n"
-      "\t\tunsigned long end;\n")
-assert a4 in s, "task_mmu.c: pagemap_read 循环锚点没找到"
-s = s.replace(a4, a4 +
-              "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-              "\t\tstruct vm_area_struct *vma;\n"
               "#endif\n", 1)
 
-a5 = ("\t\tret = mmap_read_lock_killable(mm);\n"
-      "\t\tif (ret)\n"
-      "\t\t\tgoto out_free;\n"
-      "\t\tret = walk_page_range(mm, start_vaddr, end, &pagemap_ops, &pm);\n"
-      "\t\tmmap_read_unlock(mm);\n")
-assert a5 in s, "task_mmu.c: pagemap_read walk 锚点没找到"
-s = s.replace(a5,
-              "\t\tret = mmap_read_lock_killable(mm);\n"
-              "\t\tif (ret)\n"
-              "\t\t\tgoto out_free;\n"
-              "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-              "\t\tvma = vma_lookup(mm, start_vaddr);\n"
-              "\t\tif (vma && vma->vm_file &&\n"
-              "\t\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
-              "\t\t\tgoto bypass_sus_map_page;\n"
-              "#endif\n"
-              "\t\tret = walk_page_range(mm, start_vaddr, end, &pagemap_ops, &pm);\n"
-              "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-              "bypass_sus_map_page:\n"
-              "#endif\n"
-              "\t\tmmap_read_unlock(mm);\n", 1)
+# 2) show_map_vma：在函数内第一个 if (vma->vm_file) 之前跳过
+i = s.find("show_map_vma(struct seq_file *m, struct vm_area_struct *vma)")
+assert i >= 0, "task_mmu.c: show_map_vma 没找到"
+j = s.find("\tif (vma->vm_file) {", i)
+assert j >= 0, "task_mmu.c: show_map_vma 的 vm_file 分支没找到"
+s = s[:j] + ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+             "\tif (vma->vm_file &&\n"
+             "\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
+             "\t\treturn;\n"
+             "#endif\n") + s[j:]
+
+# 3) show_smap：在第一个 smap_gather_stats 之前跳过（此时声明已结束）
+i = s.find("static int show_smap(struct seq_file *m, void *v)")
+assert i >= 0, "task_mmu.c: show_smap 没找到"
+j = s.find("\tsmap_gather_stats(vma, &mss, 0);", i)
+assert j >= 0, "task_mmu.c: show_smap 的 smap_gather_stats 没找到"
+s = s[:j] + ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+             "\tif (vma->vm_file &&\n"
+             "\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
+             "\t\treturn 0;\n"
+             "#endif\n") + s[j:]
+
+# 4) show_smaps_rollup：do { 之后判断，命中则跳过统计但仍推进 last_vma_end
+i = s.find("static int show_smaps_rollup(struct seq_file *m, void *v)")
+assert i >= 0, "task_mmu.c: show_smaps_rollup 没找到"
+j = s.find("\tdo {\n", i)
+assert j >= 0, "task_mmu.c: show_smaps_rollup 的 do 循环没找到"
+s = s[:j] + ("\tdo {\n"
+             "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+             "\t\tif (vma->vm_file &&\n"
+             "\t\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
+             "\t\t\tgoto bypass_sus_map;\n"
+             "#endif\n") + s[j + len("\tdo {\n"):]
+k = s.find("\t\tsmap_gather_stats(vma, &mss, 0);", i)
+assert k >= 0, "task_mmu.c: rollup 的 smap_gather_stats 没找到"
+s = s[:k] + "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\nbypass_sus_map:\n#endif\n" + s[k:]
+
+# 5) pagemap_read：跳过命中 VMA 的页表遍历
+i = s.find("while (count && (start_vaddr < end_vaddr)) {")
+assert i >= 0, "task_mmu.c: pagemap_read 循环没找到"
+j = s.find("\n", i) + 1
+s = s[:j] + ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+             "\t\tstruct vm_area_struct *vma;\n"
+             "#endif\n") + s[j:]
+walk = "\t\tret = walk_page_range(mm, start_vaddr, end, &pagemap_ops, &pm);"
+k = s.find(walk, i)
+assert k >= 0, "task_mmu.c: pagemap_read 的 walk_page_range 没找到"
+s = s[:k] + ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+             "\t\tvma = vma_lookup(mm, start_vaddr);\n"
+             "\t\tif (vma && vma->vm_file &&\n"
+             "\t\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
+             "\t\t\tgoto bypass_sus_map_page;\n"
+             "#endif\n") + s[k:]
+k2 = s.find(walk, k) + len(walk)
+s = s[:k2] + "\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\nbypass_sus_map_page:\n#endif" + s[k2:]
 
 open(p, "w").write(s)
 print("    task_mmu.c: sus_map 展示隐藏已注入")
