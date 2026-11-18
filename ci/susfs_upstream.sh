@@ -720,7 +720,8 @@ print("    setuid_hook.c: 官方 LOOP 调度已接入")
 PYP
 echo "==> [upstream] 6.18 适配：fs/proc/task_mmu.c（sus_map 展示隐藏）"
 # 官方 6.12 补丁的 task_mmu hunk 在 6.18 上下文对不上（VMA_PAD_START/__VM_NO_COMPAT 等）。
-# 这里按 6.18 快照分支的实际源码做“按函数定位”的注入，不依赖 include 的具体排列。
+# 2026-06 快照里 smap_gather_stats() 还是两参数版本，所以这里不匹配函数调用形态，
+# 只按“函数定义 + 声明块/do 循环”定位。
 python3 - "$SRC/fs/proc/task_mmu.c" <<'PYP'
 import sys
 
@@ -756,18 +757,24 @@ s = s[:j] + ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
              "\t\treturn;\n"
              "#endif\n") + s[j:]
 
-# 3) show_smap：在第一个 smap_gather_stats 之前跳过（此时声明已结束）
+# 3) show_smap：插在声明块结束之后（不依赖 smap_gather_stats 的参数个数）
 i = s.find("static int show_smap(struct seq_file *m, void *v)")
 assert i >= 0, "task_mmu.c: show_smap 没找到"
-j = s.find("\tsmap_gather_stats(vma, &mss, 0);", i)
-assert j >= 0, "task_mmu.c: show_smap 的 smap_gather_stats 没找到"
+mss = "\tstruct mem_size_stats mss = {};\n"
+j = s.find(mss, i)
+if j >= 0:
+    j += len(mss)
+else:
+    b = s.find("\n\n", s.find("{", i))
+    assert b >= 0, "task_mmu.c: show_smap 声明块没找到"
+    j = b + 2
 s = s[:j] + ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
              "\tif (vma->vm_file &&\n"
              "\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
              "\t\treturn 0;\n"
              "#endif\n") + s[j:]
 
-# 4) show_smaps_rollup：do { 之后判断，命中则跳过统计但仍推进 last_vma_end
+# 4) show_smaps_rollup：do { 之后判断；标签插在首个 smap_gather_stats 行之前
 i = s.find("static int show_smaps_rollup(struct seq_file *m, void *v)")
 assert i >= 0, "task_mmu.c: show_smaps_rollup 没找到"
 j = s.find("\tdo {\n", i)
@@ -778,8 +785,9 @@ s = s[:j] + ("\tdo {\n"
              "\t\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
              "\t\t\tgoto bypass_sus_map;\n"
              "#endif\n") + s[j + len("\tdo {\n"):]
-k = s.find("\t\tsmap_gather_stats(vma, &mss, 0);", i)
-assert k >= 0, "task_mmu.c: rollup 的 smap_gather_stats 没找到"
+m = s.find("smap_gather_stats(vma, &mss", i)
+assert m >= 0, "task_mmu.c: rollup 的 smap_gather_stats 没找到"
+k = s.rfind("\n", 0, m) + 1
 s = s[:k] + "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\nbypass_sus_map:\n#endif\n" + s[k:]
 
 # 5) pagemap_read：跳过命中 VMA 的页表遍历
