@@ -3,7 +3,7 @@ name: build-dijun-kernel
 on:
   workflow_dispatch:
   push:
-    branches: [main, upstream-align]
+    branches: [main, upstream-align, feat/kernel-owner-exempt]
 
 concurrency:
   group: build-dijun-${{ github.ref }}
