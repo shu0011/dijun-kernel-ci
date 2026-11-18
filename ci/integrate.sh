@@ -55,12 +55,14 @@ config KSU_SUSFS
 	  spoof uname/cmdline，以及 ksu_susfs 命令字 ABI。
 
 config KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
-	bool "Hide ksu/susfs symbols from /proc/kallsyms"
+	bool "Hide ksu/susfs symbols from /proc/kallsyms (v2.4 only)"
 	depends on KSU_SUSFS
-	default y
+	default n
 	help
-	  Upstream SUSFS 的符号隐藏：在 kernel/kallsyms.c 的 s_show() 里按前缀
-	  过滤 ksu_/susfs_ 等符号名。编译期实现，零 kprobe。
+	  Upstream SUSFS v2.4 新增功能。FinaSU 管理器按 v2.3 协议工作，不识别
+	  此 feature，实测 v2.4 功能集会导致重启。fina su 分支关闭以匹配 v2.3。
+	  在 kernel/kallsyms.c 的 s_show() 里按前缀过滤 ksu_/susfs_ 符号；
+	  关闭时走原厂裸 seq_printf，无 kprobe 残留。
 
 config KSU_SUSFS_ENABLE_LOG
 	bool "Enable SUSFS kernel logging (static key)"
@@ -77,10 +79,12 @@ config KSU_SUSFS_OPEN_REDIRECT
 	  Redirect a target path to a user-defined path on openat.
 
 config KSU_SUSFS_PRIORITY_UID_FILTER
-	bool "Enable SUSFS priority UID filter"
+	bool "Enable SUSFS priority UID filter (v2.4 only)"
 	depends on KSU_SUSFS
-	default y
+	default n
 	help
+	  Upstream SUSFS v2.4 新增功能。FinaSU 管理器按 v2.3 协议工作，不识别
+	  此 feature，实测 v2.4 功能集会导致重启。fina su 分支关闭以匹配 v2.3。
 	  Hide user-defined uids from get/setpriority and ioprio syscalls.
 	  (SUS_PATH_UID_FILTER shares the SUS_PATH gate; it has no own CONFIG.)
 
