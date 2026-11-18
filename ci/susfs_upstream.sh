@@ -799,34 +799,28 @@ s = s[:j] + ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
              "\t\treturn 0;\n"
              "#endif\n") + s[j:]
 
-# ---- rollup：打印真实源码，注入失败不阻塞 ----
+# ---- rollup：6.18.21 的实际结构是 while (vma) + smap_gather_stats(priv, ...) ----
 i = s.find("static int show_smaps_rollup(struct seq_file *m, void *v)")
 if i < 0:
     print("    WARN: show_smaps_rollup 没找到，跳过")
 else:
-    end = s.find("\n}\n", i)
-    print("    ---- show_smaps_rollup 实际源码 begin ----")
-    print(s[i:end + 3] if end > 0 else s[i:i + 6000])
-    print("    ---- show_smaps_rollup 实际源码 end ----")
     snap = s
     try:
-        j = s.find("\tdo {\n", i)
-        assert j >= 0, "do 循环没找到"
-        s = s[:j] + ("\tdo {\n"
+        j = s.find("\twhile (vma) {\n", i)
+        assert j >= 0, "while (vma) 没找到"
+        s = s[:j] + ("\twhile (vma) {\n"
                      "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-                     "\t\tif (vma->vm_file &&\n"
+                     "\t\tif (!IS_ERR(vma) && vma->vm_file &&\n"
                      "\t\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
                      "\t\t\tgoto bypass_sus_map;\n"
-                     "#endif\n") + s[j + len("\tdo {\n"):]
-        m = s.find("last_vma_end = vma->vm_end;", j)
-        assert m >= 0, "last_vma_end 没找到"
-        k = s.rfind("\n", 0, m) + 1
+                     "#endif\n") + s[j + len("\twhile (vma) {\n"):]
+        k = s.find("\t\tlast_vma_end = vma->vm_end;\n", j)
+        assert k >= 0, "last_vma_end 没找到"
         s = s[:k] + "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\nbypass_sus_map:\n#endif\n" + s[k:]
         print("    rollup 已注入")
     except AssertionError as e:
         print("    WARN: rollup 注入失败（%s），本轮跳过" % e)
         s = snap
-
 # pagemap 是次要路径：锚点找不到就告警跳过，不阻塞构建
 i = s.find("while (count && (start_vaddr < end_vaddr)) {")
 walk = "\t\tret = walk_page_range(mm, start_vaddr, end, &pagemap_ops, &pm);"
