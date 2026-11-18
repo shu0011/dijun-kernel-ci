@@ -459,6 +459,20 @@ clone_block = clone_anchor + (
     "\t}\n"
     "#endif\n")
 s = s.replace(clone_anchor, clone_block, 1)
+# 4b) copy_mnt_ns：必须真的把 CL_COPY_MNT_NS 打进 copy_flags，
+#     否则 clone_mnt 里“unshare 复用旧 mnt_id”的分支永远不会执行，
+#     su/ksu 命名空间会整树变成 20000xxxxx 高号段（检测器/银行 App 的
+#     fdinfo 与 mountinfo 交叉校验会直接命中）。
+copy_anchor = "\tcopy_flags = CL_COPY_UNBINDABLE | CL_EXPIRE;\n"
+assert copy_anchor in s, "namespace.c: copy_mnt_ns 锚点没找到"
+if "copy_flags |= CL_COPY_MNT_NS;" not in s:
+    s = s.replace(copy_anchor, copy_anchor +
+                  "#ifdef CONFIG_KSU_SUSFS\n"
+                  "\tcopy_flags |= CL_COPY_MNT_NS;\n"
+                  "#endif\n", 1)
+    print("    copy_mnt_ns 已注入 CL_COPY_MNT_NS")
+else:
+    print("    copy_mnt_ns 已注入过 CL_COPY_MNT_NS")
 
 # 5) 追加官方三个 non-sus 辅助函数（proc_namespace / proc/fd / statfs 都要用）
 assert "fs_initcall(init_fs_namespace_sysctls);" in s, "namespace.c: 尾部锚点没找到"
