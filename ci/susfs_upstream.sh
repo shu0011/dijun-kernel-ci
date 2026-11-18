@@ -663,3 +663,58 @@ open(p, "w").write(s)
 print("    namei.c: open_redirect 已注入（path_openat + vfs_readlink）")
 PY
 
+echo "==> [upstream] 接官方 LOOP 调度（ADD_SUS_PATH_LOOP 落地）"
+# 官方 10_enable_susfs_for_ksu.patch 在 KernelSU 的 setresuid 钩子里调度
+# susfs_extra_works；没有这一步，susfs_add_sus_path_loop() 只入队、永远不落地。
+# 这里按官方位置接到 SukiSU-Nova 的 kernel/hook/setuid_hook.c。
+python3 - "$SRC/drivers/kernelsu/hook/setuid_hook.c" <<'PYP'
+import os
+import sys
+
+p = sys.argv[1]
+assert os.path.exists(p), "setuid_hook.c 不存在: " + p
+s = open(p).read()
+
+if "ksu_handle_extra_susfs_work" in s:
+    print("    setuid_hook.c 已注入过")
+    raise SystemExit(0)
+
+inc_anchor = "#include <linux/uidgid.h>\n"
+assert inc_anchor in s, "setuid_hook.c: include 锚点没找到"
+s = s.replace(inc_anchor, inc_anchor +
+              "#ifdef CONFIG_KSU_SUSFS\n"
+              "#include <linux/workqueue.h>\n"
+              "#endif\n", 1)
+
+hook_anchor = "int ksu_handle_setresuid(uid_t old_uid, uid_t new_uid)\n{\n"
+assert hook_anchor in s, "setuid_hook.c: ksu_handle_setresuid 锚点没找到"
+hook_block = (
+    "#ifdef CONFIG_KSU_SUSFS\n"
+    "/* 官方 10_enable_susfs_for_ksu.patch 的 ksu_handle_extra_susfs_work()：\n"
+    " * ADD_SUS_PATH_LOOP 只负责入队，必须由 app spawn（setresuid）驱动才落地。\n"
+    " * 只在 app / isolated 进程真正被 spawn 时调度，避免 zygote 阶段阻塞。 */\n"
+    "extern struct work_struct susfs_extra_works;\n"
+    "\n"
+    "static inline void ksu_handle_extra_susfs_work(void)\n"
+    "{\n"
+    "    if (work_pending(&susfs_extra_works))\n"
+    "        return;\n"
+    "    schedule_work(&susfs_extra_works);\n"
+    "}\n"
+    "#endif\n"
+    "\n"
+)
+s = s.replace(hook_anchor, hook_block + hook_anchor, 1)
+
+umount_anchor = "    // Handle kernel umount\n    ksu_handle_umount(old_uid, new_uid);\n"
+assert umount_anchor in s, "setuid_hook.c: ksu_handle_umount 锚点没找到"
+s = s.replace(umount_anchor, umount_anchor +
+              "#ifdef CONFIG_KSU_SUSFS\n"
+              "    if (is_isolated_process(new_uid) ||\n"
+              "        (is_appuid(new_uid) && ksu_uid_should_umount(new_uid)))\n"
+              "        ksu_handle_extra_susfs_work();\n"
+              "#endif\n", 1)
+
+open(p, "w").write(s)
+print("    setuid_hook.c: 官方 LOOP 调度已接入")
+PYP
