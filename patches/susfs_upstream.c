@@ -54,6 +54,12 @@ bool susfs_ksu_proc_umounted(void)
 		return false;
 	if (susfs_is_current_ksu_domain())
 		return false;
+	/* 官方 TIF_PROC_UMOUNTED 对 isolated 进程（app zygote 90000-98999、
+	 * classic isolated 99000-99999）无条件打标；这里补上同样的语义，
+	 * 否则 Play Integrity / Authenticator 这类在 isolated 进程里做检测的
+	 * 应用会看到 mountinfo 被过滤、而 fdinfo/__lookup_mnt 仍走未 umount 分支。 */
+	if (uid >= 90000 && uid <= 99999)
+		return true;
 	return ksu_uid_should_umount(uid);
 }
 
