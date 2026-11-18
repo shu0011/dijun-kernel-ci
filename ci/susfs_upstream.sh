@@ -887,7 +887,8 @@ else:
          "\t\treturn NULL;\n"
          "\t}\n"
          "#endif\n")
-    s = s[:i] + b + s[i:]
+    k = s.find(a, i)
+    s = s[:k] + b + s[k:]
 
 # 2) mnt_find_id_at
 i = s.find("static struct mount *mnt_find_id_at(struct mnt_namespace *ns, u64 mnt_id)")
