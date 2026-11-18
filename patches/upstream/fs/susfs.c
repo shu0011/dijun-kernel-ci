@@ -231,6 +231,19 @@ static DEFINE_MUTEX(susfs_mutex_lock_sus_path);
 static LIST_HEAD(LH_SUS_PATH_LOOP);
 const struct qstr susfs_fake_qstr_name = QSTR_INIT("..5.u.S", 7); // used to re-test the dcache lookup, make sure you don't have file named like this!!
 
+/*
+ * LOCAL EXTENSION, NOT PART OF UPSTREAM SUSFS.
+ *
+ * Records the owner app uid of a sus_path whose pathname belongs to
+ * '/Android/data/<pkg>' or '/Android/media/<pkg>', so that the owner app
+ * itself can still see its own data directory while every other app has
+ * it hidden. This is a per-inode exemption and is independent of the
+ * global sus_path uid filter (susfs_set_sus_path_uid_filter).
+ * Implemented at the end of the SUS_PATH block, here only the prototypes.
+ */
+static void susfs_owner_record(struct inode *inode, const char *pathname);
+static bool susfs_owner_matches(struct inode *inode);
+
 void susfs_add_sus_path(void __user **user_info) {
 	struct st_susfs_sus_path info = {0};
 	struct path path;
@@ -254,6 +267,9 @@ void susfs_add_sus_path(void __user **user_info) {
 		info.err = -ENOENT;
 		goto out_path_put_path;
 	}
+
+	/* LOCAL EXTENSION: remember the owner app of this sus_path, if any */
+	susfs_owner_record(inode, info.target_pathname);
 
 	if (inode->i_sb->s_magic == FUSE_SUPER_MAGIC) {
 		fi = get_fuse_inode(inode);
@@ -335,6 +351,8 @@ static void susfs_run_sus_path_loop(void) {
 				path_put(&path);
 				continue;
 			}
+			/* LOCAL EXTENSION: remember the owner app of this sus_path, if any */
+			susfs_owner_record(inode, cursor->target_pathname);
 			if (inode->i_sb->s_magic == FUSE_SUPER_MAGIC) {
 				fi = get_fuse_inode(inode);
 				if (!fi || !fi->inode.i_mapping) {
@@ -385,6 +403,9 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 		if (unlikely(test_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_mapping->flags) &&
 			likely(!susfs_is_uid_allowed_for_sus_path(uid))))
 		{
+			/* LOCAL EXTENSION: the owner app can see its own data dir */
+			if (susfs_owner_matches(inode))
+				return false;
 			//SUSFS_LOGI("hiding path with ino '%lu'\n", inode->i_ino);
 			return true;
 		}
@@ -394,6 +415,9 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 	if (unlikely(test_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags) &&
 		likely(!susfs_is_uid_allowed_for_sus_path(uid))))
 	{
+		/* LOCAL EXTENSION: the owner app can see its own data dir */
+		if (susfs_owner_matches(inode))
+			return false;
 		//SUSFS_LOGI("hiding path with ino '%lu'\n", inode->i_ino);
 		return true;
 	}
@@ -826,6 +850,181 @@ bool susfs_is_uid_allowed_for_sus_path(uid_t uid) {
 
 	rcu_read_unlock();
 	return false;
+}
+
+/*****************************************************/
+/* sus_path per-owner exemption (LOCAL EXTENSION)    */
+/*****************************************************/
+/*
+ * This block is NOT part of upstream SUSFS. It implements a per-inode
+ * owner exemption for sus_path, so that an app can still see its own
+ * '/Android/data/<pkg>' and '/Android/media/<pkg>' directories while
+ * those directories stay hidden from every other app.
+ *
+ * The exemption is independent of, and is checked after, the global
+ * sus_path uid filter above: if the global filter already allows the
+ * calling uid to see all sus paths, the owner lookup is not needed.
+ *
+ * The owner uid is resolved once, when the sus path is added, from
+ * /data/system/packages.list. If an app is uninstalled and reinstalled
+ * afterwards (its uid may change), the sus path has to be added again
+ * or the device rebooted for the new uid to be picked up.
+ */
+struct susfs_sus_path_owner {
+	struct hlist_node               node;
+	struct rcu_head                 rcu;
+	struct inode                    *inode;
+	unsigned long                   i_ino;
+	uid_t                           uid;
+};
+
+static DEFINE_MUTEX(susfs_mutex_lock_sus_path_owner);
+static DEFINE_HASHTABLE(SUS_PATH_OWNER_HLIST, 10);
+
+/*
+ * Extracts the app package name from a pathname of the form
+ * '.../Android/data/<pkg>' or '.../Android/media/<pkg>', resolves its uid
+ * and stores it in 'uid'.
+ * Returns 0 on success, a negative errno if the pathname does not belong to
+ * an app data directory or the uid cannot be resolved.
+ */
+static int susfs_owner_uid_from_pathname(const char *pathname, uid_t *uid)
+{
+	static const char * const tags[] = { "/Android/data/", "/Android/media/" };
+	char app_name[SUSFS_MAX_LEN_PATHNAME];
+	const char *app = NULL;
+	const char *p = NULL;
+	size_t len = 0;
+	size_t tag_len;
+	int i;
+
+	if (!pathname || !uid)
+		return -EINVAL;
+
+	for (i = 0; i < 2; i++) {
+		tag_len = strlen(tags[i]);
+		p = pathname;
+		while ((p = strstr(p, tags[i])) != NULL) {
+			app = p + tag_len;
+			p = app;
+		}
+	}
+
+	if (!app || *app == '\0')
+		return -ENOENT;
+
+	len = strlen(app);
+	/* tolerate a trailing slash, e.g. '/Android/data/<pkg>/' */
+	while (len > 0 && app[len - 1] == '/')
+		len--;
+
+	if (!len || len >= sizeof(app_name))
+		return -ENOENT;
+
+	memcpy(app_name, app, len);
+	app_name[len] = '\0';
+
+	/* only the app data dir itself, not a path below it */
+	if (strchr(app_name, '/'))
+		return -ENOENT;
+
+	if (!susfs_is_valid_sus_path_app_name(app_name))
+		return -EINVAL;
+
+	return susfs_resolve_sus_path_app_uid(app_name, uid);
+}
+
+/*
+ * Records the owner app uid of the given inode if the pathname belongs to an
+ * app data directory. Safe to call repeatedly for the same inode.
+ */
+static void susfs_owner_record(struct inode *inode, const char *pathname)
+{
+	struct susfs_sus_path_owner *entry = NULL;
+	struct susfs_sus_path_owner *tmp = NULL;
+	struct hlist_node *tmp_node = NULL;
+	const struct cred *saved = NULL;
+	unsigned long key;
+	uid_t uid = 0;
+	int err;
+
+	if (!inode || !pathname)
+		return;
+
+	/* fast path: the inode has been recorded already */
+	rcu_read_lock();
+	hash_for_each_possible_rcu(SUS_PATH_OWNER_HLIST, tmp, node, (unsigned long)inode) {
+		if (tmp->inode == inode && tmp->i_ino == inode->i_ino) {
+			rcu_read_unlock();
+			return;
+		}
+	}
+	rcu_read_unlock();
+
+	/*
+	 * The caller may not be able to read /data/system/packages.list with
+	 * its own credentials (it can even be a kworker), hence the KernelSU
+	 * credentials are overridden while the uid is resolved, like it is
+	 * done in susfs_run_sus_path_loop().
+	 */
+	if (!ksu_cred)
+		return;
+	saved = override_creds(ksu_cred);
+	err = susfs_owner_uid_from_pathname(pathname, &uid);
+	revert_creds(saved);
+	if (err)
+		return;
+
+	key = (unsigned long)inode;
+	mutex_lock(&susfs_mutex_lock_sus_path_owner);
+	hash_for_each_possible_safe(SUS_PATH_OWNER_HLIST, tmp, tmp_node, node, key) {
+		if (tmp->inode != inode)
+			continue;
+		if (tmp->i_ino == inode->i_ino)
+			goto unlock; /* recorded by another thread meanwhile */
+		/* stale entry of a freed inode which got its address reused */
+		hash_del_rcu(&tmp->node);
+		kfree_rcu(tmp, rcu);
+		break;
+	}
+
+	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	if (!entry) {
+		SUSFS_LOGE("failed to allocate the sus_path owner entry\n");
+		goto unlock;
+	}
+	entry->inode = inode;
+	entry->i_ino = inode->i_ino;
+	entry->uid = uid;
+	hash_add_rcu(SUS_PATH_OWNER_HLIST, &entry->node, key);
+	SUSFS_LOGI("owner uid '%u' recorded for sus_path '%s' (local extension)\n", uid, pathname);
+unlock:
+	mutex_unlock(&susfs_mutex_lock_sus_path_owner);
+}
+
+/*
+ * Returns true if the calling process is the owner app of the given inode.
+ * Lockless, called from the hot path.
+ */
+static bool susfs_owner_matches(struct inode *inode)
+{
+	struct susfs_sus_path_owner *entry = NULL;
+	uid_t uid = current_uid().val % 100000;
+	bool matched = false;
+
+	if (!inode || uid < 10000)
+		return false;
+
+	rcu_read_lock();
+	hash_for_each_possible_rcu(SUS_PATH_OWNER_HLIST, entry, node, (unsigned long)inode) {
+		if (entry->inode == inode && entry->i_ino == inode->i_ino) {
+			matched = (READ_ONCE(entry->uid) == uid);
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	return matched;
 }
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH
 
