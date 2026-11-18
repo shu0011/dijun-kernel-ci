@@ -161,44 +161,54 @@ jobs:
       # finasu-v23-compat: 内核信任的管理器签名必须跟随官方最新版，
       # 不能写死证书 —— 否则编出信任 v1.5 的内核，用户却装了 v1.6 管理器，
       # 签名对不上就拿不到 root。这里从 releases/latest 现取 APK 解出证书。
+      # 主路径走 github.com 网页 + git 协议（不受 api.github.com 匿名 60/h 限流）；
+      # Actions 共享出口 IP 的匿名 API 会被别人打满返回 403（#152 实测），故 API 仅兜底。
       - name: 抓取 FinaSU 最新管理器签名
         run: |
           set -euo pipefail
-          api="https://api.github.com/repos/LyraVoid/FinaSU"
-          # 关键：这里访问的是外部仓库 LyraVoid/FinaSU，绝不能带 GITHUB_TOKEN。
-          # 仓库级 GITHUB_TOKEN 对外部仓库的 API 请求会返回 403（实测），
-          # 而匿名读公开仓库 releases 返回 200。所以全程匿名。
+          repo="LyraVoid/FinaSU"
+          api="https://api.github.com/repos/$repo"
+          web="https://github.com/$repo"
+          apk="$GITHUB_WORKSPACE/manager.apk"
           get() { curl -fsSL --retry 3 --max-time 60 "$1"; }
 
-          tag=$(get "$api/releases/latest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
-          echo "管理器版本: $tag"
-          # 优先挑名字含 release 的 .apk（避开 debug / kernel-bundle），同时取 asset id 供 fallback
-          meta=$(get "$api/releases/tags/$tag")
-          url=$(printf '%s' "$meta" | python3 -c '
+          # 主路径（网页，无 API 限流）：git ls-remote 取最新 tag，expanded_assets 取 release apk 直链
+          tag=""
+          url=""
+          if t=$(git ls-remote --tags --refs "https://github.com/$repo.git" 'refs/tags/v*' \
+                 | sed 's|.*refs/tags/||' | sort -V | tail -1) && [ -n "$t" ]; then
+            tag="$t"
+            echo "管理器版本(网页): $tag"
+            rel=$(get "$web/releases/expanded_assets/$tag" | python3 -c '
+          import sys,re
+          links=re.findall(r"href=\"([^\"]+\.apk)\"", sys.stdin.read())
+          pref=[x for x in links if "release" in x] or links
+          print(pref[0] if pref else "")') || true
+            if [ -n "$rel" ]; then
+              url="https://github.com$rel"
+            fi
+          fi
+
+          # 兜底：网页通道拿不到（页面改版/网络问题）才碰 API；全程匿名，不带 GITHUB_TOKEN
+          if [ -z "$tag" ] || [ -z "$url" ]; then
+            echo "网页通道不完整，回退 API"
+            tag=$(get "$api/releases/latest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+            meta=$(get "$api/releases/tags/$tag")
+            url=$(printf '%s' "$meta" | python3 -c '
           import json,sys
           d=json.load(sys.stdin)
           a=[x for x in d["assets"] if x["name"].endswith(".apk")]
           p=[x for x in a if "release" in x["name"]] or a
           print(p[0]["browser_download_url"] if p else "")')
-          asset_id=$(printf '%s' "$meta" | python3 -c '
-          import json,sys
-          d=json.load(sys.stdin)
-          a=[x for x in d["assets"] if x["name"].endswith(".apk")]
-          p=[x for x in a if "release" in x["name"]] or a
-          print(p[0]["id"] if p else "")')
+          fi
+          echo "管理器版本: $tag"
           if [ -z "$url" ]; then
-            echo "::error::LyraVoid/FinaSU release $tag 里没有 apk 资产"
+            echo "::error::LyraVoid/FinaSU release $tag 里没有 release apk 资产"
             exit 1
           fi
 
-          # 下载 APK：主路径 browser_download_url，失败则回退 API asset endpoint（都不带 token）
-          apk="$GITHUB_WORKSPACE/manager.apk"
-          echo "下载(主): $url"
-          if ! curl -fsSL --retry 3 --max-time 180 -o "$apk" "$url"; then
-            echo "主路径失败，回退 API asset endpoint (id=$asset_id)"
-            curl -fsSL --retry 3 --max-time 180 -H "Accept: application/octet-stream" \
-              -o "$apk" "$api/releases/assets/$asset_id"
-          fi
+          echo "下载: $url"
+          curl -fsSL --retry 3 --max-time 180 -o "$apk" "$url"
           ls -l "$apk"
           # 下载下来的必须是可解析的 APK（zipfile 能打开），否则后面解证书只会给出误导性错误
           python3 -c 'import sys,zipfile; zipfile.ZipFile(sys.argv[1]); print("APK 校验 OK")' "$apk"
