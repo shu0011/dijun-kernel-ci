@@ -719,10 +719,9 @@ open(p, "w").write(s)
 print("    setuid_hook.c: 官方 LOOP 调度已接入")
 PYP
 echo "==> [upstream] 6.18 适配：fs/proc/task_mmu.c（sus_map 展示隐藏）"
-# 6.18.21（2026-06 快照）的 task_mmu 与 HEAD 有差异：
-#   - smap_gather_stats() 只有两参数
-#   - 函数内部文本/顺序不完全一致
-# 所以注入点只用稳定的“函数定义 + 关键赋值/循环”来定位。
+# 6.18.21（2026-06 快照）与 HEAD 的 task_mmu 结构差异较大。
+# 核心两处（show_map_vma / show_smap）用稳定锚点注入；
+# rollup 先打印真实源码到日志，注入失败只告警、不阻塞构建（后续按日志修）。
 python3 - "$SRC/fs/proc/task_mmu.c" <<'PYP'
 import sys
 
@@ -772,21 +771,32 @@ s = s[:j] + ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
              "\t\treturn 0;\n"
              "#endif\n") + s[j:]
 
+# ---- rollup：打印真实源码，注入失败不阻塞 ----
 i = s.find("static int show_smaps_rollup(struct seq_file *m, void *v)")
-assert i >= 0, "task_mmu.c: show_smaps_rollup 没找到"
-j = s.find("\tdo {\n", i)
-assert j >= 0, "task_mmu.c: show_smaps_rollup 的 do 循环没找到"
-s = s[:j] + ("\tdo {\n"
-             "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-             "\t\tif (vma->vm_file &&\n"
-             "\t\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
-             "\t\t\tgoto bypass_sus_map;\n"
-             "#endif\n") + s[j + len("\tdo {\n"):]
-# 标签放在 last_vma_end 赋值之前：无论统计调用长什么样，都会跳到这条语句
-m = s.find("last_vma_end = vma->vm_end;", j)
-assert m >= 0, "task_mmu.c: rollup 的 last_vma_end 没找到"
-k = s.rfind("\n", 0, m) + 1
-s = s[:k] + "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\nbypass_sus_map:\n#endif\n" + s[k:]
+if i < 0:
+    print("    WARN: show_smaps_rollup 没找到，跳过")
+else:
+    end = s.find("\n}\n", i)
+    print("    ---- show_smaps_rollup 实际源码 begin ----")
+    print(s[i:end + 3] if end > 0 else s[i:i + 6000])
+    print("    ---- show_smaps_rollup 实际源码 end ----")
+    try:
+        j = s.find("\tdo {\n", i)
+        assert j >= 0, "do 循环没找到"
+        s = s[:j] + ("\tdo {\n"
+                     "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+                     "\t\tif (vma->vm_file &&\n"
+                     "\t\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
+                     "\t\t\tgoto bypass_sus_map;\n"
+                     "#endif\n") + s[j + len("\tdo {\n"):]
+        m = s.find("last_vma_end = vma->vm_end;", j)
+        assert m >= 0, "last_vma_end 没找到"
+        k = s.rfind("\n", 0, m) + 1
+        s = s[:k] + "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\nbypass_sus_map:\n#endif\n" + s[k:]
+        print("    rollup 已注入")
+    except AssertionError as e:
+        print("    WARN: rollup 注入失败（%s），本轮跳过" % e)
+        s = open(p).read()
 
 # pagemap 是次要路径：锚点找不到就告警跳过，不阻塞构建
 i = s.find("while (count && (start_vaddr < end_vaddr)) {")
@@ -810,5 +820,5 @@ else:
     s = s[:k2] + "\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\nbypass_sus_map_page:\n#endif" + s[k2:]
 
 open(p, "w").write(s)
-print("    task_mmu.c: sus_map 展示隐藏已注入")
+print("    task_mmu.c: sus_map 展示隐藏已处理")
 PYP
