@@ -719,9 +719,10 @@ open(p, "w").write(s)
 print("    setuid_hook.c: 官方 LOOP 调度已接入")
 PYP
 echo "==> [upstream] 6.18 适配：fs/proc/task_mmu.c（sus_map 展示隐藏）"
-# 官方 6.12 补丁的 task_mmu hunk 在 6.18 上下文对不上（VMA_PAD_START/__VM_NO_COMPAT 等）。
-# 2026-06 快照里 smap_gather_stats() 还是两参数版本，所以这里不匹配函数调用形态，
-# 只按“函数定义 + 声明块/do 循环”定位。
+# 6.18.21（2026-06 快照）的 task_mmu 与 HEAD 有差异：
+#   - smap_gather_stats() 只有两参数
+#   - 函数内部文本/顺序不完全一致
+# 所以注入点只用稳定的“函数定义 + 关键赋值/循环”来定位。
 python3 - "$SRC/fs/proc/task_mmu.c" <<'PYP'
 import sys
 
@@ -732,7 +733,6 @@ if "SUSFS_IS_INODE_SUS_MAP" in s:
     print("    已注入过")
     raise SystemExit(0)
 
-# 1) include：挑一个一定存在的 include，紧跟其后插入
 inc = None
 for cand in ("#include <linux/buildid.h>\n",
              "#include <linux/overflow.h>\n",
@@ -746,7 +746,6 @@ s = s.replace(inc, inc +
               "#include <linux/susfs_def.h>\n"
               "#endif\n", 1)
 
-# 2) show_map_vma：在函数内第一个 if (vma->vm_file) 之前跳过
 i = s.find("show_map_vma(struct seq_file *m, struct vm_area_struct *vma)")
 assert i >= 0, "task_mmu.c: show_map_vma 没找到"
 j = s.find("\tif (vma->vm_file) {", i)
@@ -757,7 +756,6 @@ s = s[:j] + ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
              "\t\treturn;\n"
              "#endif\n") + s[j:]
 
-# 3) show_smap：插在声明块结束之后（不依赖 smap_gather_stats 的参数个数）
 i = s.find("static int show_smap(struct seq_file *m, void *v)")
 assert i >= 0, "task_mmu.c: show_smap 没找到"
 mss = "\tstruct mem_size_stats mss = {};\n"
@@ -774,7 +772,6 @@ s = s[:j] + ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
              "\t\treturn 0;\n"
              "#endif\n") + s[j:]
 
-# 4) show_smaps_rollup：do { 之后判断；标签插在首个 smap_gather_stats 行之前
 i = s.find("static int show_smaps_rollup(struct seq_file *m, void *v)")
 assert i >= 0, "task_mmu.c: show_smaps_rollup 没找到"
 j = s.find("\tdo {\n", i)
@@ -785,29 +782,32 @@ s = s[:j] + ("\tdo {\n"
              "\t\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
              "\t\t\tgoto bypass_sus_map;\n"
              "#endif\n") + s[j + len("\tdo {\n"):]
-m = s.find("smap_gather_stats(vma, &mss", i)
-assert m >= 0, "task_mmu.c: rollup 的 smap_gather_stats 没找到"
+# 标签放在 last_vma_end 赋值之前：无论统计调用长什么样，都会跳到这条语句
+m = s.find("last_vma_end = vma->vm_end;", j)
+assert m >= 0, "task_mmu.c: rollup 的 last_vma_end 没找到"
 k = s.rfind("\n", 0, m) + 1
 s = s[:k] + "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\nbypass_sus_map:\n#endif\n" + s[k:]
 
-# 5) pagemap_read：跳过命中 VMA 的页表遍历
+# pagemap 是次要路径：锚点找不到就告警跳过，不阻塞构建
 i = s.find("while (count && (start_vaddr < end_vaddr)) {")
-assert i >= 0, "task_mmu.c: pagemap_read 循环没找到"
-j = s.find("\n", i) + 1
-s = s[:j] + ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-             "\t\tstruct vm_area_struct *vma;\n"
-             "#endif\n") + s[j:]
 walk = "\t\tret = walk_page_range(mm, start_vaddr, end, &pagemap_ops, &pm);"
-k = s.find(walk, i)
-assert k >= 0, "task_mmu.c: pagemap_read 的 walk_page_range 没找到"
-s = s[:k] + ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-             "\t\tvma = vma_lookup(mm, start_vaddr);\n"
-             "\t\tif (vma && vma->vm_file &&\n"
-             "\t\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
-             "\t\t\tgoto bypass_sus_map_page;\n"
-             "#endif\n") + s[k:]
-k2 = s.find(walk, k) + len(walk)
-s = s[:k2] + "\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\nbypass_sus_map_page:\n#endif" + s[k2:]
+k = s.find(walk, i) if i >= 0 else -1
+if i < 0 or k < 0:
+    print("    WARN: pagemap_read 锚点没找到，跳过 pagemap 隐藏")
+else:
+    j = s.find("\n", i) + 1
+    s = s[:j] + ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+                 "\t\tstruct vm_area_struct *vma;\n"
+                 "#endif\n") + s[j:]
+    k = s.find(walk, i)
+    s = s[:k] + ("#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+                 "\t\tvma = vma_lookup(mm, start_vaddr);\n"
+                 "\t\tif (vma && vma->vm_file &&\n"
+                 "\t\t    SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
+                 "\t\t\tgoto bypass_sus_map_page;\n"
+                 "#endif\n") + s[k:]
+    k2 = s.find(walk, k) + len(walk)
+    s = s[:k2] + "\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\nbypass_sus_map_page:\n#endif" + s[k2:]
 
 open(p, "w").write(s)
 print("    task_mmu.c: sus_map 展示隐藏已注入")
