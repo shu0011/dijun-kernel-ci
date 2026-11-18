@@ -165,29 +165,45 @@ jobs:
         run: |
           set -euo pipefail
           api="https://api.github.com/repos/LyraVoid/FinaSU"
-          AUTH=()
-          if [ -n "${GITHUB_TOKEN:-}" ]; then
-            AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
-          fi
-          get() { curl -fsSL ${AUTH[@]+"${AUTH[@]}"} "$1"; }
+          # 关键：这里访问的是外部仓库 LyraVoid/FinaSU，绝不能带 GITHUB_TOKEN。
+          # 仓库级 GITHUB_TOKEN 对外部仓库的 API 请求会返回 403（实测），
+          # 而匿名读公开仓库 releases 返回 200。所以全程匿名。
+          get() { curl -fsSL --retry 3 --max-time 60 "$1"; }
 
           tag=$(get "$api/releases/latest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
           echo "管理器版本: $tag"
-          # 优先挑名字含 release 的 .apk（避开 debug / kernel-bundle）
-          url=$(get "$api/releases/tags/$tag" | python3 -c '
+          # 优先挑名字含 release 的 .apk（避开 debug / kernel-bundle），同时取 asset id 供 fallback
+          meta=$(get "$api/releases/tags/$tag")
+          url=$(printf '%s' "$meta" | python3 -c '
           import json,sys
           d=json.load(sys.stdin)
           a=[x for x in d["assets"] if x["name"].endswith(".apk")]
           p=[x for x in a if "release" in x["name"]] or a
           print(p[0]["browser_download_url"] if p else "")')
+          asset_id=$(printf '%s' "$meta" | python3 -c '
+          import json,sys
+          d=json.load(sys.stdin)
+          a=[x for x in d["assets"] if x["name"].endswith(".apk")]
+          p=[x for x in a if "release" in x["name"]] or a
+          print(p[0]["id"] if p else "")')
           if [ -z "$url" ]; then
             echo "::error::LyraVoid/FinaSU release $tag 里没有 apk 资产"
             exit 1
           fi
-          echo "下载: $url"
-          curl -fsSL --retry 3 --max-time 180 -o "$GITHUB_WORKSPACE/manager.apk" "$url"
-          ls -l "$GITHUB_WORKSPACE/manager.apk"
-          python3 tools/manager_identity.py "$GITHUB_WORKSPACE/manager.apk" | tee "$GITHUB_WORKSPACE/mgr.txt"
+
+          # 下载 APK：主路径 browser_download_url，失败则回退 API asset endpoint（都不带 token）
+          apk="$GITHUB_WORKSPACE/manager.apk"
+          echo "下载(主): $url"
+          if ! curl -fsSL --retry 3 --max-time 180 -o "$apk" "$url"; then
+            echo "主路径失败，回退 API asset endpoint (id=$asset_id)"
+            curl -fsSL --retry 3 --max-time 180 -H "Accept: application/octet-stream" \
+              -o "$apk" "$api/releases/assets/$asset_id"
+          fi
+          ls -l "$apk"
+          # 下载下来的必须是可解析的 APK（zipfile 能打开），否则后面解证书只会给出误导性错误
+          python3 -c 'import sys,zipfile; zipfile.ZipFile(sys.argv[1]); print("APK 校验 OK")' "$apk"
+
+          python3 tools/manager_identity.py "$apk" | tee "$GITHUB_WORKSPACE/mgr.txt"
           # manager_identity.py 默认输出 key=value，直接进 $GITHUB_ENV
           cat "$GITHUB_WORKSPACE/mgr.txt" >> "$GITHUB_ENV"
           echo "MANAGER_TAG=$tag" >> "$GITHUB_ENV"
