@@ -32,10 +32,16 @@ echo "==> [upstream] 放入官方源码"
 cp "$UP/fs/susfs.c" "$SRC/fs/susfs.c"
 cp "$UP/include/linux/susfs.h" "$SRC/include/linux/susfs.h"
 cp "$UP/include/linux/susfs_def.h" "$SRC/include/linux/susfs_def.h"
-cp "$HERE/patches/susfs_upstream.c" "$SRC/fs/susfs_upstream.c"
 cp "$HERE/patches/susfs_abi.h" "$SRC/include/linux/susfs_abi.h"
+if [ "${KSU_VARIANT:-sukisu}" = "finasu" ]; then
+    echo "    FinaSU 自带 CMD 分发与 susfs_init，跳过 susfs_upstream.c"
+    grep -q 'susfs\.o' "$SRC/fs/Makefile" || \
+        printf 'obj-$(CONFIG_KSU_SUSFS) += susfs.o\n' >> "$SRC/fs/Makefile"
+else
+cp "$HERE/patches/susfs_upstream.c" "$SRC/fs/susfs_upstream.c"
 if ! grep -q 'susfs\.o' "$SRC/fs/Makefile"; then
     printf 'obj-$(CONFIG_KSU_SUSFS) += susfs.o susfs_upstream.o\n' >> "$SRC/fs/Makefile"
+fi
 fi
 
 echo "==> [upstream] susfs.c 自动生成全局函数前置原型（-Wmissing-prototypes）"
@@ -114,6 +120,7 @@ PY
 fi
 
 
+if [ -f "$SRC/fs/susfs_bridge.c" ]; then
 echo "==> [upstream] 瘦身 bridge（官方 susfs.c 已提供同名符号，避免重复定义）"
 python3 - "$SRC" <<'PYB'
 import os, sys
@@ -165,6 +172,7 @@ s += "\n/* SUSFS_BRIDGE_TRIMMED */\n"
 open(p, "w").write(s)
 print("    bridge 已瘦身")
 PYB
+fi
 
 echo "==> [upstream] 应用官方内核补丁（排除 6.18 需适配与 KSU 专属 hunk）"
 python3 - "$UP/kernel_patches/50_add_susfs_in_gki-android16-6.12.patch" "$SRC" <<'PYA'

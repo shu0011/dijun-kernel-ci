@@ -56,10 +56,10 @@ PY
 echo "==> [finasu] 应用 SUSFS SELinux 补丁"
 patch -p1 -d "$SRC" --forward < "$HERE/patches/susfs-selinux.patch"
 
-echo "==> [finasu] 加入 bridge"
-cp "$HERE/patches/susfs_bridge.c" "$SRC/fs/susfs_bridge.c"
-grep -q 'susfs_bridge' "$SRC/fs/Makefile" || \
-    printf '\nobj-$(CONFIG_KSU_SUSFS) += susfs_bridge.o\n' >> "$SRC/fs/Makefile"
+echo "==> [finasu] 跳过 bridge（FinaSU selinux.c 已提供 SID 与 ksu_domain 判定）"
+# SukiSU 模式下 bridge 负责补 susfs_ksu_sid/susfs_priv_app_sid/
+# susfs_is_current_ksu_domain；FinaSU 的 selinux/selinux.c 已经原生提供，
+# 再编 bridge 会 duplicate symbol。
 
 echo "==> [finasu] 应用 SUSFS v2.4.0 内核侧移植"
 KSU_VARIANT=finasu bash "$HERE/ci/susfs_upstream.sh" "$SRC" "$HERE"
