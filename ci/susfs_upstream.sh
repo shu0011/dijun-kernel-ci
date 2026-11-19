@@ -194,6 +194,10 @@ skip = {
     # 模糊匹配插错位置 → 先跳过，sus_map 的展示钩子下一轮单独补。
     "fs/proc/task_mmu.c",
 }
+if os.environ.get("KSU_VARIANT") == "finasu":
+    # FinaSU 的 supercall kprobe 只处理 fd 安装，不转发 SUSFS magic，
+    # SUSFS 命令必须靠官方 hunk 在 kernel/reboot.c 里调用 ksu_handle_sys_reboot。
+    skip.discard("kernel/reboot.c")
 chunks, cur, name = [], [], None
 for ln in open(patch_file).read().split("\n"):
     m = re.match(r"^diff --git a/(\S+) b/", ln)
