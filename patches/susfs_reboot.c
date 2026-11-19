@@ -43,13 +43,15 @@ static const char susfs_feature_list[] =
 	"CONFIG_KSU_SUSFS_SUS_KSTAT\n"
 	"CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
 	"CONFIG_KSU_SUSFS_ENABLE_LOG\n"
+	"CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS\n"
 	"CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n"
 	"CONFIG_KSU_SUSFS_OPEN_REDIRECT\n"
-	"CONFIG_KSU_SUSFS_SUS_MAP\n";
-/* finasu-v23-compat: v2.4 新增的 HIDE_KSU_SUSFS_SYMBOLS / PRIORITY_UID_FILTER
- * 已关闭并从本表移除，只上报 FinaSU v2.3 识别的 8 项，避免其按 v2.3 协议
- * 操作 v2.4 功能导致的重启 bug。SUS_PATH_UID_FILTER 仍是 SUS_PATH 子功能，
- * 沿用 upstream 做法不单独上报。 */
+	"CONFIG_KSU_SUSFS_SUS_MAP\n"
+	"CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER\n";
+/* Note: SUS_PATH_UID_FILTER is a sub-feature of SUS_PATH in upstream's
+ * feature list (upstream does NOT list it separately in SHOW_ENABLED_FEATURES
+ * — it is gated by CONFIG_KSU_SUSFS_SUS_PATH).  We implement it but report
+ * the same 10 names upstream reports, keeping the WebUI mapping 1:1. */
 
 /* ---------- read-only query commands ---------- */
 static void susfs_query_show_version(void __user **arg)

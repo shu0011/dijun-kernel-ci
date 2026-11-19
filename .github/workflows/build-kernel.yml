@@ -268,7 +268,7 @@ jobs:
           # releases/latest 自动抓到的 tag（如 v1.6.4），管理器升级后包名自动跟随。
           # ${MANAGER_TAG#v} 去掉前缀 v：finasu1.6.4（不加空格，避免刷机/下载转义问题）
           FINASU_VER="${MANAGER_TAG#v}"
-          AK3_NAME="ak3-xring-o1-6.18-finasu${FINASU_VER}-susfs2.3-gki553682993.zip"
+          AK3_NAME="ak3-xring-o1-6.18-finasu${FINASU_VER}-susfs2.4-gki553682993.zip"
           ( cd /tmp/ak3 && zip -r9 "$GITHUB_WORKSPACE/out/$AK3_NAME" . )
           ls -l out/*.zip
           sha256sum out/*.zip
