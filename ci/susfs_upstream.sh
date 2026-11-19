@@ -32,10 +32,16 @@ echo "==> [upstream] 放入官方源码"
 cp "$UP/fs/susfs.c" "$SRC/fs/susfs.c"
 cp "$UP/include/linux/susfs.h" "$SRC/include/linux/susfs.h"
 cp "$UP/include/linux/susfs_def.h" "$SRC/include/linux/susfs_def.h"
-cp "$HERE/patches/susfs_upstream.c" "$SRC/fs/susfs_upstream.c"
 cp "$HERE/patches/susfs_abi.h" "$SRC/include/linux/susfs_abi.h"
+if [ "${KSU_VARIANT:-sukisu}" = "finasu" ]; then
+    echo "    FinaSU 自带 CMD 分发与 susfs_init，跳过 susfs_upstream.c"
+    grep -q 'susfs\.o' "$SRC/fs/Makefile" || \
+        printf 'obj-$(CONFIG_KSU_SUSFS) += susfs.o\n' >> "$SRC/fs/Makefile"
+else
+cp "$HERE/patches/susfs_upstream.c" "$SRC/fs/susfs_upstream.c"
 if ! grep -q 'susfs\.o' "$SRC/fs/Makefile"; then
     printf 'obj-$(CONFIG_KSU_SUSFS) += susfs.o susfs_upstream.o\n' >> "$SRC/fs/Makefile"
+fi
 fi
 
 echo "==> [upstream] susfs.c 自动生成全局函数前置原型（-Wmissing-prototypes）"
@@ -81,6 +87,11 @@ print("    susfs.c 已插入 %d 个全局函数原型" % len(protos))
 PYP
 
 echo "==> [upstream] 补齐官方 CONFIG 开关"
+# FinaSU 原生内核的 drivers/kernelsu/Kconfig 已自带完整的 KSU_SUSFS 子项，
+# 再往 drivers/Kconfig 里塞一遍会造成重复 config 定义，直接跳过。
+if grep -q '^config KSU_SUSFS_SUS_PATH$' "$SRC/drivers/kernelsu/Kconfig" 2>/dev/null; then
+    echo "    drivers/kernelsu/Kconfig 已自带 SUSFS 子项，跳过"
+else
 python3 - "$SRC/drivers/Kconfig" <<'PY'
 import sys
 p = sys.argv[1]
@@ -106,8 +117,10 @@ if add:
 else:
     print("    CONFIG 已齐")
 PY
+fi
 
 
+if [ -f "$SRC/fs/susfs_bridge.c" ]; then
 echo "==> [upstream] 瘦身 bridge（官方 susfs.c 已提供同名符号，避免重复定义）"
 python3 - "$SRC" <<'PYB'
 import os, sys
@@ -159,6 +172,7 @@ s += "\n/* SUSFS_BRIDGE_TRIMMED */\n"
 open(p, "w").write(s)
 print("    bridge 已瘦身")
 PYB
+fi
 
 echo "==> [upstream] 应用官方内核补丁（排除 6.18 需适配与 KSU 专属 hunk）"
 python3 - "$UP/kernel_patches/50_add_susfs_in_gki-android16-6.12.patch" "$SRC" <<'PYA'
@@ -180,6 +194,10 @@ skip = {
     # 模糊匹配插错位置 → 先跳过，sus_map 的展示钩子下一轮单独补。
     "fs/proc/task_mmu.c",
 }
+if os.environ.get("KSU_VARIANT") == "finasu":
+    # FinaSU 的 supercall kprobe 只处理 fd 安装，不转发 SUSFS magic，
+    # SUSFS 命令必须靠官方 hunk 在 kernel/reboot.c 里调用 ksu_handle_sys_reboot。
+    skip.discard("kernel/reboot.c")
 chunks, cur, name = [], [], None
 for ln in open(patch_file).read().split("\n"):
     m = re.match(r"^diff --git a/(\S+) b/", ln)
@@ -235,6 +253,9 @@ else:
     print("    !! statfs.c 没找到 wrapper 定义，跳过")
 PY
 
+if [ "${KSU_VARIANT:-sukisu}" = "finasu" ]; then
+    echo "==> [upstream] FinaSU 使用真实 TIF 线程标志，跳过 SukiSU 的闸门替换"
+else
 echo "==> [upstream] 6.18 适配：susfs_def.h 的三个 TIF 闸门"
 python3 - "$SRC/include/linux/susfs_def.h" <<'PY'
 import sys
@@ -277,6 +298,7 @@ s = s.replace(old3, new3, 1)
 open(p, "w").write(s)
 print("    闸门已替换为 KSU 判定（含 umounted_app）")
 PY
+fi
 
 echo "==> [upstream] 6.18 适配：fs/stat.c（SUS_KSTAT 官方钩子）"
 python3 - "$SRC" <<'PY'
@@ -691,6 +713,9 @@ open(p, "w").write(s)
 print("    namei.c: open_redirect 已注入（path_openat + vfs_readlink）")
 PY
 
+if [ "${KSU_VARIANT:-sukisu}" = "finasu" ]; then
+    echo "==> [upstream] FinaSU 原生 setuid_hook 已调度 susfs_extra_works，跳过 LOOP 注入"
+else
 echo "==> [upstream] 接官方 LOOP 调度（ADD_SUS_PATH_LOOP 落地）"
 # 官方 10_enable_susfs_for_ksu.patch 在 KernelSU 的 setresuid 钩子里调度
 # susfs_extra_works；没有这一步，susfs_add_sus_path_loop() 只入队、永远不落地。
@@ -746,6 +771,7 @@ s = s.replace(umount_anchor, umount_anchor +
 open(p, "w").write(s)
 print("    setuid_hook.c: 官方 LOOP 调度已接入")
 PYP
+fi
 echo "==> [upstream] 6.18 适配：fs/proc/task_mmu.c（sus_map 展示隐藏）"
 # 6.18.21（2026-06 快照）与 HEAD 的 task_mmu 结构差异较大。
 # 核心两处（show_map_vma / show_smap）用稳定锚点注入；

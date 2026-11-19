@@ -4,7 +4,7 @@
 ### AnyKernel setup
 # global properties
 properties() { '
-kernel.string=xring-o1 6.18.21-abogki553682993 + SukiSU + SELinux Hide + susfs v2.4
+kernel.string=xring-o1 6.18.21-abogki553682993 + SukiSU + SELinux Hide + susfs v2.4 (FinaSU manager)
 do.devicecheck=1
 do.modules=0
 do.systemless=0

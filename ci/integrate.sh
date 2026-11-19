@@ -19,6 +19,13 @@ SRC="$(cd "${SRC:-kernel}" && pwd)"
 KSU_BRANCH="${KSU_BRANCH:-main}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# finasu-native：走 LyraVoid/FinaSU 原生内核集成，与下面的 SukiSU 路径互斥。
+if [ "${KSU_VARIANT:-sukisu}" = "finasu" ]; then
+    echo "==> [finasu] 使用 FinaSU 原生内核集成（跳过 SukiSU 路径）"
+    export SRC KSU_VARIANT
+    exec bash "$HERE/ci/integrate_finasu.sh"
+fi
+
 echo "==> A 按官方指南集成 KernelSU（分支 $KSU_BRANCH）"
 cd "$SRC"
 curl -LSs "https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nova/main/kernel/setup.sh" \
@@ -34,6 +41,67 @@ if [ -L "$SRC/drivers/kernelsu" ]; then
     echo "    $target -> drivers/kernelsu"
 fi
 [ -d "$SRC/drivers/kernelsu" ] || { echo "!! drivers/kernelsu 不存在"; exit 1; }
+
+echo "==> B2 finasu: 让 get_info 上报 hook 类型"
+# FinaSU 管理器的「钩子类型」来自 ksu_get_info_cmd.flags 的 1<<6 / 1<<7 / 1<<8，
+# SukiSU-Nova 完全没有这几个位，所以一直显示「旧版/未知」。
+# 本内核的 syscall 重定向走 sys_enter tracepoint，因此上报 TRACEPOINT；
+# READY 只在 tracepoint 注册成功时置位，失败时管理器会显示「（异常）」。
+python3 - "$SRC" <<'PYEOF'
+import sys
+root = sys.argv[1] + "/drivers/kernelsu"
+
+# 1) hook/syscall_hook_manager.c：记录 tracepoint 是否注册成功
+p = root + "/hook/syscall_hook_manager.c"
+s = open(p).read()
+if "ksu_syscall_hook_ready" not in s:
+    anchor = "void __init ksu_syscall_hook_manager_init(void)\n{"
+    assert s.count(anchor) == 1, "hook manager: init 锚点"
+    s = s.replace(
+        anchor,
+        "/* finasu: 供 supercall get_info 上报 hook 是否就绪 */\n"
+        "bool ksu_syscall_hook_ready = false;\n\n" + anchor,
+        1,
+    )
+    ok = '        pr_info("hook_manager: sys_enter tracepoint registered\\n");'
+    assert s.count(ok) == 1, "hook manager: 注册成功日志锚点"
+    s = s.replace(ok, ok + "\n        ksu_syscall_hook_ready = true;", 1)
+    open(p, "w").write(s)
+    print("    hook manager: ready 标记已加")
+
+# 2) supercall/dispatch.c：新旧两条 get_info 路径都上报
+#    标记用局部 #define，不写进 uapi 头，避免 static const 在未引用它的
+#    编译单元里触发 -Wunused-const-variable。
+p = root + "/supercall/dispatch.c"
+s = open(p).read()
+if "KSU_GET_INFO_FLAG_HOOK_TRACEPOINT" not in s:
+    inc = '#include "klog.h" // IWYU pragma: keep'
+    assert s.count(inc) == 1, "dispatch.c: klog include 锚点"
+    head = (
+        "/* finasu: 与 FinaSU 管理器共享的 hook 后端标记（SukiSU-Nova 未定义） */\n"
+        "#ifndef KSU_GET_INFO_FLAG_HOOK_TRACEPOINT\n"
+        "#define KSU_GET_INFO_FLAG_HOOK_TRACEPOINT (1U << 6)\n"
+        "#endif\n"
+        "#ifndef KSU_GET_INFO_FLAG_HOOK_READY\n"
+        "#define KSU_GET_INFO_FLAG_HOOK_READY (1U << 8)\n"
+        "#endif\n"
+        "extern bool ksu_syscall_hook_ready;\n"
+    )
+    s = s.replace(inc, head + inc, 1)
+    block = (
+        "    /* finasu: 上报 syscall hook 后端，本内核走 sys_enter tracepoint */\n"
+        "#ifdef CONFIG_HAVE_SYSCALL_TRACEPOINTS\n"
+        "    cmd.flags |= KSU_GET_INFO_FLAG_HOOK_TRACEPOINT;\n"
+        "    if (ksu_syscall_hook_ready)\n"
+        "        cmd.flags |= KSU_GET_INFO_FLAG_HOOK_READY;\n"
+        "#endif\n"
+    )
+    n = s.count("    cmd.features = KSU_FEATURE_MAX;")
+    assert n == 2, "dispatch.c: get_info 锚点数量 %d" % n
+    s = s.replace("    cmd.features = KSU_FEATURE_MAX;", block + "    cmd.features = KSU_FEATURE_MAX;")
+    open(p, "w").write(s)
+    print("    dispatch.c: hook 类型上报已注入 %d 处" % n)
+PYEOF
 
 echo "==> C 注册 CONFIG_KSU_SUSFS"
 # 上游没有 SUSFS 开关，补一个。放 drivers/Kconfig 而非 kernelsu 的 Kconfig，

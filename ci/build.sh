@@ -23,6 +23,38 @@ CFG="${CFG:-config/dijun_defconfig}"
 JOBS="${JOBS:-$(nproc)}"
 LLVM_SUFFIX="${LLVM_SUFFIX:--18}"
 
+# ---- 管理器身份（按 KSU_VARIANT 分流）----
+# matrix 一次构建两个内核，各自只信任自己的管理器：
+#   - sukisu：SukiSU-Nova 内核，用上游默认槽（com.sukisu.nova + 默认签名），
+#            不注入任何 KSU_* make 参数；
+#   - finasu ：FinaSU 本体内核，用其第二信任槽
+#            （KSU_EXPECTED_SIZE2/HASH2 + KSU_SECOND_SIGNATURE_RELEASE），
+#            签名来自 workflow 现抓的官方最新管理器。
+KSU_SIGN_MAKE_ARGS=()
+case "${KSU_VARIANT:-sukisu}" in
+  finasu)
+    if [ -n "${MANAGER_CERT_SIZE:-}" ] && [ -n "${MANAGER_CERT_HASH:-}" ]; then
+        KSU_SIGN_MAKE_ARGS+=("KSU_EXPECTED_SIZE2=${MANAGER_CERT_SIZE}")
+        KSU_SIGN_MAKE_ARGS+=("KSU_EXPECTED_HASH2=${MANAGER_CERT_HASH}")
+        KSU_SIGN_MAKE_ARGS+=("KSU_SECOND_SIGNATURE_RELEASE=1")
+        echo "==> 管理器身份: FinaSU 原生（第二信任槽）"
+        echo "==> 管理器信任槽2: size=${MANAGER_CERT_SIZE} hash=${MANAGER_CERT_HASH}"
+        echo "    ${MANAGER_TAG:-FinaSU@latest}"
+    else
+        echo "::error::finasu 变体未提供 MANAGER_CERT_*，会验签失败"
+        exit 1
+    fi
+    ;;
+  sukisu)
+    # SukiSU 用内核默认槽，绝不注入包名/签名覆盖（否则会信任错管理器）
+    echo "==> 管理器身份: SukiSU 默认槽（com.sukisu.nova + 上游签名，无覆盖）"
+    ;;
+  *)
+    echo "::error::未知 KSU_VARIANT=${KSU_VARIANT}"
+    exit 1
+    ;;
+esac
+
 # LLVM=1 要求 PATH 里有不带后缀的 clang/ld.lld/llvm-objcopy；
 # 只有 ubuntu 的 clang-18 时要用 LLVM=-18 走带后缀的工具链。
 # AOSP 预编译 clang 自带这些名字，用 LLVM=1 才能让 POR_EL0 之类的
@@ -180,7 +212,7 @@ disable_cfg() {
     fi
 }
 
-for k in KSU KSU_SUSFS MODULE_SCMVERSION RUST ASHMEM; do
+for k in KSU KSU_SUSFS MODULE_SCMVERSION RUST ASHMEM KALLSYMS_ALL; do
     enable_cfg "$k" "$SRC/.config"
 done
 
@@ -296,7 +328,7 @@ print("    mkcompile_h 已改为输出官方编译器串")
 PY
 
 echo "==> 5 编译 Image（$JOBS 并发）"
-make -C "$SRC" ARCH=arm64 LLVM="$LLVM_VAL" $RUST_ARGS -j"$JOBS" Image
+make -C "$SRC" ARCH=arm64 LLVM="$LLVM_VAL" $RUST_ARGS "${KSU_SIGN_MAKE_ARGS[@]}" -j"$JOBS" Image
 
 echo "==> 6 抽取 .BTF 与产物"
 cp "$SRC/arch/arm64/boot/Image" "$OUT/Image"

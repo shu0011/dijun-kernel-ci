@@ -3,7 +3,7 @@ name: build-dijun-kernel
 on:
   workflow_dispatch:
   push:
-    branches: [main, upstream-align, feat/kernel-owner-exempt]
+    branches: [main, finasu-native]
 
 concurrency:
   group: build-dijun-${{ github.ref }}
@@ -13,11 +13,20 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
+    # 一次构建同时出两个内核：SukiSU 管理器版 + FinaSU 管理器版。
+    # 两个 job 各自拉源码、集成对应 KSU、编译、打包，互不干扰。
+    strategy:
+      fail-fast: false
+      matrix:
+        ksu_variant: [sukisu, finasu]
     env:
       # 正式版：恢复 CONFIG_PANIC_ON_OOPS 默认（y）
       DIAG_NO_PANIC: "0"
       # upstream-align：SUSFS 走官方 v2.4.0 实现（自研阶段由 SUSFS_UPSTREAM=1 关闭）
       SUSFS_UPSTREAM: "1"
+      # 由矩阵注入：sukisu=内核默认槽（SukiSU-Nova），finasu=FinaSU 本体 + 签名注入。
+      # integrate.sh 检测到 finasu 会转交给 ci/integrate_finasu.sh。
+      KSU_VARIANT: ${{ matrix.ksu_variant }}
 
     steps:
       - uses: actions/checkout@v4
@@ -158,6 +167,83 @@ jobs:
           mkdir -p out
           bash ci/integrate.sh 2>&1 | tee out/integrate.log
 
+      # finasu-v23-compat: 内核信任的管理器签名必须跟随官方最新版，
+      # 不能写死证书 —— 否则编出信任 v1.5 的内核，用户却装了 v1.6 管理器，
+      # 签名对不上就拿不到 root。这里从 releases/latest 现取 APK 解出证书。
+      # 主路径走 github.com 网页 + git 协议（不受 api.github.com 匿名 60/h 限流）；
+      # Actions 共享出口 IP 的匿名 API 会被别人打满返回 403（#152 实测），故 API 仅兜底。
+      - name: 抓取 FinaSU 最新管理器签名
+        if: matrix.ksu_variant == 'finasu'
+        run: |
+          set -euo pipefail
+          repo="LyraVoid/FinaSU"
+          api="https://api.github.com/repos/$repo"
+          web="https://github.com/$repo"
+          apk="$GITHUB_WORKSPACE/manager.apk"
+          get() { curl -fsSL --retry 3 --max-time 60 "$1"; }
+
+          # 主路径（网页，无 API 限流）：git ls-remote 取最新 tag，expanded_assets 取 release apk 直链
+          tag=""
+          url=""
+          if t=$(git ls-remote --tags --refs "https://github.com/$repo.git" 'refs/tags/v*' \
+                 | sed 's|.*refs/tags/||' | sort -V | tail -1) && [ -n "$t" ]; then
+            tag="$t"
+            echo "管理器版本(网页): $tag"
+            rel=$(get "$web/releases/expanded_assets/$tag" | python3 -c '
+          import sys,re
+          links=re.findall(r"href=\"([^\"]+\.apk)\"", sys.stdin.read())
+          pref=[x for x in links if "release" in x] or links
+          print(pref[0] if pref else "")') || true
+            if [ -n "$rel" ]; then
+              url="https://github.com$rel"
+            fi
+          fi
+
+          # 兜底：网页通道拿不到（页面改版/网络问题）才碰 API；全程匿名，不带 GITHUB_TOKEN
+          if [ -z "$tag" ] || [ -z "$url" ]; then
+            echo "网页通道不完整，回退 API"
+            tag=$(get "$api/releases/latest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+            meta=$(get "$api/releases/tags/$tag")
+            url=$(printf '%s' "$meta" | python3 -c '
+          import json,sys
+          d=json.load(sys.stdin)
+          a=[x for x in d["assets"] if x["name"].endswith(".apk")]
+          p=[x for x in a if "release" in x["name"]] or a
+          print(p[0]["browser_download_url"] if p else "")')
+          fi
+          echo "管理器版本: $tag"
+          if [ -z "$url" ]; then
+            echo "::error::LyraVoid/FinaSU release $tag 里没有 release apk 资产"
+            exit 1
+          fi
+
+          echo "下载: $url"
+          curl -fsSL --retry 3 --max-time 180 -o "$apk" "$url"
+          ls -l "$apk"
+          # 下载下来的必须是可解析的 APK（zipfile 能打开），否则后面解证书只会给出误导性错误
+          python3 -c 'import sys,zipfile; zipfile.ZipFile(sys.argv[1]); print("APK 校验 OK")' "$apk"
+
+          python3 tools/manager_identity.py "$apk" | tee "$GITHUB_WORKSPACE/mgr.txt"
+          # manager_identity.py 默认输出 key=value，直接进 $GITHUB_ENV
+          cat "$GITHUB_WORKSPACE/mgr.txt" >> "$GITHUB_ENV"
+          echo "MANAGER_TAG=$tag" >> "$GITHUB_ENV"
+          # 映射到 build.sh 读的变量名
+          echo "MANAGER_CERT_SIZE=$(awk -F= '/^cert_size=/{print $2}' "$GITHUB_WORKSPACE/mgr.txt")" >> "$GITHUB_ENV"
+          echo "MANAGER_CERT_HASH=$(awk -F= '/^cert_sha256=/{print $2}' "$GITHUB_WORKSPACE/mgr.txt")" >> "$GITHUB_ENV"
+
+          # finasu-native：内核必须检出与管理器 Release 对应的提交，
+          # 这样内核 KSU 版本（30000 + git 提交数）与管理器 versionCode 同源。
+          FINASU_COMMIT=$(git ls-remote https://github.com/LyraVoid/FinaSU.git "refs/tags/$tag^{}" | awk '{print $1}')
+          if [ -z "$FINASU_COMMIT" ]; then
+            FINASU_COMMIT=$(git ls-remote https://github.com/LyraVoid/FinaSU.git "refs/tags/$tag" | awk '{print $1}')
+          fi
+          if [ -n "$FINASU_COMMIT" ]; then
+            echo "FINASU_COMMIT=$FINASU_COMMIT" >> "$GITHUB_ENV"
+            echo "FinaSU 内核提交: $FINASU_COMMIT"
+          else
+            echo "::warning::未能解析 FinaSU 标签 $tag 的提交，内核将使用 master HEAD"
+          fi
+
       - name: 编译 Image 并抽取 BTF
         run: |
           set -o pipefail
@@ -201,11 +287,24 @@ jobs:
           rm -rf /tmp/ak3/.git /tmp/ak3/.github /tmp/ak3/modules /tmp/ak3/patch /tmp/ak3/ramdisk
           cp "$GITHUB_WORKSPACE/out/Image" /tmp/ak3/Image
           cp "$GITHUB_WORKSPACE/ak3/anykernel.sh" /tmp/ak3/anykernel.sh
-          AK3_NAME="ak3-xring-o1-6.18-sukisu-susfs2.4-gki553682993.zip"
+
+          if [ "${KSU_VARIANT}" = "finasu" ]; then
+            # finasu：包名带管理器版本号（取自 releases/latest 抓到的 tag），升级后自动跟随
+            # ${MANAGER_TAG#v} 去掉前缀 v：finasu1.6.4
+            FINASU_VER="${MANAGER_TAG#v}"
+            AK3_NAME="ak3-xring-o1-6.18-finasu${FINASU_VER}-native-susfs2.4-gki553682993.zip"
+            sed -i 's|kernel.string=.*|kernel.string=xring-o1 6.18.21-abogki553682993 + SukiSU + SELinux Hide + susfs v2.4 (FinaSU manager)|' /tmp/ak3/anykernel.sh
+          else
+            # sukisu：固定包名
+            AK3_NAME="ak3-xring-o1-6.18-sukisu-susfs2.4-gki553682993.zip"
+            sed -i 's|kernel.string=.*|kernel.string=xring-o1 6.18.21-abogki553682993 + SukiSU + SELinux Hide + susfs v2.4|' /tmp/ak3/anykernel.sh
+          fi
+
           ( cd /tmp/ak3 && zip -r9 "$GITHUB_WORKSPACE/out/$AK3_NAME" . )
           ls -l out/*.zip
           sha256sum out/*.zip
           unzip -l "$GITHUB_WORKSPACE/out/$AK3_NAME"
+          echo "AK3_NAME=$AK3_NAME" >> "$GITHUB_ENV"
 
       - name: 摘要
         if: always()
@@ -214,7 +313,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: dijun-kernel-${{ github.run_number }}
+          name: dijun-kernel-${{ matrix.ksu_variant }}-${{ github.run_number }}
           path: |
             out/
             kernel-fetch.log
