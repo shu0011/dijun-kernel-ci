@@ -241,6 +241,9 @@ else:
     print("    !! statfs.c 没找到 wrapper 定义，跳过")
 PY
 
+if [ "${KSU_VARIANT:-sukisu}" = "finasu" ]; then
+    echo "==> [upstream] FinaSU 使用真实 TIF 线程标志，跳过 SukiSU 的闸门替换"
+else
 echo "==> [upstream] 6.18 适配：susfs_def.h 的三个 TIF 闸门"
 python3 - "$SRC/include/linux/susfs_def.h" <<'PY'
 import sys
@@ -283,6 +286,7 @@ s = s.replace(old3, new3, 1)
 open(p, "w").write(s)
 print("    闸门已替换为 KSU 判定（含 umounted_app）")
 PY
+fi
 
 echo "==> [upstream] 6.18 适配：fs/stat.c（SUS_KSTAT 官方钩子）"
 python3 - "$SRC" <<'PY'
@@ -697,6 +701,9 @@ open(p, "w").write(s)
 print("    namei.c: open_redirect 已注入（path_openat + vfs_readlink）")
 PY
 
+if [ "${KSU_VARIANT:-sukisu}" = "finasu" ]; then
+    echo "==> [upstream] FinaSU 原生 setuid_hook 已调度 susfs_extra_works，跳过 LOOP 注入"
+else
 echo "==> [upstream] 接官方 LOOP 调度（ADD_SUS_PATH_LOOP 落地）"
 # 官方 10_enable_susfs_for_ksu.patch 在 KernelSU 的 setresuid 钩子里调度
 # susfs_extra_works；没有这一步，susfs_add_sus_path_loop() 只入队、永远不落地。
@@ -752,6 +759,7 @@ s = s.replace(umount_anchor, umount_anchor +
 open(p, "w").write(s)
 print("    setuid_hook.c: 官方 LOOP 调度已接入")
 PYP
+fi
 echo "==> [upstream] 6.18 适配：fs/proc/task_mmu.c（sus_map 展示隐藏）"
 # 6.18.21（2026-06 快照）与 HEAD 的 task_mmu 结构差异较大。
 # 核心两处（show_map_vma / show_smap）用稳定锚点注入；
