@@ -19,6 +19,13 @@ SRC="$(cd "${SRC:-kernel}" && pwd)"
 KSU_BRANCH="${KSU_BRANCH:-main}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# finasu-native：走 LyraVoid/FinaSU 原生内核集成，与下面的 SukiSU 路径互斥。
+if [ "${KSU_VARIANT:-sukisu}" = "finasu" ]; then
+    echo "==> [finasu] 使用 FinaSU 原生内核集成（跳过 SukiSU 路径）"
+    export SRC KSU_VARIANT
+    exec bash "$HERE/ci/integrate_finasu.sh"
+fi
+
 echo "==> A 按官方指南集成 KernelSU（分支 $KSU_BRANCH）"
 cd "$SRC"
 curl -LSs "https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nova/main/kernel/setup.sh" \

@@ -23,26 +23,35 @@ CFG="${CFG:-config/dijun_defconfig}"
 JOBS="${JOBS:-$(nproc)}"
 LLVM_SUFFIX="${LLVM_SUFFIX:--18}"
 
-# ---- finasu-v23-compat: 管理器身份（包名 + 信任签名）----
-# SukiSU-Nova 的 drivers/kernelsu/Kbuild 用三个 ?= 变量，均可命令行覆盖：
-#   KSU_PACKAGE_NAME    thronetracker 按【包名】扫 /data/app 找管理器（maybe_manager_apk_dir）
-#   KSU_EXPECTED_SIZE/HASH  找到后【验签】用的证书（单槽位）
-# 两个都要对齐 FinaSU，缺一不可：
-#   只改签名不改包名 → 内核只扫 com.sukisu.nova，FinaSU(me.yuki.fina) 连被验签的机会都没有
-#     （实测 #151：Searching manager com.sukisu.nova... / is_manager: 0 / 三个管理器都无 root）
-#   只改包名不改签名 → 扫到 FinaSU 但验签不过，同样 is_manager: 0
-# 包名固定 me.yuki.fina（FinaSU 官方包名，不随版本变）；签名由 workflow
-# 的「抓取 FinaSU 最新管理器签名」一步经环境变量注入，跟随 releases/latest。
+# ---- 管理器身份 ----
+# KSU_VARIANT=finasu（finasu-native）：内核就是 LyraVoid/FinaSU 本体，包名/签名走
+#   FinaSU 自带的第二信任槽（KSU_EXPECTED_SIZE2/HASH2 + KSU_SECOND_SIGNATURE_RELEASE），
+#   不再需要改包名。
+# 其它变体（finasu-v23-compat 等，SukiSU-Nova 内核 + FinaSU 管理器）：
+#   KSU_PACKAGE_NAME 改包名，KSU_EXPECTED_SIZE/HASH 改单槽证书。
 KSU_SIGN_MAKE_ARGS=()
-KSU_SIGN_MAKE_ARGS+=("KSU_PACKAGE_NAME=me.yuki.fina")
-if [ -n "${MANAGER_CERT_SIZE:-}" ] && [ -n "${MANAGER_CERT_HASH:-}" ]; then
-    KSU_SIGN_MAKE_ARGS+=("KSU_EXPECTED_SIZE=${MANAGER_CERT_SIZE}")
-    KSU_SIGN_MAKE_ARGS+=("KSU_EXPECTED_HASH=${MANAGER_CERT_HASH}")
-    echo "==> 管理器身份: package=me.yuki.fina"
-    echo "==> 管理器信任槽: size=${MANAGER_CERT_SIZE} hash=${MANAGER_CERT_HASH}"
-    echo "    ${MANAGER_TAG:-FinaSU@latest}"
+if [ "${KSU_VARIANT:-sukisu}" = "finasu" ]; then
+    if [ -n "${MANAGER_CERT_SIZE:-}" ] && [ -n "${MANAGER_CERT_HASH:-}" ]; then
+        KSU_SIGN_MAKE_ARGS+=("KSU_EXPECTED_SIZE2=${MANAGER_CERT_SIZE}")
+        KSU_SIGN_MAKE_ARGS+=("KSU_EXPECTED_HASH2=${MANAGER_CERT_HASH}")
+        KSU_SIGN_MAKE_ARGS+=("KSU_SECOND_SIGNATURE_RELEASE=1")
+        echo "==> 管理器身份: FinaSU 原生（第二信任槽）"
+        echo "==> 管理器信任槽2: size=${MANAGER_CERT_SIZE} hash=${MANAGER_CERT_HASH}"
+        echo "    ${MANAGER_TAG:-FinaSU@latest}"
+    else
+        echo "==> 未提供 MANAGER_CERT_*，FinaSU 原型只信任内核默认槽（会验签失败，仅本地调试用）"
+    fi
 else
-    echo "==> 未提供 MANAGER_CERT_*，包名已设为 me.yuki.fina 但签名用内核默认（会验签失败，仅本地调试用）"
+    KSU_SIGN_MAKE_ARGS+=("KSU_PACKAGE_NAME=me.yuki.fina")
+    if [ -n "${MANAGER_CERT_SIZE:-}" ] && [ -n "${MANAGER_CERT_HASH:-}" ]; then
+        KSU_SIGN_MAKE_ARGS+=("KSU_EXPECTED_SIZE=${MANAGER_CERT_SIZE}")
+        KSU_SIGN_MAKE_ARGS+=("KSU_EXPECTED_HASH=${MANAGER_CERT_HASH}")
+        echo "==> 管理器身份: package=me.yuki.fina"
+        echo "==> 管理器信任槽: size=${MANAGER_CERT_SIZE} hash=${MANAGER_CERT_HASH}"
+        echo "    ${MANAGER_TAG:-FinaSU@latest}"
+    else
+        echo "==> 未提供 MANAGER_CERT_*，包名已设为 me.yuki.fina 但签名用内核默认（会验签失败，仅本地调试用）"
+    fi
 fi
 
 # LLVM=1 要求 PATH 里有不带后缀的 clang/ld.lld/llvm-objcopy；
@@ -202,7 +211,7 @@ disable_cfg() {
     fi
 }
 
-for k in KSU KSU_SUSFS MODULE_SCMVERSION RUST ASHMEM; do
+for k in KSU KSU_SUSFS MODULE_SCMVERSION RUST ASHMEM KALLSYMS_ALL; do
     enable_cfg "$k" "$SRC/.config"
 done
 

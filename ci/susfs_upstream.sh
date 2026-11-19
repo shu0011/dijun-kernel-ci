@@ -81,6 +81,11 @@ print("    susfs.c 已插入 %d 个全局函数原型" % len(protos))
 PYP
 
 echo "==> [upstream] 补齐官方 CONFIG 开关"
+# FinaSU 原生内核的 drivers/kernelsu/Kconfig 已自带完整的 KSU_SUSFS 子项，
+# 再往 drivers/Kconfig 里塞一遍会造成重复 config 定义，直接跳过。
+if grep -q '^config KSU_SUSFS_SUS_PATH$' "$SRC/drivers/kernelsu/Kconfig" 2>/dev/null; then
+    echo "    drivers/kernelsu/Kconfig 已自带 SUSFS 子项，跳过"
+else
 python3 - "$SRC/drivers/Kconfig" <<'PY'
 import sys
 p = sys.argv[1]
@@ -106,6 +111,7 @@ if add:
 else:
     print("    CONFIG 已齐")
 PY
+fi
 
 
 echo "==> [upstream] 瘦身 bridge（官方 susfs.c 已提供同名符号，避免重复定义）"

@@ -3,7 +3,7 @@ name: build-dijun-kernel
 on:
   workflow_dispatch:
   push:
-    branches: [main, upstream-align, feat/kernel-owner-exempt, finasu-v23-compat]
+    branches: [main, upstream-align, feat/kernel-owner-exempt, finasu-v23-compat, finasu-native]
 
 concurrency:
   group: build-dijun-${{ github.ref }}
@@ -18,6 +18,9 @@ jobs:
       DIAG_NO_PANIC: "0"
       # upstream-align：SUSFS 走官方 v2.4.0 实现（自研阶段由 SUSFS_UPSTREAM=1 关闭）
       SUSFS_UPSTREAM: "1"
+      # finasu：内核使用 LyraVoid/FinaSU 本体（不是改 SukiSU），
+      # integrate.sh 检测到该变量会转交给 ci/integrate_finasu.sh。
+      KSU_VARIANT: "finasu"
 
     steps:
       - uses: actions/checkout@v4
@@ -221,6 +224,19 @@ jobs:
           echo "MANAGER_CERT_SIZE=$(awk -F= '/^cert_size=/{print $2}' "$GITHUB_WORKSPACE/mgr.txt")" >> "$GITHUB_ENV"
           echo "MANAGER_CERT_HASH=$(awk -F= '/^cert_sha256=/{print $2}' "$GITHUB_WORKSPACE/mgr.txt")" >> "$GITHUB_ENV"
 
+          # finasu-native：内核必须检出与管理器 Release 对应的提交，
+          # 这样内核 KSU 版本（30000 + git 提交数）与管理器 versionCode 同源。
+          FINASU_COMMIT=$(git ls-remote https://github.com/LyraVoid/FinaSU.git "refs/tags/$tag^{}" | awk '{print $1}')
+          if [ -z "$FINASU_COMMIT" ]; then
+            FINASU_COMMIT=$(git ls-remote https://github.com/LyraVoid/FinaSU.git "refs/tags/$tag" | awk '{print $1}')
+          fi
+          if [ -n "$FINASU_COMMIT" ]; then
+            echo "FINASU_COMMIT=$FINASU_COMMIT" >> "$GITHUB_ENV"
+            echo "FinaSU 内核提交: $FINASU_COMMIT"
+          else
+            echo "::warning::未能解析 FinaSU 标签 $tag 的提交，内核将使用 master HEAD"
+          fi
+
       - name: 编译 Image 并抽取 BTF
         run: |
           set -o pipefail
@@ -268,7 +284,7 @@ jobs:
           # releases/latest 自动抓到的 tag（如 v1.6.4），管理器升级后包名自动跟随。
           # ${MANAGER_TAG#v} 去掉前缀 v：finasu1.6.4（不加空格，避免刷机/下载转义问题）
           FINASU_VER="${MANAGER_TAG#v}"
-          AK3_NAME="ak3-xring-o1-6.18-finasu${FINASU_VER}-susfs2.4-gki553682993.zip"
+          AK3_NAME="ak3-xring-o1-6.18-finasu${FINASU_VER}-native-susfs2.4-gki553682993.zip"
           ( cd /tmp/ak3 && zip -r9 "$GITHUB_WORKSPACE/out/$AK3_NAME" . )
           ls -l out/*.zip
           sha256sum out/*.zip
