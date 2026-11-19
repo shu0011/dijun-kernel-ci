@@ -40,15 +40,15 @@ ln -sfn "$(realpath --relative-to="$DRIVER_DIR" "$SRC/KernelSU/kernel")" "$DRIVE
 grep -q 'kernelsu/' "$DRIVER_DIR/Makefile" || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> "$DRIVER_DIR/Makefile"
 grep -q 'source "drivers/kernelsu/Kconfig"' "$DRIVER_DIR/Kconfig" || sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' "$DRIVER_DIR/Kconfig"
 
-echo "==> [finasu] 版本品牌串固定为 @finasu"
+echo "==> [finasu] 版本品牌串固定为 @shushu"
 python3 - "$SRC/KernelSU/kernel/Kbuild" <<'PY'
 import sys
 p = sys.argv[1]
 s = open(p).read()
 old = "@$(KSU_VERSION_BRANCH)"
 if old in s:
-    open(p, "w").write(s.replace(old, "@finasu", 1))
-    print("    KSU_VERSION_FULL 中的分支段已固定为 @finasu")
+    open(p, "w").write(s.replace(old, "@shushu", 1))
+    print("    KSU_VERSION_FULL 中的分支段已固定为 @shushu")
 else:
     print("    !! 未找到 @$(KSU_VERSION_BRANCH)，跳过（仅影响版本显示）")
 PY
