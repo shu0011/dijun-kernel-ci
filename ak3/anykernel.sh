@@ -4,7 +4,7 @@
 ### AnyKernel setup
 # global properties
 properties() { '
-kernel.string=dijun 6.18.21-abogki553682993 + SukiSU v3.0.0-c60f21b9 + SELinux Hide
+kernel.string=xring-o1 6.18.21-abogki553682993 + SukiSU + SELinux Hide + susfs v2.4
 do.devicecheck=1
 do.modules=0
 do.systemless=0
@@ -12,8 +12,8 @@ do.cleanup=1
 do.cleanuponabort=0
 device.name1=dijun
 device.name2=25053RP5CC
-device.name3=
-device.name4=
+device.name3=jinghu
+device.name4=violin
 device.name5=
 supported.versions=
 supported.patchlevels=

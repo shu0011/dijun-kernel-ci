@@ -201,10 +201,11 @@ jobs:
           rm -rf /tmp/ak3/.git /tmp/ak3/.github /tmp/ak3/modules /tmp/ak3/patch /tmp/ak3/ramdisk
           cp "$GITHUB_WORKSPACE/out/Image" /tmp/ak3/Image
           cp "$GITHUB_WORKSPACE/ak3/anykernel.sh" /tmp/ak3/anykernel.sh
-          ( cd /tmp/ak3 && zip -r9 "$GITHUB_WORKSPACE/out/AK3-dijun-${{ github.run_number }}.zip" . )
-          ls -l out/AK3-*.zip
-          sha256sum out/AK3-*.zip
-          unzip -l out/AK3-*.zip
+          AK3_NAME="ak3-xring-o1-6.18-sukisu-susfs2.4-gki553682993.zip"
+          ( cd /tmp/ak3 && zip -r9 "$GITHUB_WORKSPACE/out/$AK3_NAME" . )
+          ls -l out/*.zip
+          sha256sum out/*.zip
+          unzip -l "$GITHUB_WORKSPACE/out/$AK3_NAME"
 
       - name: 摘要
         if: always()

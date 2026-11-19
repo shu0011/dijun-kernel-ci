@@ -2,7 +2,7 @@
 
 > 设备：小米 15S Pro（`dijun`），HyperOS OS4.0.5.0，玄戒 O1
 > 内核基线：`6.18.21-android17-5-g284297031c53-abogki553682993-4k`（GKI / KMI `android17-6.18`）
-> 当前版本：**#147**（分支 `main`，commit `ee96ad70`，CI run `44278522101` 构建成功，已上机多次重启验证稳定）
+> 当前版本：以 Releases 最新条目为准（分支 `main`，CI 自动构建，已上机多次重启验证稳定）
 > 上游：2026-11-15 起 SukiSU-Ultra 更名为 **SukiSU-Nova**，本项目跟踪其 `main` 分支
 
 本仓库用 GitHub Actions 复现整套构建：AOSP `android17-6.18` 源码 + 设备原厂 `boot.img` 抽出的 config，
