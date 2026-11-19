@@ -64,6 +64,123 @@ echo "==> [finasu] 跳过 bridge（FinaSU selinux.c 已提供 SID 与 ksu_domain
 echo "==> [finasu] 应用 SUSFS v2.4.0 内核侧移植"
 KSU_VARIANT=finasu bash "$HERE/ci/susfs_upstream.sh" "$SRC" "$HERE"
 
+echo "==> [finasu] mount_view_filter 改走 SUSFS 号段挂载隐藏"
+# 本机型 EL2 保护禁止 fixmap 改 rodata，FinaSU 的 ksu_patch_text 改
+# proc_mounts_operations.open 会返回 -EFAULT（dmesg 实测 -14），
+# 「隐藏挂载记录」因此永远启用失败。改成复用 SUSFS 的
+# susfs_is_hide_sus_mnts_for_non_su_procs_enabled：
+# 对非 su 进程隐藏 mnt_id >= DEFAULT_KSU_MNT_ID 的 root/模块挂载。
+python3 - "$SRC/drivers/kernelsu/feature/mount_view_filter.c" <<'PYMVF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+GUARD = "#if defined(CONFIG_KSU_SUSFS) && defined(CONFIG_KSU_SUSFS_SUS_MOUNT)"
+if "susfs_is_hide_sus_mnts_for_non_su_procs_enabled" not in s:
+    inc = '#include "mount_view_filter.h"\n'
+    assert s.count(inc) == 1, "mvf: include 锚点"
+    s = s.replace(
+        inc,
+        inc
+        + "\n" + GUARD + "\n"
+        + "#include <linux/jump_label.h>\n"
+        + "/* SUSFS 的号段挂载隐藏开关，定义在 fs/susfs.c */\n"
+        + "extern struct static_key_false susfs_is_hide_sus_mnts_for_non_su_procs_enabled;\n"
+        + "#endif\n",
+        1,
+    )
+
+    old_get = (
+        "static int ksu_mvf_feature_get(u64 *value)\n"
+        "{\n"
+        "    *value = READ_ONCE(ksu_mvf_enabled) ? 1 : 0;\n"
+        "    return 0;\n"
+        "}"
+    )
+    assert s.count(old_get) == 1, "mvf: get 锚点"
+    new_get = (
+        "static int ksu_mvf_feature_get(u64 *value)\n"
+        "{\n"
+        + GUARD + "\n"
+        "    *value = static_branch_unlikely(&susfs_is_hide_sus_mnts_for_non_su_procs_enabled) ? 1 : 0;\n"
+        "    return 0;\n"
+        "#else\n"
+        "    *value = READ_ONCE(ksu_mvf_enabled) ? 1 : 0;\n"
+        "    return 0;\n"
+        "#endif\n"
+        "}"
+    )
+    s = s.replace(old_get, new_get, 1)
+
+    old_set = (
+        "static int ksu_mvf_feature_set(u64 value)\n"
+        "{\n"
+        "    bool enable = value != 0;\n"
+        "    int ret = 0;\n"
+        "\n"
+        "    mutex_lock(&ksu_mvf_mutex);\n"
+        "    if (enable) {\n"
+        "        if (!smp_load_acquire(&ksu_mvf_enabled)) {\n"
+        "            ret = ksu_mvf_resolve_symbols();\n"
+        "            if (!ret)\n"
+        "                ret = ksu_mvf_install_hooks();\n"
+        "            if (!ret)\n"
+        "                smp_store_release(&ksu_mvf_enabled, true);\n"
+        "            else {\n"
+        "                ksu_mvf_restore_hooks();\n"
+        "                synchronize_rcu();\n"
+        "            }\n"
+        "        }\n"
+        "    } else if (smp_load_acquire(&ksu_mvf_enabled)) {\n"
+        "        smp_store_release(&ksu_mvf_enabled, false);\n"
+        "        ret = ksu_mvf_restore_hooks();\n"
+        "        synchronize_rcu();\n"
+        "    }\n"
+        "    mutex_unlock(&ksu_mvf_mutex);\n"
+        "    return ret;\n"
+        "}"
+    )
+    assert s.count(old_set) == 1, "mvf: set 锚点"
+    new_set = (
+        "static int ksu_mvf_feature_set(u64 value)\n"
+        "{\n"
+        + GUARD + "\n"
+        "    if (value)\n"
+        "        static_branch_enable(&susfs_is_hide_sus_mnts_for_non_su_procs_enabled);\n"
+        "    else\n"
+        "        static_branch_disable(&susfs_is_hide_sus_mnts_for_non_su_procs_enabled);\n"
+        "    return 0;\n"
+        "#else\n"
+        "    bool enable = value != 0;\n"
+        "    int ret = 0;\n"
+        "\n"
+        "    mutex_lock(&ksu_mvf_mutex);\n"
+        "    if (enable) {\n"
+        "        if (!smp_load_acquire(&ksu_mvf_enabled)) {\n"
+        "            ret = ksu_mvf_resolve_symbols();\n"
+        "            if (!ret)\n"
+        "                ret = ksu_mvf_install_hooks();\n"
+        "            if (!ret)\n"
+        "                smp_store_release(&ksu_mvf_enabled, true);\n"
+        "            else {\n"
+        "                ksu_mvf_restore_hooks();\n"
+        "                synchronize_rcu();\n"
+        "            }\n"
+        "        }\n"
+        "    } else if (smp_load_acquire(&ksu_mvf_enabled)) {\n"
+        "        smp_store_release(&ksu_mvf_enabled, false);\n"
+        "        ret = ksu_mvf_restore_hooks();\n"
+        "        synchronize_rcu();\n"
+        "    }\n"
+        "    mutex_unlock(&ksu_mvf_mutex);\n"
+        "    return ret;\n"
+        "#endif\n"
+        "}"
+    )
+    s = s.replace(old_set, new_set, 1)
+    open(p, "w").write(s)
+    print("    mount_view_filter 已切换为 SUSFS 号段隐藏")
+PYMVF
+
 echo "==> [finasu] 校验关键内容"
 grep -q 'susfs_owner_record' "$SRC/fs/susfs.c" || {
     echo "!! fs/susfs.c 缺少属主豁免实现（patches/upstream/fs/susfs.c 被改动？）"
