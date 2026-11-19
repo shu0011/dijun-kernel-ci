@@ -34,11 +34,29 @@ jobs:
       - name: 安装构建依赖
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential bc bison flex libelf-dev libssl-dev libdw-dev libdwarf-dev \
-            dwarves cpio kmod lz4 xz-utils python3 \
-            clang-18 lld-18 llvm-18
+          # runner 侧 apt 偶发挂起（#170 finasu job 卡在此步 46 分钟），
+          # 用 timeout 封顶 + 清 apt 锁后重试，避免单次卡死拖垮整个 job。
+          install_deps() {
+            sudo apt-get update
+            sudo apt-get install -y \
+              build-essential bc bison flex libelf-dev libssl-dev libdw-dev libdwarf-dev \
+              dwarves cpio kmod lz4 xz-utils python3 \
+              clang-18 lld-18 llvm-18
+          }
+          ok=0
+          for attempt in 1 2 3; do
+            echo "==> 依赖安装尝试 $attempt/3"
+            if timeout 600 bash -c "$(declare -f install_deps); install_deps"; then
+              ok=1; break
+            fi
+            echo "!! 依赖安装失败/超时，清理 apt 状态后重试"
+            sudo systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+            sudo pkill -9 -f 'apt-get\|dpkg' 2>/dev/null || true
+            sudo rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null || true
+            sudo dpkg --configure -a 2>/dev/null || true
+            sleep 10
+          done
+          if [ "$ok" -ne 1 ]; then echo "::error::依赖安装 3 次均失败/超时"; exit 1; fi
           # Debian 系有些版本把 dwarf.h 放在 libdwarf/ 子目录，内核却按 <dwarf.h> 引用
           if [ ! -e /usr/include/dwarf.h ] && [ -e /usr/include/libdwarf/dwarf.h ]; then
             sudo ln -s /usr/include/libdwarf/dwarf.h /usr/include/dwarf.h
