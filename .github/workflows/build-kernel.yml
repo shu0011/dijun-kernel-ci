@@ -315,11 +315,11 @@ jobs:
             # finasu：包名带管理器版本号（取自 releases/latest 抓到的 tag），升级后自动跟随
             # ${MANAGER_TAG#v} 去掉前缀 v：finasu1.6.4
             FINASU_VER="${MANAGER_TAG#v}"
-            AK3_NAME="ak3-xring-o1-6.18-finasu${FINASU_VER}-native-susfs2.4-gki553682993.zip"
+            AK3_NAME="ak3-xring-o1-6.18-finasu${FINASU_VER}-susfs2.4-gki553682993.zip"
             sed -i 's|kernel.string=.*|kernel.string=xring-o1 6.18.21-abogki553682993 + SukiSU + SELinux Hide + susfs v2.4 (FinaSU manager)|' /tmp/ak3/anykernel.sh
           else
-            # sukisu：固定包名
-            AK3_NAME="ak3-xring-o1-6.18-sukisu-susfs2.4-gki553682993.zip"
+            # sukisu：官方 Release 版，包名带 3.0；CI 版（带 nomount）在 ci 分支单独产
+            AK3_NAME="ak3-xring-o1-6.18-sukisu3.0-susfs2.4-gki553682993.zip"
             sed -i 's|kernel.string=.*|kernel.string=xring-o1 6.18.21-abogki553682993 + SukiSU + SELinux Hide + susfs v2.4|' /tmp/ak3/anykernel.sh
           fi
 
