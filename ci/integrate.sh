@@ -1678,6 +1678,9 @@ PYEOF
 
 fi
 
+# built-in nomount（ci 分支实验：两个变体都编入，CONFIG_NOMOUNT=y）
+bash "$HERE/ci/integrate_nomount.sh" "$SRC"
+
 echo "==> H 集成完成"
 echo "    KSU 分支配置文件: $(ls "$SRC/drivers/kernelsu"/Kbuild "$SRC/drivers/kernelsu"/Makefile 2>/dev/null | tr '\n' ' ')"
 echo "    SELinux 补丁命中: $(grep -c 'CONFIG_KSU_SUSFS' "$SRC/security/selinux/status.c" 2>/dev/null || echo 0) 处 status.c"

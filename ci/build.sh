@@ -212,7 +212,7 @@ disable_cfg() {
     fi
 }
 
-for k in KSU KSU_SUSFS MODULE_SCMVERSION RUST ASHMEM KALLSYMS_ALL; do
+for k in KSU KSU_SUSFS NOMOUNT MODULE_SCMVERSION RUST ASHMEM KALLSYMS_ALL; do
     enable_cfg "$k" "$SRC/.config"
 done
 
@@ -262,7 +262,7 @@ if [ -e "$SRC/include/config/auto.conf" ]; then
     sed -i "s|^CONFIG_LOCALVERSION_AUTO=.*|CONFIG_LOCALVERSION_AUTO=y|" \
         "$SRC/include/config/auto.conf"
     drop_kleaf_file_dep "$SRC/include/config/auto.conf"
-    for k in KSU KSU_SUSFS MODULE_SCMVERSION RUST ASHMEM; do
+    for k in KSU KSU_SUSFS NOMOUNT MODULE_SCMVERSION RUST ASHMEM; do
         enable_cfg "$k" "$SRC/include/config/auto.conf"
     done
     if [ "${DIAG_NO_PANIC:-0}" = "1" ]; then

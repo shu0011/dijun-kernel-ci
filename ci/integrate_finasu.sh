@@ -181,6 +181,9 @@ if "susfs_is_hide_sus_mnts_for_non_su_procs_enabled" not in s:
     print("    mount_view_filter 已切换为 SUSFS 号段隐藏")
 PYMVF
 
+# built-in nomount（ci 分支实验：两个变体都编入，CONFIG_NOMOUNT=y）
+bash "$HERE/ci/integrate_nomount.sh" "$SRC"
+
 echo "==> [finasu] 校验关键内容"
 grep -q 'susfs_owner_record' "$SRC/fs/susfs.c" || {
     echo "!! fs/susfs.c 缺少属主豁免实现（patches/upstream/fs/susfs.c 被改动？）"

@@ -3,7 +3,7 @@ name: build-dijun-kernel
 on:
   workflow_dispatch:
   push:
-    branches: [main, finasu-native]
+    branches: [main, finasu-native, ci]
 
 concurrency:
   group: build-dijun-${{ github.ref }}
