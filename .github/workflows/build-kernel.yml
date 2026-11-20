@@ -27,6 +27,11 @@ jobs:
       # 由矩阵注入：sukisu=内核默认槽（SukiSU-Nova），finasu=FinaSU 本体 + 签名注入。
       # integrate.sh 检测到 finasu 会转交给 ci/integrate_finasu.sh。
       KSU_VARIANT: ${{ matrix.ksu_variant }}
+      # main 同步 SukiSU 官方 Release 版（tag v3.0.0，commit c60f21b9），
+      # 不再跟随 main 分支 HEAD（CI 滚动版）。CI 适配版保留在 ci 分支。
+      # 仅 sukisu job 生效：integrate.sh 用 ${KSU_BRANCH:-main} 传给 setup.sh checkout；
+      # finasu job 走 integrate_finasu.sh，克隆 FinaSU 自己的仓库，不受此变量影响。
+      KSU_BRANCH: v3.0.0
 
     steps:
       - uses: actions/checkout@v4
