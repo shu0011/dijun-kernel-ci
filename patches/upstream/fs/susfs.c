@@ -41,10 +41,10 @@ extern struct vfsmount *susfs_get_non_sus_vfsmnt_from_vfsmnt(struct vfsmount *vf
  *
  * Marks an inode added as an app data sus_path ('.../Android/data|media/<pkg>',
  * i.e. what the module's "emulate vold app data" adds). Generic sus_paths keep
- * the upstream "hide from every app uid" rule; a marked inode is only hidden
- * from app processes KSU would umount modules for. The bit lives in the same
- * address_space flags word as AS_FLAGS_SUS_PATH, so it can never disagree with
- * the hide flag it belongs to.
+ * the upstream "hide from every app uid" rule; a marked inode is hidden from
+ * every app as well, except from its owner (option C). The bit lives in the
+ * same address_space flags word as AS_FLAGS_SUS_PATH, so it can never disagree
+ * with the hide flag it belongs to.
  */
 #ifndef AS_FLAGS_SUS_PATH_APP_DATA
 #define AS_FLAGS_SUS_PATH_APP_DATA 40
@@ -255,11 +255,11 @@ const struct qstr susfs_fake_qstr_name = QSTR_INIT("..5.u.S", 7); // used to re-
  * global sus_path uid filter (susfs_set_sus_path_uid_filter).
  * Implemented at the end of the SUS_PATH block, here only the prototypes.
  *
- * Option B: a sus_path that belongs to an app data directory is hidden only
- * from app processes KSU would umount modules for, while generic sus_paths
- * keep the upstream "hide from every app uid" behaviour. The caller uses the
- * return value to set AS_FLAGS_SUS_PATH_APP_DATA on the same mapping that
- * carries AS_FLAGS_SUS_PATH.
+ * Option C: a sus_path that belongs to an app data directory is hidden from
+ * every app, except from the inode owner; generic sus_paths keep the upstream
+ * "hide from every app uid" behaviour. The caller uses the return value to set
+ * AS_FLAGS_SUS_PATH_APP_DATA on the same mapping that carries
+ * AS_FLAGS_SUS_PATH.
  */
 static bool susfs_owner_record(struct inode *inode, const char *pathname);
 static bool susfs_owner_matches(struct inode *inode);
@@ -440,18 +440,14 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 		if (unlikely(test_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_mapping->flags) &&
 			likely(!susfs_is_uid_allowed_for_sus_path(uid))))
 		{
-			/* LOCAL EXTENSION (option B): app data sus_paths follow the
-			 * LKM semantics - hidden only from app processes KSU would
-			 * umount modules for, and never from the inode owner.
-			 * Generic sus_paths keep the upstream rule. */
+			/* LOCAL EXTENSION (option C): an app data sus_path is hidden
+			 * from every app, except from the inode owner. Generic
+			 * sus_paths keep the upstream rule. */
 			if (unlikely(test_bit(AS_FLAGS_SUS_PATH_APP_DATA,
-					      &fi->inode.i_mapping->flags))) {
-				if (!susfs_is_current_proc_umounted_app())
-					return false;
-				if (inode->i_uid.val % 100000 == uid ||
-				    susfs_owner_matches(inode))
-					return false;
-			}
+					      &fi->inode.i_mapping->flags)) &&
+			    (inode->i_uid.val % 100000 == uid ||
+			     susfs_owner_matches(inode)))
+				return false;
 			//SUSFS_LOGI("hiding path with ino '%lu'\n", inode->i_ino);
 			return true;
 		}
@@ -461,18 +457,14 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 	if (unlikely(test_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags) &&
 		likely(!susfs_is_uid_allowed_for_sus_path(uid))))
 	{
-		/* LOCAL EXTENSION (option B): app data sus_paths follow the
-		 * LKM semantics - hidden only from app processes KSU would
-		 * umount modules for, and never from the inode owner.
-		 * Generic sus_paths keep the upstream rule. */
+		/* LOCAL EXTENSION (option C): an app data sus_path is hidden
+		 * from every app, except from the inode owner. Generic
+		 * sus_paths keep the upstream rule. */
 		if (unlikely(test_bit(AS_FLAGS_SUS_PATH_APP_DATA,
-				      &inode->i_mapping->flags))) {
-			if (!susfs_is_current_proc_umounted_app())
-				return false;
-			if (inode->i_uid.val % 100000 == uid ||
-			    susfs_owner_matches(inode))
-				return false;
-		}
+				      &inode->i_mapping->flags)) &&
+		    (inode->i_uid.val % 100000 == uid ||
+		     susfs_owner_matches(inode)))
+			return false;
 		//SUSFS_LOGI("hiding path with ino '%lu'\n", inode->i_ino);
 		return true;
 	}
