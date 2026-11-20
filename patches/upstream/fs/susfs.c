@@ -36,6 +36,20 @@ extern struct cred *ksu_cred;
 extern int susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt);
 extern struct vfsmount *susfs_get_non_sus_vfsmnt_from_vfsmnt(struct vfsmount *vfsmnt);
 
+/*
+ * LOCAL EXTENSION (option B), not part of upstream SUSFS.
+ *
+ * Marks an inode added as an app data sus_path ('.../Android/data|media/<pkg>',
+ * i.e. what the module's "emulate vold app data" adds). Generic sus_paths keep
+ * the upstream "hide from every app uid" rule; a marked inode is only hidden
+ * from app processes KSU would umount modules for. The bit lives in the same
+ * address_space flags word as AS_FLAGS_SUS_PATH, so it can never disagree with
+ * the hide flag it belongs to.
+ */
+#ifndef AS_FLAGS_SUS_PATH_APP_DATA
+#define AS_FLAGS_SUS_PATH_APP_DATA 40
+#endif
+
 #ifdef CONFIG_KSU_SUSFS_ENABLE_LOG
 DEFINE_STATIC_KEY_TRUE(susfs_is_log_enabled);
 #define SUSFS_LOGI(fmt, ...) if (static_branch_likely(&susfs_is_log_enabled)) pr_info("susfs:[%u][%d][%s] " fmt, current_uid().val, current->pid, __func__, ##__VA_ARGS__)
@@ -241,20 +255,21 @@ const struct qstr susfs_fake_qstr_name = QSTR_INIT("..5.u.S", 7); // used to re-
  * global sus_path uid filter (susfs_set_sus_path_uid_filter).
  * Implemented at the end of the SUS_PATH block, here only the prototypes.
  *
- * Option B: a sus_path that has an owner record is an app data directory
- * added by the module's "emulate vold app data". Those paths are only
- * hidden from app processes KSU would umount modules for, while generic
- * sus_paths keep the upstream "hide from every app uid" behaviour.
+ * Option B: a sus_path that belongs to an app data directory is hidden only
+ * from app processes KSU would umount modules for, while generic sus_paths
+ * keep the upstream "hide from every app uid" behaviour. The caller uses the
+ * return value to set AS_FLAGS_SUS_PATH_APP_DATA on the same mapping that
+ * carries AS_FLAGS_SUS_PATH.
  */
-static void susfs_owner_record(struct inode *inode, const char *pathname);
+static bool susfs_owner_record(struct inode *inode, const char *pathname);
 static bool susfs_owner_matches(struct inode *inode);
-static bool susfs_owner_has_record(struct inode *inode);
 
 void susfs_add_sus_path(void __user **user_info) {
 	struct st_susfs_sus_path info = {0};
 	struct path path;
 	struct inode *inode = NULL;
 	struct fuse_inode *fi = NULL;
+	bool is_app_data;
 
 	if (copy_from_user(&info, (struct st_susfs_sus_path __user*)*user_info, sizeof(info))) {
 		info.err = -EFAULT;
@@ -274,8 +289,9 @@ void susfs_add_sus_path(void __user **user_info) {
 		goto out_path_put_path;
 	}
 
-	/* LOCAL EXTENSION: remember the owner app of this sus_path, if any */
-	susfs_owner_record(inode, info.target_pathname);
+	/* LOCAL EXTENSION: remember the owner app of this sus_path, if any.
+	 * Also tells us whether this path is an app data directory (option B). */
+	is_app_data = susfs_owner_record(inode, info.target_pathname);
 
 	if (inode->i_sb->s_magic == FUSE_SUPER_MAGIC) {
 		fi = get_fuse_inode(inode);
@@ -286,6 +302,10 @@ void susfs_add_sus_path(void __user **user_info) {
 		}
 		set_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_mapping->flags);
 		set_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags);
+		if (is_app_data) {
+			set_bit(AS_FLAGS_SUS_PATH_APP_DATA, &fi->inode.i_mapping->flags);
+			set_bit(AS_FLAGS_SUS_PATH_APP_DATA, &inode->i_mapping->flags);
+		}
 		SUSFS_LOGI("flagged AS_FLAGS_SUS_PATH on pathname: '%s', fi->nodeid: %llu, fi->inode.i_ino: %lu, fi->inode.i_mapping->flags: 0x%lx\n", 
 					info.target_pathname, fi->nodeid, fi->inode.i_ino, fi->inode.i_mapping->flags);
 		info.err = 0;
@@ -293,6 +313,8 @@ void susfs_add_sus_path(void __user **user_info) {
 	}
 
 	set_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags);
+	if (is_app_data)
+		set_bit(AS_FLAGS_SUS_PATH_APP_DATA, &inode->i_mapping->flags);
 	SUSFS_LOGI("flagged AS_FLAGS_SUS_PATH on pathname: '%s', ino: '%lu', inode->i_mapping->flags: 0x%lx\n",
 				info.target_pathname, inode->i_ino, inode->i_mapping->flags);
 	info.err = 0;
@@ -351,14 +373,17 @@ static void susfs_run_sus_path_loop(void) {
 	list_for_each_entry_rcu(cursor, &LH_SUS_PATH_LOOP, list) {
 		if (!kern_path(cursor->target_pathname, 0, &path))
 		{
+			bool is_app_data;
+
 			inode = d_backing_inode(path.dentry);
 			if (!inode || !inode->i_mapping) {
 				SUSFS_LOGE("inode || inode->i_mapping is NULL\n");
 				path_put(&path);
 				continue;
 			}
-			/* LOCAL EXTENSION: remember the owner app of this sus_path, if any */
-			susfs_owner_record(inode, cursor->target_pathname);
+			/* LOCAL EXTENSION: remember the owner app of this sus_path,
+			 * and whether it is an app data directory (option B) */
+			is_app_data = susfs_owner_record(inode, cursor->target_pathname);
 			if (inode->i_sb->s_magic == FUSE_SUPER_MAGIC) {
 				fi = get_fuse_inode(inode);
 				if (!fi || !fi->inode.i_mapping) {
@@ -368,10 +393,16 @@ static void susfs_run_sus_path_loop(void) {
 				}
 				set_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_mapping->flags);
 				set_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags);
+				if (is_app_data) {
+					set_bit(AS_FLAGS_SUS_PATH_APP_DATA, &fi->inode.i_mapping->flags);
+					set_bit(AS_FLAGS_SUS_PATH_APP_DATA, &inode->i_mapping->flags);
+				}
 				SUSFS_LOGI("re-flag AS_FLAGS_SUS_PATH on path '%s', fi->inode.i_ino: '%lu', fi->inode.i_mapping->flags: 0x%lx\n",
 						cursor->target_pathname, fi->inode.i_ino, fi->inode.i_mapping->flags);
 			} else {
 				set_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags);
+				if (is_app_data)
+					set_bit(AS_FLAGS_SUS_PATH_APP_DATA, &inode->i_mapping->flags);
 				SUSFS_LOGI("re-flag AS_FLAGS_SUS_PATH on path '%s', inode->i_ino: '%lu', inode->i_mapping->flags: 0x%lx\n",
 						cursor->target_pathname, inode->i_ino, inode->i_mapping->flags);
 			}
@@ -409,15 +440,18 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 		if (unlikely(test_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_mapping->flags) &&
 			likely(!susfs_is_uid_allowed_for_sus_path(uid))))
 		{
-			/* LOCAL EXTENSION (option B): an app data sus_path (owner
-			 * recorded) is only hidden from app processes KSU would
-			 * umount modules for; generic sus_paths stay upstream. */
-			if (susfs_owner_has_record(inode) &&
-			    !susfs_is_current_proc_umounted_app())
-				return false;
-			/* LOCAL EXTENSION: the owner app can see its own data dir */
-			if (susfs_owner_matches(inode))
-				return false;
+			/* LOCAL EXTENSION (option B): app data sus_paths follow the
+			 * LKM semantics - hidden only from app processes KSU would
+			 * umount modules for, and never from the inode owner.
+			 * Generic sus_paths keep the upstream rule. */
+			if (unlikely(test_bit(AS_FLAGS_SUS_PATH_APP_DATA,
+					      &fi->inode.i_mapping->flags))) {
+				if (!susfs_is_current_proc_umounted_app())
+					return false;
+				if (inode->i_uid.val % 100000 == uid ||
+				    susfs_owner_matches(inode))
+					return false;
+			}
 			//SUSFS_LOGI("hiding path with ino '%lu'\n", inode->i_ino);
 			return true;
 		}
@@ -427,15 +461,18 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 	if (unlikely(test_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags) &&
 		likely(!susfs_is_uid_allowed_for_sus_path(uid))))
 	{
-		/* LOCAL EXTENSION (option B): an app data sus_path (owner
-		 * recorded) is only hidden from app processes KSU would
-		 * umount modules for; generic sus_paths stay upstream. */
-		if (susfs_owner_has_record(inode) &&
-		    !susfs_is_current_proc_umounted_app())
-			return false;
-		/* LOCAL EXTENSION: the owner app can see its own data dir */
-		if (susfs_owner_matches(inode))
-			return false;
+		/* LOCAL EXTENSION (option B): app data sus_paths follow the
+		 * LKM semantics - hidden only from app processes KSU would
+		 * umount modules for, and never from the inode owner.
+		 * Generic sus_paths keep the upstream rule. */
+		if (unlikely(test_bit(AS_FLAGS_SUS_PATH_APP_DATA,
+				      &inode->i_mapping->flags))) {
+			if (!susfs_is_current_proc_umounted_app())
+				return false;
+			if (inode->i_uid.val % 100000 == uid ||
+			    susfs_owner_matches(inode))
+				return false;
+		}
 		//SUSFS_LOGI("hiding path with ino '%lu'\n", inode->i_ino);
 		return true;
 	}
@@ -954,7 +991,7 @@ static int susfs_owner_app_name_from_pathname(const char *pathname, char *app_na
  * Records the owner app uid of the given inode if the pathname belongs to an
  * app data directory. Safe to call repeatedly for the same inode.
  */
-static void susfs_owner_record(struct inode *inode, const char *pathname)
+static bool susfs_owner_record(struct inode *inode, const char *pathname)
 {
 	struct susfs_sus_path_owner *entry = NULL;
 	struct susfs_sus_path_owner *tmp = NULL;
@@ -966,7 +1003,7 @@ static void susfs_owner_record(struct inode *inode, const char *pathname)
 	int err;
 
 	if (!inode || !pathname)
-		return;
+		return false;
 
 	/* fast path: the inode has been recorded with an owner uid already */
 	rcu_read_lock();
@@ -974,7 +1011,7 @@ static void susfs_owner_record(struct inode *inode, const char *pathname)
 		if (tmp->inode == inode && tmp->i_ino == inode->i_ino) {
 			if (READ_ONCE(tmp->uid)) {
 				rcu_read_unlock();
-				return;
+				return true;
 			}
 			/* recorded without a uid earlier (packages.list was not
 			 * readable yet): fall through and try to resolve again */
@@ -986,7 +1023,7 @@ static void susfs_owner_record(struct inode *inode, const char *pathname)
 	/* cheap check first: most sus paths are not app data dirs at all */
 	err = susfs_owner_app_name_from_pathname(pathname, app_name, sizeof(app_name));
 	if (err)
-		return;
+		return false;
 
 	/*
 	 * The caller may not be able to read /data/system/packages.list with
@@ -994,10 +1031,10 @@ static void susfs_owner_record(struct inode *inode, const char *pathname)
 	 * credentials are overridden while the uid is resolved, like it is
 	 * done in susfs_run_sus_path_loop().
 	 *
-	 * A failed lookup is not fatal: the entry with uid 0 still marks the
-	 * inode as an app data path, and that marker is what the option-B
-	 * gate keys on (uid 0 never matches an app process, so the owner
-	 * exemption simply does not apply in that case).
+	 * A failed lookup is not fatal: the entry with uid 0 lets a later add
+	 * retry the resolution (uid 0 never matches an app process, so the
+	 * owner exemption simply does not apply in that case). The option-B
+	 * gate itself keys on AS_FLAGS_SUS_PATH_APP_DATA.
 	 */
 	if (ksu_cred) {
 		saved = override_creds(ksu_cred);
@@ -1037,6 +1074,7 @@ static void susfs_owner_record(struct inode *inode, const char *pathname)
 	SUSFS_LOGI("owner uid '%u' recorded for sus_path '%s' (local extension)\n", uid, pathname);
 unlock:
 	mutex_unlock(&susfs_mutex_lock_sus_path_owner);
+	return true;
 }
 
 /*
@@ -1062,29 +1100,6 @@ static bool susfs_owner_matches(struct inode *inode)
 	rcu_read_unlock();
 
 	return matched;
-}
-
-/*
- * Returns true if the given inode was recorded as an app data directory
- * ('.../Android/data|media/<pkg>'). Lockless, called from the hot path.
- */
-static bool susfs_owner_has_record(struct inode *inode)
-{
-	struct susfs_sus_path_owner *entry = NULL;
-
-	if (!inode)
-		return false;
-
-	rcu_read_lock();
-	hash_for_each_possible_rcu(SUS_PATH_OWNER_HLIST, entry, node, (unsigned long)inode) {
-		if (entry->inode == inode && entry->i_ino == inode->i_ino) {
-			rcu_read_unlock();
-			return true;
-		}
-	}
-	rcu_read_unlock();
-
-	return false;
 }
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH
 
