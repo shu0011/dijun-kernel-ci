@@ -4,6 +4,7 @@
 #include <linux/slab.h>
 #include <linux/seq_file.h>
 #include <linux/printk.h>
+#include <linux/atomic.h>
 #include <linux/namei.h>
 #include <linux/list.h>
 #include <linux/init_task.h>
@@ -262,7 +263,6 @@ const struct qstr susfs_fake_qstr_name = QSTR_INIT("..5.u.S", 7); // used to re-
  * AS_FLAGS_SUS_PATH.
  */
 static bool susfs_owner_record(struct inode *inode, const char *pathname);
-static bool susfs_owner_matches(struct inode *inode);
 
 void susfs_add_sus_path(void __user **user_info) {
 	struct st_susfs_sus_path info = {0};
@@ -415,6 +415,8 @@ static void susfs_run_sus_path_loop(void) {
 
 
 bool susfs_is_uid_allowed_for_sus_path(uid_t uid);
+/* owner table lookup, defined in the per-owner exemption block below */
+static uid_t susfs_owner_uid(u64 dev, u64 ident);
 
 __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 {
@@ -440,15 +442,18 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 		if (unlikely(test_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_mapping->flags) &&
 			likely(!susfs_is_uid_allowed_for_sus_path(uid))))
 		{
-			/* LOCAL EXTENSION (option C): an app data sus_path is hidden
-			 * from every app, except from the inode owner. Generic
-			 * sus_paths keep the upstream rule. */
-			if (unlikely(test_bit(AS_FLAGS_SUS_PATH_APP_DATA,
-					      &fi->inode.i_mapping->flags)) &&
-			    (inode->i_uid.val % 100000 == uid ||
-			     susfs_owner_matches(inode)))
+			uid_t owner_uid;
+			u64 dev = (u64)inode->i_sb->s_dev;
+			u64 ident = fi->nodeid ? fi->nodeid : (u64)inode->i_ino;
+			bool is_app_data = test_bit(AS_FLAGS_SUS_PATH_APP_DATA,
+						    &fi->inode.i_mapping->flags);
+			owner_uid = susfs_owner_uid(dev, ident);
+			/* option C: exempt only the app that owns this sus_path.
+			 * On FUSE the access-time inode has i_uid==i_ino==0, so we
+			 * use the owner uid recorded at add time, keyed by
+			 * (s_dev, nodeid) which stays stable across inode rebuilds. */
+			if (is_app_data && owner_uid != 0 && owner_uid % 100000 == uid)
 				return false;
-			//SUSFS_LOGI("hiding path with ino '%lu'\n", inode->i_ino);
 			return true;
 		}
 		return false;
@@ -457,15 +462,14 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 	if (unlikely(test_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags) &&
 		likely(!susfs_is_uid_allowed_for_sus_path(uid))))
 	{
-		/* LOCAL EXTENSION (option C): an app data sus_path is hidden
-		 * from every app, except from the inode owner. Generic
-		 * sus_paths keep the upstream rule. */
-		if (unlikely(test_bit(AS_FLAGS_SUS_PATH_APP_DATA,
-				      &inode->i_mapping->flags)) &&
-		    (inode->i_uid.val % 100000 == uid ||
-		     susfs_owner_matches(inode)))
+		uid_t owner_uid;
+		u64 dev = (u64)inode->i_sb->s_dev;
+		u64 ident = (u64)inode->i_ino;
+		bool is_app_data = test_bit(AS_FLAGS_SUS_PATH_APP_DATA,
+					    &inode->i_mapping->flags);
+		owner_uid = susfs_owner_uid(dev, ident);
+		if (is_app_data && owner_uid != 0 && owner_uid % 100000 == uid)
 			return false;
-		//SUSFS_LOGI("hiding path with ino '%lu'\n", inode->i_ino);
 		return true;
 	}
 
@@ -903,30 +907,61 @@ bool susfs_is_uid_allowed_for_sus_path(uid_t uid) {
 /* sus_path per-owner exemption (LOCAL EXTENSION)    */
 /*****************************************************/
 /*
- * This block is NOT part of upstream SUSFS. It implements a per-inode
- * owner exemption for sus_path, so that an app can still see its own
- * '/Android/data/<pkg>' and '/Android/media/<pkg>' directories while
- * those directories stay hidden from every other app.
+ * This block is NOT part of upstream SUSFS. It detects app data sus_paths
+ * ('/Android/data/<pkg>' and '/Android/media/<pkg>'), marks them with
+ * AS_FLAGS_SUS_PATH_APP_DATA, and records the owning app uid so that
+ * susfs_is_inode_sus_path() can apply the option-C rule: hidden from every
+ * app except the one that owns the directory.
  *
- * The exemption is independent of, and is checked after, the global
- * sus_path uid filter above: if the global filter already allows the
- * calling uid to see all sus paths, the owner lookup is not needed.
- *
- * The owner uid is resolved once, when the sus path is added, from
- * /data/system/packages.list. If an app is uninstalled and reinstalled
- * afterwards (its uid may change), the sus path has to be added again
- * or the device rebooted for the new uid to be picked up.
+ * Owner identity is keyed by (s_dev, nodeid/ino), NOT by inode pointer:
+ *   - FUSE (/sdcard) re-instantiates inodes; the access-time inode has
+ *     i_ino == 0 and i_uid == 0 (measured on device), so neither can be
+ *     used as the owner key. FUSE hashes inodes by nodeid instead, so
+ *     nodeid is the stable identity (same approach as susfs4ksu-lkm using
+ *     (dev, ino)).
+ *   - Non-FUSE uses (s_dev, i_ino).
+ * The uid itself is resolved once from /data/system/packages.list with
+ * KernelSU credentials and stored in the table.
  */
+
 struct susfs_sus_path_owner {
-	struct hlist_node               node;
-	struct rcu_head                 rcu;
-	struct inode                    *inode;
-	unsigned long                   i_ino;
-	uid_t                           uid;
+	struct hlist_node node;
+	struct rcu_head rcu;
+	u64 dev;
+	u64 ident;              /* FUSE: fi->nodeid, else inode->i_ino */
+	uid_t uid;
 };
 
 static DEFINE_MUTEX(susfs_mutex_lock_sus_path_owner);
 static DEFINE_HASHTABLE(SUS_PATH_OWNER_HLIST, 10);
+
+static u64 susfs_owner_ident(struct inode *inode)
+{
+	if (inode->i_sb->s_magic == FUSE_SUPER_MAGIC) {
+		struct fuse_inode *fi = get_fuse_inode(inode);
+		if (fi && fi->nodeid)
+			return fi->nodeid;
+	}
+	return (u64)inode->i_ino;
+}
+
+/* Returns the recorded owner uid, or 0 if not found. */
+static uid_t susfs_owner_uid(u64 dev, u64 ident)
+{
+	struct susfs_sus_path_owner *entry = NULL;
+	uid_t ret = 0;
+
+	rcu_read_lock();
+	hash_for_each_possible_rcu(SUS_PATH_OWNER_HLIST, entry, node,
+				   (unsigned long)(dev ^ ident)) {
+		if (entry->dev == dev && entry->ident == ident) {
+			ret = READ_ONCE(entry->uid);
+			break;
+		}
+	}
+	rcu_read_unlock();
+	return ret;
+}
 
 /*
  * Extracts the app package name from a pathname of the form
@@ -980,54 +1015,29 @@ static int susfs_owner_app_name_from_pathname(const char *pathname, char *app_na
 }
 
 /*
- * Records the owner app uid of the given inode if the pathname belongs to an
- * app data directory. Safe to call repeatedly for the same inode.
+ * If the pathname is an app data directory, record (s_dev, ident) -> app uid
+ * in the owner table and return true (so the caller sets
+ * AS_FLAGS_SUS_PATH_APP_DATA). Returns false for any other path.
  */
 static bool susfs_owner_record(struct inode *inode, const char *pathname)
 {
-	struct susfs_sus_path_owner *entry = NULL;
-	struct susfs_sus_path_owner *tmp = NULL;
+	char app_name[SUSFS_MAX_LEN_PATHNAME];
+	struct susfs_sus_path_owner *entry = NULL, *tmp = NULL;
 	struct hlist_node *tmp_node = NULL;
 	const struct cred *saved = NULL;
-	char app_name[SUSFS_MAX_LEN_PATHNAME];
-	unsigned long key;
+	u64 dev, ident;
 	uid_t uid = 0;
+	unsigned long key;
 	int err;
 
 	if (!inode || !pathname)
 		return false;
 
-	/* fast path: the inode has been recorded with an owner uid already */
-	rcu_read_lock();
-	hash_for_each_possible_rcu(SUS_PATH_OWNER_HLIST, tmp, node, (unsigned long)inode) {
-		if (tmp->inode == inode && tmp->i_ino == inode->i_ino) {
-			if (READ_ONCE(tmp->uid)) {
-				rcu_read_unlock();
-				return true;
-			}
-			/* recorded without a uid earlier (packages.list was not
-			 * readable yet): fall through and try to resolve again */
-			break;
-		}
-	}
-	rcu_read_unlock();
-
-	/* cheap check first: most sus paths are not app data dirs at all */
 	err = susfs_owner_app_name_from_pathname(pathname, app_name, sizeof(app_name));
 	if (err)
 		return false;
 
-	/*
-	 * The caller may not be able to read /data/system/packages.list with
-	 * its own credentials (it can even be a kworker), hence the KernelSU
-	 * credentials are overridden while the uid is resolved, like it is
-	 * done in susfs_run_sus_path_loop().
-	 *
-	 * A failed lookup is not fatal: the entry with uid 0 lets a later add
-	 * retry the resolution (uid 0 never matches an app process, so the
-	 * owner exemption simply does not apply in that case). The option-B
-	 * gate itself keys on AS_FLAGS_SUS_PATH_APP_DATA.
-	 */
+	/* Resolve app uid with KernelSU creds (caller may be a kworker). */
 	if (ksu_cred) {
 		saved = override_creds(ksu_cred);
 		err = susfs_resolve_sus_path_app_uid(app_name, &uid);
@@ -1036,62 +1046,28 @@ static bool susfs_owner_record(struct inode *inode, const char *pathname)
 			uid = 0;
 	}
 
-	key = (unsigned long)inode;
+	dev = (u64)inode->i_sb->s_dev;
+	ident = susfs_owner_ident(inode);
+	key = (unsigned long)(dev ^ ident);
+
 	mutex_lock(&susfs_mutex_lock_sus_path_owner);
 	hash_for_each_possible_safe(SUS_PATH_OWNER_HLIST, tmp, tmp_node, node, key) {
-		if (tmp->inode != inode)
-			continue;
-		if (tmp->i_ino == inode->i_ino) {
-			/* entry recorded meanwhile; fill in the uid if the
-			 * earlier attempt could not resolve it */
+		if (tmp->dev == dev && tmp->ident == ident) {
 			if (uid)
 				WRITE_ONCE(tmp->uid, uid);
-			goto unlock;
+			goto out_unlock;
 		}
-		/* stale entry of a freed inode which got its address reused */
-		hash_del_rcu(&tmp->node);
-		kfree_rcu(tmp, rcu);
-		break;
 	}
-
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
-	if (!entry) {
-		SUSFS_LOGE("failed to allocate the sus_path owner entry\n");
-		goto unlock;
+	if (entry) {
+		entry->dev = dev;
+		entry->ident = ident;
+		entry->uid = uid;
+		hash_add_rcu(SUS_PATH_OWNER_HLIST, &entry->node, key);
 	}
-	entry->inode = inode;
-	entry->i_ino = inode->i_ino;
-	entry->uid = uid;
-	hash_add_rcu(SUS_PATH_OWNER_HLIST, &entry->node, key);
-	SUSFS_LOGI("owner uid '%u' recorded for sus_path '%s' (local extension)\n", uid, pathname);
-unlock:
+out_unlock:
 	mutex_unlock(&susfs_mutex_lock_sus_path_owner);
 	return true;
-}
-
-/*
- * Returns true if the calling process is the owner app of the given inode.
- * Lockless, called from the hot path.
- */
-static bool susfs_owner_matches(struct inode *inode)
-{
-	struct susfs_sus_path_owner *entry = NULL;
-	uid_t uid = current_uid().val % 100000;
-	bool matched = false;
-
-	if (!inode || uid < 10000)
-		return false;
-
-	rcu_read_lock();
-	hash_for_each_possible_rcu(SUS_PATH_OWNER_HLIST, entry, node, (unsigned long)inode) {
-		if (entry->inode == inode && entry->i_ino == inode->i_ino) {
-			matched = (READ_ONCE(entry->uid) == uid);
-			break;
-		}
-	}
-	rcu_read_unlock();
-
-	return matched;
 }
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH
 
