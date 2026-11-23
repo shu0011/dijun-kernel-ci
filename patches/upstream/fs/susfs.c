@@ -4,6 +4,7 @@
 #include <linux/slab.h>
 #include <linux/seq_file.h>
 #include <linux/printk.h>
+#include <linux/atomic.h>
 #include <linux/namei.h>
 #include <linux/list.h>
 #include <linux/init_task.h>
@@ -415,6 +416,11 @@ static void susfs_run_sus_path_loop(void) {
 
 bool susfs_is_uid_allowed_for_sus_path(uid_t uid);
 
+/* DIAG (temporary): print the full decision for the first N hits so we can
+ * see exactly which gate drops TIM's access to its own chat images. */
+static atomic_t susfs_diag_sus_path_n = ATOMIC_INIT(0);
+#define SUSFS_DIAG_SUS_PATH_MAX 200
+
 __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 {
 	uid_t uid = current_uid().val % 100000;
@@ -439,6 +445,16 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 		if (unlikely(test_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_mapping->flags) &&
 			likely(!susfs_is_uid_allowed_for_sus_path(uid))))
 		{
+			bool diag_appdata, diag_owner, diag_hide;
+			diag_appdata = test_bit(AS_FLAGS_SUS_PATH_APP_DATA,
+						&fi->inode.i_mapping->flags);
+			diag_owner = (inode->i_uid.val % 100000 == uid);
+			diag_hide = !(diag_appdata && diag_owner);
+			if (atomic_inc_return(&susfs_diag_sus_path_n) <= SUSFS_DIAG_SUS_PATH_MAX)
+				pr_info("SUSFS_DIAG FUSE uid=%u inode_uid=%u i_ino=%lu fi_ino=%lu flags=0x%lx appdata=%d owner=%d => hide=%d\n",
+					uid, inode->i_uid.val % 100000, inode->i_ino,
+					fi->inode.i_ino, fi->inode.i_mapping->flags,
+					(int)diag_appdata, (int)diag_owner, (int)diag_hide);
 			/* LOCAL EXTENSION (option C): an app data sus_path is hidden
 			 * from every app except the inode owner. Owner check is the
 			 * live inode->i_uid (same as susfs4ksu-lkm's sus_path_gate),
@@ -446,11 +462,8 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 			 * re-instantiates inodes, so a pointer-keyed record goes stale
 			 * and causes intermittent "app cannot open its own file".
 			 * Generic sus_paths keep the upstream rule. */
-			if (unlikely(test_bit(AS_FLAGS_SUS_PATH_APP_DATA,
-					      &fi->inode.i_mapping->flags)) &&
-			    inode->i_uid.val % 100000 == uid)
+			if (diag_appdata && diag_owner)
 				return false;
-			//SUSFS_LOGI("hiding path with ino '%lu'\n", inode->i_ino);
 			return true;
 		}
 		return false;
@@ -459,15 +472,19 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 	if (unlikely(test_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags) &&
 		likely(!susfs_is_uid_allowed_for_sus_path(uid))))
 	{
-		/* LOCAL EXTENSION (option C): an app data sus_path is hidden
-		 * from every app, except from the inode owner. Generic
-		 * sus_paths keep the upstream rule. */
+		bool diag_appdata, diag_owner, diag_hide;
+		diag_appdata = test_bit(AS_FLAGS_SUS_PATH_APP_DATA,
+					&inode->i_mapping->flags);
+		diag_owner = (inode->i_uid.val % 100000 == uid);
+		diag_hide = !(diag_appdata && diag_owner);
+		if (atomic_inc_return(&susfs_diag_sus_path_n) <= SUSFS_DIAG_SUS_PATH_MAX)
+			pr_info("SUSFS_DIAG NONFUSE uid=%u inode_uid=%u i_ino=%lu flags=0x%lx appdata=%d owner=%d => hide=%d\n",
+				uid, inode->i_uid.val % 100000, inode->i_ino,
+				inode->i_mapping->flags,
+				(int)diag_appdata, (int)diag_owner, (int)diag_hide);
 		/* option C: live inode->i_uid owner check, see FUSE branch above */
-		if (unlikely(test_bit(AS_FLAGS_SUS_PATH_APP_DATA,
-				      &inode->i_mapping->flags)) &&
-		    inode->i_uid.val % 100000 == uid)
+		if (diag_appdata && diag_owner)
 			return false;
-		//SUSFS_LOGI("hiding path with ino '%lu'\n", inode->i_ino);
 		return true;
 	}
 
