@@ -432,7 +432,7 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 
 	/* DIAG entry line: fires for TIM regardless of which gate wins. */
 	if (uid == SUSFS_DIAG_UID && inode)
-		pr_info("SUSFS_DIAG ENTER uid=%u i_ino=%lu magic=0x%x inode_uid=%u i_mapping_flags=0x%lx ksu_allowed=%d\n",
+		pr_info("SUSFS_DIAG ENTER uid=%u i_ino=%lu magic=0x%lx inode_uid=%u i_mapping_flags=0x%lx ksu_allowed=%d\n",
 			uid, inode->i_ino, inode->i_sb->s_magic,
 			inode->i_uid.val % 100000,
 			inode->i_mapping ? inode->i_mapping->flags : 0UL,
