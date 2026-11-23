@@ -418,11 +418,6 @@ bool susfs_is_uid_allowed_for_sus_path(uid_t uid);
 /* owner table lookup, defined in the per-owner exemption block below */
 static uid_t susfs_owner_uid(u64 dev, u64 ident);
 
-/* DIAG (temporary): rate-limited, prints every app-uid decision so we can
- * see exactly which gate drops TIM's access to its own chat images.
- * No hard cap: a 200-cap was consumed during boot before TIM ever ran. */
-#define SUSFS_DIAG_UID 10342
-
 __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 {
 	uid_t uid = current_uid().val % 100000;
@@ -431,14 +426,6 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 	if (uid < 10000) {
 		return false;
 	}
-
-	/* DIAG entry line: fires for TIM regardless of which gate wins. */
-	if (uid == SUSFS_DIAG_UID && inode)
-		pr_info("SUSFS_DIAG ENTER uid=%u i_ino=%lu magic=0x%lx inode_uid=%u i_mapping_flags=0x%lx ksu_allowed=%d\n",
-			uid, inode->i_ino, inode->i_sb->s_magic,
-			inode->i_uid.val % 100000,
-			inode->i_mapping ? inode->i_mapping->flags : 0UL,
-			(int)susfs_is_uid_allowed_for_sus_path(uid));
 
 	if (!inode->i_mapping) {
 		SUSFS_LOGE("inode->i_mapping is NULL\n");
@@ -455,26 +442,17 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 		if (unlikely(test_bit(AS_FLAGS_SUS_PATH, &fi->inode.i_mapping->flags) &&
 			likely(!susfs_is_uid_allowed_for_sus_path(uid))))
 		{
-			bool diag_appdata, diag_owner, diag_hide;
 			uid_t owner_uid;
 			u64 dev = (u64)inode->i_sb->s_dev;
 			u64 ident = fi->nodeid ? fi->nodeid : (u64)inode->i_ino;
-			diag_appdata = test_bit(AS_FLAGS_SUS_PATH_APP_DATA,
-						&fi->inode.i_mapping->flags);
+			bool is_app_data = test_bit(AS_FLAGS_SUS_PATH_APP_DATA,
+						    &fi->inode.i_mapping->flags);
 			owner_uid = susfs_owner_uid(dev, ident);
 			/* option C: exempt only the app that owns this sus_path.
 			 * On FUSE the access-time inode has i_uid==i_ino==0, so we
 			 * use the owner uid recorded at add time, keyed by
 			 * (s_dev, nodeid) which stays stable across inode rebuilds. */
-			diag_owner = (owner_uid != 0 && owner_uid % 100000 == uid);
-			diag_hide = !(diag_appdata && diag_owner);
-			if (uid == SUSFS_DIAG_UID)
-				pr_info("SUSFS_DIAG FUSE uid=%u owner_uid=%u dev=%llu ident=%llu inode_uid=%u i_ino=%lu flags=0x%lx appdata=%d owner=%d => hide=%d\n",
-					uid, owner_uid, dev, ident,
-					inode->i_uid.val % 100000, inode->i_ino,
-					fi->inode.i_mapping->flags,
-					(int)diag_appdata, (int)diag_owner, (int)diag_hide);
-			if (diag_appdata && diag_owner)
+			if (is_app_data && owner_uid != 0 && owner_uid % 100000 == uid)
 				return false;
 			return true;
 		}
@@ -484,22 +462,13 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 	if (unlikely(test_bit(AS_FLAGS_SUS_PATH, &inode->i_mapping->flags) &&
 		likely(!susfs_is_uid_allowed_for_sus_path(uid))))
 	{
-		bool diag_appdata, diag_owner, diag_hide;
 		uid_t owner_uid;
 		u64 dev = (u64)inode->i_sb->s_dev;
 		u64 ident = (u64)inode->i_ino;
-		diag_appdata = test_bit(AS_FLAGS_SUS_PATH_APP_DATA,
-					&inode->i_mapping->flags);
+		bool is_app_data = test_bit(AS_FLAGS_SUS_PATH_APP_DATA,
+					    &inode->i_mapping->flags);
 		owner_uid = susfs_owner_uid(dev, ident);
-		diag_owner = (owner_uid != 0 && owner_uid % 100000 == uid);
-		diag_hide = !(diag_appdata && diag_owner);
-		if (uid == SUSFS_DIAG_UID)
-			pr_info("SUSFS_DIAG NONFUSE uid=%u owner_uid=%u dev=%llu ident=%llu inode_uid=%u i_ino=%lu flags=0x%lx appdata=%d owner=%d => hide=%d\n",
-				uid, owner_uid, dev, ident,
-				inode->i_uid.val % 100000, inode->i_ino,
-				inode->i_mapping->flags,
-				(int)diag_appdata, (int)diag_owner, (int)diag_hide);
-		if (diag_appdata && diag_owner)
+		if (is_app_data && owner_uid != 0 && owner_uid % 100000 == uid)
 			return false;
 		return true;
 	}
@@ -1095,8 +1064,6 @@ static bool susfs_owner_record(struct inode *inode, const char *pathname)
 		entry->ident = ident;
 		entry->uid = uid;
 		hash_add_rcu(SUS_PATH_OWNER_HLIST, &entry->node, key);
-		SUSFS_LOGI("owner dev='%llu' ident='%llu' uid='%u' recorded for '%s'\n",
-			   dev, ident, uid, pathname);
 	}
 out_unlock:
 	mutex_unlock(&susfs_mutex_lock_sus_path_owner);
