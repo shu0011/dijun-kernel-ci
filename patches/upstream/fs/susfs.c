@@ -416,10 +416,10 @@ static void susfs_run_sus_path_loop(void) {
 
 bool susfs_is_uid_allowed_for_sus_path(uid_t uid);
 
-/* DIAG (temporary): print the full decision for the first N hits so we can
- * see exactly which gate drops TIM's access to its own chat images. */
-static atomic_t susfs_diag_sus_path_n = ATOMIC_INIT(0);
-#define SUSFS_DIAG_SUS_PATH_MAX 200
+/* DIAG (temporary): rate-limited, prints every app-uid decision so we can
+ * see exactly which gate drops TIM's access to its own chat images.
+ * No hard cap: a 200-cap was consumed during boot before TIM ever ran. */
+#define SUSFS_DIAG_UID 10342
 
 __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 {
@@ -429,6 +429,14 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 	if (uid < 10000) {
 		return false;
 	}
+
+	/* DIAG entry line: fires for TIM regardless of which gate wins. */
+	if (uid == SUSFS_DIAG_UID && inode)
+		pr_info("SUSFS_DIAG ENTER uid=%u i_ino=%lu magic=0x%x inode_uid=%u i_mapping_flags=0x%lx ksu_allowed=%d\n",
+			uid, inode->i_ino, inode->i_sb->s_magic,
+			inode->i_uid.val % 100000,
+			inode->i_mapping ? inode->i_mapping->flags : 0UL,
+			(int)susfs_is_uid_allowed_for_sus_path(uid));
 
 	if (!inode->i_mapping) {
 		SUSFS_LOGE("inode->i_mapping is NULL\n");
@@ -450,7 +458,7 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 						&fi->inode.i_mapping->flags);
 			diag_owner = (inode->i_uid.val % 100000 == uid);
 			diag_hide = !(diag_appdata && diag_owner);
-			if (atomic_inc_return(&susfs_diag_sus_path_n) <= SUSFS_DIAG_SUS_PATH_MAX)
+			if (uid == SUSFS_DIAG_UID)
 				pr_info("SUSFS_DIAG FUSE uid=%u inode_uid=%u i_ino=%lu fi_ino=%lu flags=0x%lx appdata=%d owner=%d => hide=%d\n",
 					uid, inode->i_uid.val % 100000, inode->i_ino,
 					fi->inode.i_ino, fi->inode.i_mapping->flags,
@@ -477,7 +485,7 @@ __attribute__((hot)) bool susfs_is_inode_sus_path(struct inode *inode)
 					&inode->i_mapping->flags);
 		diag_owner = (inode->i_uid.val % 100000 == uid);
 		diag_hide = !(diag_appdata && diag_owner);
-		if (atomic_inc_return(&susfs_diag_sus_path_n) <= SUSFS_DIAG_SUS_PATH_MAX)
+		if (uid == SUSFS_DIAG_UID)
 			pr_info("SUSFS_DIAG NONFUSE uid=%u inode_uid=%u i_ino=%lu flags=0x%lx appdata=%d owner=%d => hide=%d\n",
 				uid, inode->i_uid.val % 100000, inode->i_ino,
 				inode->i_mapping->flags,
