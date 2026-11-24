@@ -244,35 +244,33 @@ sed -i "s|^KSU_VERSION_FULL := .*|KSU_VERSION_FULL := v${KSU_TAG}-${KSU_SHA}@shu
     "$SRC/drivers/kernelsu/Kbuild"
 grep -n 'KSU_VERSION_FULL :=' "$SRC/drivers/kernelsu/Kbuild"
 
-echo "==> G-fix 让版本号走上游自动计算（补齐浅克隆历史，不写死）"
-# 上游 Kbuild 在构建时自动算版本码，公式随上游版本演进：
-#   LOCAL_COUNT := GitHub API 的 commit 页数（GITHUB_COMMITS）或 git rev-list --count main
-#   KSU_VERSION := VERSION_BASE + LOCAL_COUNT - VERSION_OFFSET
-# 早期 SukiSU-Ultra：40000 + COUNT - 2815（COUNT=4000 → 41185）
-# 2026-11-15 改名 Nova 后：30000 + COUNT - 4001（当前 API 实测 COUNT=4001 → 30000）
-# 之前写死 41185 违背了上游"自动计算"的设计，且上游改名后已经过时 —— 撤销。
-#
-# CI 上偶发显示 40000/30000（=VERSION_BASE 回退值）有两个原因，这里都修掉：
-#   1) setup.sh 用 --depth=1 浅克隆，git rev-list --count main 只数到 1；
-#   2) B 步骤把 drivers/kernelsu 的 symlink 换成实目录后 .git 丢了，
-#      Kbuild 里 $(KSU_SRC)/../.git 判断落空 → 走 MDIR → 更拿不到历史。
-# 修法：在 B 之后、编译之前把 KernelSU 的完整历史 fetch 下来，并在 drivers/
-# 下补一个 .git 指针，让 Kbuild 的 wildcard/../.git 判断与 git rev-list 都命中。
-# 这样版本号完全由上游公式自动算出，不钉死、不依赖网络 API 是否限流。
-KSU_REPO="$SRC/KernelSU"
-if [ -d "$KSU_REPO/.git" ] || [ -f "$KSU_REPO/.git" ]; then
-    # 浅克隆补完整历史（已完整时 fetch --unshallow 会报错，忽略即可）
-    git -C "$KSU_REPO" fetch --unshallow --tags -q 2>/dev/null || true
-    N=$(git -C "$KSU_REPO" rev-list --count main 2>/dev/null || echo 0)
-    echo "    KSU main commit count = $N"
-    # B 步骤 cp -aL 后 drivers/kernelsu 是实目录，Kbuild 要 $(KSU_SRC)/../.git
-    if [ ! -e "$SRC/drivers/.git" ] && [ -e "$KSU_REPO/.git" ]; then
-        ln -s "$KSU_REPO/.git" "$SRC/drivers/.git"
-        echo "    drivers/.git -> $KSU_REPO/.git"
-    fi
+echo "==> G-ver 版本码 = 30000 + 提交数 + 996（上游现行口径，不写死）"
+# 上游 Kbuild 的公式：KSU_VERSION = VERSION_BASE(30000) + LOCAL_COUNT + VERSION_OFFSET(996)。
+# 关键是 LOCAL_COUNT 取哪份历史：上游自己用的是 gitea 镜像的 commits 总数；
+# GitHub 是重写过的导出，同一个 ref 数量不同（v3.0.0 = 4001 vs 4004，main = 4008 vs 4097），
+# 拿 GitHub 数会差几十，版本码就对不上管理器。所以这里直接查 gitea 的 X-Total-Count。
+# 实测：v3.0.0 → 4004 → 35000（官方 Release 35000-6）
+#       main   → 4097 → 35093（当天 manager-ci 35093）
+# 换 tag / 换分支时数字自动跟着变，不是常量。
+KSU_COUNT=$(curl -sk --max-time 25 --retry 3 -D - -o /dev/null \
+    "https://git.zako.shirkneko.top:20004/api/v1/repos/shirkneko/SukiSU/commits?sha=${KSU_BRANCH}&limit=1" \
+    2>/dev/null | tr -d '\r' | sed -n 's/^[Xx]-[Tt]otal-[Cc]ount:[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
+if [ -z "${KSU_COUNT:-}" ]; then
+    # 兜底：补全历史后数本地提交（GitHub 历史与 gitea 不一致，可能偏小）
+    git -C "$SRC/KernelSU" fetch --unshallow --tags -q 2>/dev/null || true
+    KSU_COUNT=$(git -C "$SRC/KernelSU" rev-list --count HEAD 2>/dev/null || echo 0)
+    echo "    !! gitea 接口未取到提交数，退回本地 git = ${KSU_COUNT}（可能与管理器不一致）"
 fi
-# 原样保留上游 Kbuild 的 KSU_VERSION 计算逻辑，不做任何 sed 覆盖
-grep -nE 'VERSION_BASE|VERSION_OFFSET|KSU_VERSION[[:space:]]*:=' "$SRC/drivers/kernelsu/Kbuild" | head -8
+[ "${KSU_COUNT:-0}" -gt 3000 ] || { echo "!! 提交数异常（${KSU_COUNT:-0}），拒绝用错误版本码构建"; exit 1; }
+KSU_VER=$((30000 + KSU_COUNT + 996))
+echo "    KSU 版本码 = 30000 + ${KSU_COUNT} + 996 = ${KSU_VER}（ref=${KSU_BRANCH}）"
+sed -i "s|^KSU_VERSION     := .*|KSU_VERSION     := ${KSU_VER}|" "$SRC/drivers/kernelsu/Kbuild"
+grep -n '^KSU_VERSION' "$SRC/drivers/kernelsu/Kbuild"
+# B 步骤 cp -aL 之后 drivers/kernelsu 是实目录，Kbuild 里 $(KSU_SRC)/../.git 的判断要这个指针
+if [ ! -e "$SRC/drivers/.git" ] && [ -e "$SRC/KernelSU/.git" ]; then
+    ln -s "$SRC/KernelSU/.git" "$SRC/drivers/.git"
+    echo "    drivers/.git -> $SRC/KernelSU/.git"
+fi
 
 echo "==> G2 让 KSU 的 selinux_hide 不再运行期改 write_op[]"
 # ksu_selinux_hide_enable() 会往 selinuxfs 的 write_op[] 里塞函数指针，
