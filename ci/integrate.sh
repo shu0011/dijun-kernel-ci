@@ -28,6 +28,41 @@ fi
 
 echo "==> A 按官方指南集成 KernelSU（分支 $KSU_BRANCH）"
 cd "$SRC"
+# setup.sh 只在 KernelSU 不存在时才 clone，而且源只有一个（偶发连不上就整步失败）。
+# 这里先自己带重试 clone 好，setup.sh 会直接复用（跳过 clone，只做 checkout/链接）。
+clone_ksu_repo() {
+    local url="$1"
+    local attempt=1
+    while [ "$attempt" -le 3 ]; do
+        rm -rf "$SRC/KernelSU"
+        if git clone --depth=1 "$url" "$SRC/KernelSU"; then
+            # setup.sh 接下来会 git checkout "$KSU_BRANCH"；depth=1 的默认分支
+            # 不带旧 tag，这里按 tag / 分支各补一次（都不匹配就交给 setup.sh 的兜底）
+            git -C "$SRC/KernelSU" fetch --depth=1 origin \
+                "+refs/tags/$KSU_BRANCH:refs/tags/$KSU_BRANCH" 2>/dev/null || \
+            git -C "$SRC/KernelSU" fetch --depth=1 origin \
+                "+refs/heads/$KSU_BRANCH:refs/remotes/origin/$KSU_BRANCH" 2>/dev/null || true
+            return 0
+        fi
+        echo "!! clone $url 失败（第 $attempt/3 次）"
+        attempt=$((attempt + 1))
+        sleep 5
+    done
+    return 1
+}
+
+KSU_CLONED=0
+for ksu_url in \
+    "https://github.com/SukiSU-Nova/SukiSU-Nova" \
+    "https://git.zako.shirkneko.top:20004/shirkneko/SukiSU"; do
+    if clone_ksu_repo "$ksu_url"; then
+        echo "    KernelSU 已从 $ksu_url 克隆"
+        KSU_CLONED=1
+        break
+    fi
+done
+[ "$KSU_CLONED" = "1" ] || { echo "!! KernelSU 克隆失败：2 个源 x 3 次全部失败"; exit 1; }
+
 curl -LSs "https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nova/main/kernel/setup.sh" \
     | bash -s "$KSU_BRANCH"
 
