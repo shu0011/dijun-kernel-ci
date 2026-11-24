@@ -244,6 +244,14 @@ sed -i "s|^KSU_VERSION_FULL := .*|KSU_VERSION_FULL := v${KSU_TAG}-${KSU_SHA}@shu
     "$SRC/drivers/kernelsu/Kbuild"
 grep -n 'KSU_VERSION_FULL :=' "$SRC/drivers/kernelsu/Kbuild"
 
+echo "==> G3 版本号对齐发布的管理器（35000）"
+# 上游 Kbuild 用 main 的 commit 数算版本（30000 + count - 4001）。公开仓库历史在
+# 2026-11-17 被重写（main 只剩 4008 提交），现在算出来是 30007；而发布的管理器
+# 是 35000（对应重写前的 9001 提交）。内核要和管理器完全对应，这里直接钉住，
+# KSU_VERSION_FULL 保持 v3.0.0-<sha>@shushu 不变。
+sed -i 's|^KSU_VERSION     := .*|KSU_VERSION     := 35000|' "$SRC/drivers/kernelsu/Kbuild"
+grep -n '^KSU_VERSION' "$SRC/drivers/kernelsu/Kbuild"
+
 echo "==> G-fix 让版本号走上游自动计算（补齐浅克隆历史，不写死）"
 # 上游 Kbuild 在构建时自动算版本码，公式随上游版本演进：
 #   LOCAL_COUNT := GitHub API 的 commit 页数（GITHUB_COMMITS）或 git rev-list --count main
