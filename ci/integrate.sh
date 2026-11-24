@@ -28,6 +28,41 @@ fi
 
 echo "==> A 按官方指南集成 KernelSU（分支 $KSU_BRANCH）"
 cd "$SRC"
+# setup.sh 只在 KernelSU 不存在时才 clone，而且源只有一个（偶发连不上就整步失败）。
+# 这里先自己带重试 clone 好，setup.sh 会直接复用（跳过 clone，只做 checkout/链接）。
+clone_ksu_repo() {
+    local url="$1"
+    local attempt=1
+    while [ "$attempt" -le 3 ]; do
+        rm -rf "$SRC/KernelSU"
+        if git clone --depth=1 "$url" "$SRC/KernelSU"; then
+            # setup.sh 接下来会 git checkout "$KSU_BRANCH"；depth=1 的默认分支
+            # 不带旧 tag，这里按 tag / 分支各补一次（都不匹配就交给 setup.sh 的兜底）
+            git -C "$SRC/KernelSU" fetch --depth=1 origin \
+                "+refs/tags/$KSU_BRANCH:refs/tags/$KSU_BRANCH" 2>/dev/null || \
+            git -C "$SRC/KernelSU" fetch --depth=1 origin \
+                "+refs/heads/$KSU_BRANCH:refs/remotes/origin/$KSU_BRANCH" 2>/dev/null || true
+            return 0
+        fi
+        echo "!! clone $url 失败（第 $attempt/3 次）"
+        attempt=$((attempt + 1))
+        sleep 5
+    done
+    return 1
+}
+
+KSU_CLONED=0
+for ksu_url in \
+    "https://github.com/SukiSU-Nova/SukiSU-Nova" \
+    "https://git.zako.shirkneko.top:20004/shirkneko/SukiSU"; do
+    if clone_ksu_repo "$ksu_url"; then
+        echo "    KernelSU 已从 $ksu_url 克隆"
+        KSU_CLONED=1
+        break
+    fi
+done
+[ "$KSU_CLONED" = "1" ] || { echo "!! KernelSU 克隆失败：2 个源 x 3 次全部失败"; exit 1; }
+
 curl -LSs "https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nova/main/kernel/setup.sh" \
     | bash -s "$KSU_BRANCH"
 
@@ -733,7 +768,7 @@ m = pat.search(s)
 if not m:
     print("    fs/stat.c: vfs_getattr 没匹配上，跳过")
 else:
-    s = s[:m.end()] + "\tif (susfs_is_inode_sus_path(d_inode(path->dentry)))\n\t\treturn -ENOENT;\n\n" + s[m.end():]
+    s = s[:m.end()] + "\tif (susfs_is_hidden_dentry(path->dentry))\n\t\treturn -ENOENT;\n\n" + s[m.end():]
     open(p, "w").write(s)
     print("    fs/stat.c: vfs_getattr 已注入")
 
@@ -748,8 +783,7 @@ else:
         "\t\t{\n"
         "\t\t\tstruct dentry *sus_dentry = nd->path.dentry;\n"
         "\n"
-        "\t\t\tif (sus_dentry->d_inode &&\n"
-        "\t\t\t    susfs_is_inode_sus_path(sus_dentry->d_inode))\n"
+        "\t\t\tif (susfs_is_hidden_dentry(sus_dentry))\n"
         "\t\t\t\treturn -ENOENT;\n"
         "\t\t}\n"
         "\n"
@@ -775,6 +809,10 @@ variants = [
 ]
 
 filter_block = (
+    "\t/* Plan A: app data 目录的 dirent 按名字过滤（FUSE 的 d_ino/i_ino 不可用） */\n"
+    "\tif (buf->vold_dir && susfs_should_hide_vold_name(name, namlen))\n"
+    "\t\treturn true;\n"
+    "\n"
     "\tif (buf->sb) {\n"
     "\t\tstruct inode *sus_inode = ilookup(buf->sb, ino);\n"
     "\n"
@@ -795,12 +833,12 @@ for cb, fn, sysmark in variants:
               % (cb, fn))
         continue
 
-    # 回调结构体加 sb 字段（幂等）
+    # 回调结构体加 sb/vold_dir 字段（幂等）
     j = s.find("{", st) + 1
     if "struct super_block *sb;" not in s[j:j + 80]:
-        s = s[:j] + "\n\tstruct super_block *sb;" + s[j:]
+        s = s[:j] + "\n\tstruct super_block *sb;\n\tbool vold_dir;" + s[j:]
 
-    # syscall 里填 sb
+    # syscall 里填 sb + 判断被遍历的是否 Android/data|media
     k = s.find(sysmark)
     if k < 0:
         print("    fs/readdir.c: %s 没找到，%s 跳过填充" % (sysmark, fn))
@@ -808,8 +846,9 @@ for cb, fn, sysmark in variants:
         it = s.find("error = iterate_dir(fd_file(f), &buf.ctx);", k)
         if it < 0:
             print("    fs/readdir.c: %s 的 iterate_dir 没找到" % fn)
-        elif "buf.sb = fd_file(f)->f_inode->i_sb;" not in s[k:it]:
-            s = s[:it] + "buf.sb = fd_file(f)->f_inode->i_sb;\n\t" + s[it:]
+        elif "buf.vold_dir = susfs_is_vold_root_dir" not in s[k:it]:
+            s = s[:it] + ("buf.sb = fd_file(f)->f_inode->i_sb;\n\t"
+                          "buf.vold_dir = susfs_is_vold_root_dir(fd_file(f)->f_path.dentry);\n\t") + s[it:]
 
     # filler 里按 inode 过滤：插在 container_of 声明之后，保证 buf 已声明
     f = s.find("static bool %s(" % fn)
@@ -822,7 +861,7 @@ for cb, fn, sysmark in variants:
         print("    fs/readdir.c: %s 的 buf 声明没匹配上" % fn)
         continue
     a = s.find("\n", a + len(anc)) + 1
-    if "ilookup(buf->sb, ino)" in s[a:a + 400]:
+    if "ilookup(buf->sb, ino)" in s[a:a + 600]:
         print("    fs/readdir.c: %s 已注入过" % fn)
         continue
     s = s[:a] + filter_block + s[a:]
@@ -1376,11 +1415,10 @@ count = 0
 # 1) lookup_fast RCU 分支：__d_lookup_rcu 之后，命中则 dentry=NULL（RCU 不 dput）
 anchor1 = "\t\tdentry = __d_lookup_rcu(parent, &nd->last, &nd->next_seq);\n"
 block1 = (
-    "\t\tif (dentry && !IS_ERR(dentry) && dentry->d_inode &&\n"
-    "\t\t    susfs_is_inode_sus_path(dentry->d_inode))\n"
+    "\t\tif (dentry && !IS_ERR(dentry) && susfs_is_hidden_dentry(dentry))\n"
     "\t\t\tdentry = NULL;  /* RCU: __d_lookup_rcu 未取 dentry 计数，不 dput */\n"
 )
-if anchor1 in s and "susfs_is_inode_sus_path(dentry->d_inode))\n\t\t\tdentry = NULL;  /* RCU" not in s:
+if anchor1 in s and "susfs_is_hidden_dentry(dentry))\n\t\t\tdentry = NULL;  /* RCU" not in s:
     s = s.replace(anchor1, anchor1 + block1, 1)
     count += 1
     print("    namei.c: lookup_fast RCU 已注入")
@@ -1390,8 +1428,7 @@ else:
 # 2) lookup_fast 非 RCU 分支：__d_lookup 之后，命中则 dput + return NULL
 anchor2 = "\t\tdentry = __d_lookup(parent, &nd->last);\n"
 block2 = (
-    "\t\tif (dentry && !IS_ERR(dentry) && dentry->d_inode &&\n"
-    "\t\t    susfs_is_inode_sus_path(dentry->d_inode)) {\n"
+    "\t\tif (dentry && !IS_ERR(dentry) && susfs_is_hidden_dentry(dentry)) {\n"
     "\t\t\tdput(dentry);\n"
     "\t\t\tdentry = NULL;\n"
     "\t\t}\n"
@@ -1416,8 +1453,7 @@ else:
     j = s.rfind("\treturn dentry;\n", i, k)
     if j > i:
         block3 = (
-            "\tif (dentry && !IS_ERR(dentry) && dentry->d_inode &&\n"
-            "\t    susfs_is_inode_sus_path(dentry->d_inode)) {\n"
+            "\tif (dentry && !IS_ERR(dentry) && susfs_is_hidden_dentry(dentry)) {\n"
             "\t\tif (d_in_lookup(dentry))\n"
             "\t\t\td_lookup_done(dentry);\n"
             "\t\tdput(dentry);\n"
@@ -1444,8 +1480,7 @@ else:
     anc = "\tstruct dentry *dentry = d_lookup(dir, name);\n"
     j = s.find(anc, i, k)
     block35 = (
-        "\tif (dentry && !IS_ERR(dentry) && dentry->d_inode &&\n"
-        "\t    susfs_is_inode_sus_path(dentry->d_inode)) {\n"
+        "\tif (dentry && !IS_ERR(dentry) && susfs_is_hidden_dentry(dentry)) {\n"
         "\t\tdput(dentry);\n"
         "\t\treturn NULL;\n"
         "\t}\n"
@@ -1466,8 +1501,7 @@ else:
     assert k > i, "namei.c: 找不到 lookup_one_qstr_excl 的结束边界"
     j = s.rfind("\treturn dentry;\n", i, k)
     block36 = (
-        "\tif (d_is_positive(dentry) && dentry->d_inode &&\n"
-        "\t    susfs_is_inode_sus_path(dentry->d_inode)) {\n"
+        "\tif (d_is_positive(dentry) && susfs_is_hidden_dentry(dentry)) {\n"
         "\t\tdput(dentry);\n"
         "\t\treturn ERR_PTR(-ENOENT);\n"
         "\t}\n"
@@ -1482,8 +1516,7 @@ else:
 # 4) lookup_open：d_lookup(dir, &nd->last) 之后，命中则 dput + ENOENT
 anchor4 = "\tdentry = d_lookup(dir, &nd->last);\n"
 block4 = (
-    "\tif (dentry && !IS_ERR(dentry) && dentry->d_inode &&\n"
-    "\t    susfs_is_inode_sus_path(dentry->d_inode)) {\n"
+    "\tif (dentry && !IS_ERR(dentry) && susfs_is_hidden_dentry(dentry)) {\n"
     "\t\tdput(dentry);\n"
     "\t\treturn ERR_PTR(-ENOENT);\n"
     "\t}\n"
@@ -1502,10 +1535,10 @@ print("    namei.c: 本次新注入 %d 处" % count)
 markers = {
     "lookup_fast RCU":     "dentry = NULL;  /* RCU: __d_lookup_rcu",
     "lookup_fast 非RCU":   "\t\t\tdput(dentry);\n\t\t\tdentry = NULL;\n\t\t}\n",
-    "__lookup_slow":       "susfs_is_inode_sus_path(dentry->d_inode)) {\n\t\tif (d_in_lookup(dentry))",
+    "__lookup_slow":       "susfs_is_hidden_dentry(dentry)) {\n\t\tif (d_in_lookup(dentry))",
     "lookup_open":         "\t\tdput(dentry);\n\t\treturn ERR_PTR(-ENOENT);\n\t}\n",
     "lookup_dcache":       "\t\tdput(dentry);\n\t\treturn NULL;\n\t}\n",
-    "lookup_one_qstr_excl": "d_is_positive(dentry) && dentry->d_inode &&",
+    "lookup_one_qstr_excl": "d_is_positive(dentry) && susfs_is_hidden_dentry(dentry)",
 }
 missing = [name for name, mk in markers.items() if mk not in s]
 if missing:

@@ -37,6 +37,20 @@ extern int susfs_get_non_sus_mnt_id_from_mnt(struct mount *orig_mnt);
 extern struct vfsmount *susfs_get_non_sus_vfsmnt_from_vfsmnt(struct vfsmount *vfsmnt);
 
 /*
+ * LOCAL EXTENSION (Plan A): name-based Android/data|media emulation.
+ *
+ * Android FUSE does not give these directories a usable kernel inode identity
+ * on this kernel: the inode instantiated by a path walk has i_ino == 0 (and
+ * nodeid == 0), while the inode clients traverse is a different object.  A
+ * flag stored on the former is never seen, which is why the per-inode
+ * sus_path mechanism cannot hide '.../Android/data/<pkg>'.
+ * The module's CMD_SUSFS_ADD_SUS_PATH(_LOOP) for such a path therefore only
+ * registers the package name; hiding is decided from the dentry chain and the
+ * caller/owner uids, never from the inode.
+ */
+static bool susfs_vold_register(const char *pathname);
+
+/*
  * LOCAL EXTENSION (option B), not part of upstream SUSFS.
  *
  * Marks an inode added as an app data sus_path ('.../Android/data|media/<pkg>',
@@ -276,6 +290,14 @@ void susfs_add_sus_path(void __user **user_info) {
 		goto out_copy_to_user;
 	}
 
+	/* LOCAL EXTENSION (Plan A): an app data dir is registered by name and
+	 * must not be flagged on the (synthetic) FUSE inode.  Works even when
+	 * the directory does not exist yet. */
+	if (susfs_vold_register(info.target_pathname)) {
+		info.err = 0;
+		goto out_copy_to_user;
+	}
+
 	info.err = kern_path(info.target_pathname, LOOKUP_FOLLOW, &path);
 	if (info.err) {
 		SUSFS_LOGE("failed opening file '%s'\n", info.target_pathname);
@@ -342,6 +364,11 @@ void susfs_add_sus_path_loop(void __user **user_info) {
 		goto out_copy_to_user;
 	}
 
+	/* LOCAL EXTENSION (Plan A): register the name, but keep the entry in the
+	 * loop list as the retry vehicle for the owner uid resolution.  The loop
+	 * skips the inode work for registered app data paths. */
+	susfs_vold_register(info.target_pathname);
+
 	new_list = kzalloc(sizeof(struct st_susfs_sus_path_list), GFP_KERNEL);
 	if (!new_list) {
 		info.err = -ENOMEM;
@@ -371,6 +398,11 @@ static void susfs_run_sus_path_loop(void) {
 	int srcu_idx = srcu_read_lock(&susfs_srcu_sus_path_loop);
 
 	list_for_each_entry_rcu(cursor, &LH_SUS_PATH_LOOP, list) {
+		/* LOCAL EXTENSION (Plan A): app data paths are name-based rules.
+		 * Re-registering here retries the owner uid resolution; there is
+		 * no inode to flag and no path resolution to do. */
+		if (susfs_vold_register(cursor->target_pathname))
+			continue;
 		if (!kern_path(cursor->target_pathname, 0, &path))
 		{
 			bool is_app_data;
@@ -1131,6 +1163,257 @@ static bool susfs_owner_matches(struct inode *inode)
 	rcu_read_unlock();
 
 	return matched;
+}
+
+/*****************************************************/
+/* LOCAL EXTENSION (Plan A): emulate vold app data    */
+/*****************************************************/
+/*
+ * See the note above susfs_vold_register().  The rule set is a package-name
+ * hash (name -> owner uid); nothing here looks at an inode identity.
+ */
+#define SUSFS_VOLD_MAX_NAME SUSFS_MAX_LEN_PATHNAME
+
+struct susfs_vold_entry {
+	struct hlist_node               node;
+	uid_t                           uid;    /* 0 = not resolved yet */
+	u16                             len;
+	char                            name[];
+};
+
+static DEFINE_MUTEX(susfs_mutex_lock_vold);
+static DEFINE_HASHTABLE(SUSFS_VOLD_HLIST, 8);
+static DEFINE_STATIC_KEY_FALSE(susfs_vold_enabled);
+
+static inline u32 susfs_vold_hash(const char *name, unsigned int len)
+{
+	return full_name_hash(NULL, name, len);
+}
+
+static bool susfs_vold_valid_name(const char *name, unsigned int len)
+{
+	unsigned int i;
+
+	if (!name || !len || len > 255)
+		return false;
+	/* reject ".", ".." and anything with a path separator */
+	if (len == 1 && name[0] == '.')
+		return false;
+	if (len == 2 && name[0] == '.' && name[1] == '.')
+		return false;
+	for (i = 0; i < len; i++) {
+		char c = name[i];
+
+		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		    (c >= '0' && c <= '9') || c == '.' || c == '_')
+			continue;
+		return false;
+	}
+	return true;
+}
+
+static inline bool susfs_vold_qstr_eq(const struct qstr *qstr, const char *want)
+{
+	unsigned int len = strlen(want);
+
+	return qstr->len == len && !memcmp(qstr->name, want, len);
+}
+
+/* True when 'dentry' is a child of '<...>/Android/(data|media)'. */
+static bool susfs_vold_dentry_is_child(const struct dentry *dentry)
+{
+	const struct dentry *parent, *grand;
+
+	if (!dentry || !dentry->d_sb)
+		return false;
+	if (dentry->d_sb->s_magic != FUSE_SUPER_MAGIC)
+		return false;
+	if (dentry->d_parent == dentry)
+		return false;
+
+	parent = dentry->d_parent;
+	if (!susfs_vold_qstr_eq(&parent->d_name, "data") &&
+	    !susfs_vold_qstr_eq(&parent->d_name, "media"))
+		return false;
+
+	grand = parent->d_parent;
+	if (grand == parent)
+		return false;
+	return susfs_vold_qstr_eq(&grand->d_name, "Android");
+}
+
+/*
+ * Registers '<...>/Android/(data|media)/<pkg>'.  Returns true when the
+ * pathname belongs to an app data directory; the caller must then skip all
+ * per-inode work.  Safe to call repeatedly.
+ */
+static bool susfs_vold_register(const char *pathname)
+{
+	struct susfs_vold_entry *entry = NULL;
+	struct susfs_vold_entry *tmp = NULL;
+	const struct cred *saved = NULL;
+	char app_name[SUSFS_VOLD_MAX_NAME];
+	unsigned int len;
+	u32 key;
+	uid_t uid = 0;
+	bool found = false;
+
+	if (!pathname || !*pathname)
+		return false;
+	if (susfs_owner_app_name_from_pathname(pathname, app_name, sizeof(app_name)))
+		return false;
+
+	len = strlen(app_name);
+	key = susfs_vold_hash(app_name, len);
+
+	/* Fast path: already registered with a resolved owner. */
+	rcu_read_lock();
+	hash_for_each_possible_rcu(SUSFS_VOLD_HLIST, tmp, node, key) {
+		if (tmp->len == len && !memcmp(tmp->name, app_name, len)) {
+			if (READ_ONCE(tmp->uid)) {
+				rcu_read_unlock();
+				return true;
+			}
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	/* The caller is the module or the loop; its SELinux context may not be
+	 * allowed to read /data/system/packages.list.  Use the KSU creds. */
+	if (ksu_cred) {
+		saved = override_creds(ksu_cred);
+		if (susfs_resolve_sus_path_app_uid(app_name, &uid))
+			uid = 0;
+		revert_creds(saved);
+	}
+
+	mutex_lock(&susfs_mutex_lock_vold);
+	hash_for_each_possible(SUSFS_VOLD_HLIST, tmp, node, key) {
+		if (tmp->len == len && !memcmp(tmp->name, app_name, len)) {
+			if (uid && READ_ONCE(tmp->uid) != uid)
+				WRITE_ONCE(tmp->uid, uid);
+			found = true;
+			break;
+		}
+	}
+	if (!found) {
+		entry = kzalloc(sizeof(*entry) + len + 1, GFP_KERNEL);
+		if (entry) {
+			entry->uid = uid;
+			entry->len = len;
+			memcpy(entry->name, app_name, len);
+			hash_add_rcu(SUSFS_VOLD_HLIST, &entry->node, key);
+			static_branch_enable(&susfs_vold_enabled);
+			SUSFS_LOGI("vold rule: '%s' owner uid %u\n", app_name, uid);
+		} else {
+			SUSFS_LOGE("failed to allocate a vold rule for '%s'\n", app_name);
+		}
+	} else if (uid) {
+		SUSFS_LOGI("vold rule: '%s' owner uid refreshed to %u\n", app_name, uid);
+	}
+	mutex_unlock(&susfs_mutex_lock_vold);
+	return true;
+}
+
+/* True when 'dentry' is '<...>/Android/(data|media)' itself. */
+bool susfs_is_vold_root_dir(const struct dentry *dentry)
+{
+	const struct dentry *parent;
+
+	if (!static_branch_unlikely(&susfs_vold_enabled))
+		return false;
+	if (!dentry || !dentry->d_sb || dentry->d_sb->s_magic != FUSE_SUPER_MAGIC)
+		return false;
+	if (!susfs_vold_qstr_eq(&dentry->d_name, "data") &&
+	    !susfs_vold_qstr_eq(&dentry->d_name, "media"))
+		return false;
+	parent = dentry->d_parent;
+	if (!parent || parent == dentry)
+		return false;
+	return susfs_vold_qstr_eq(&parent->d_name, "Android");
+}
+
+/* True when '<...>/Android/(data|media)/<name>' is hidden from the caller. */
+bool susfs_is_vold_hidden_dentry(const struct dentry *dentry)
+{
+	struct susfs_vold_entry *entry = NULL;
+	const struct inode *inode;
+	uid_t uid = current_uid().val % 100000;
+	uid_t owner = 0;
+	unsigned int len;
+	u32 key;
+	bool found = false;
+
+	if (!static_branch_unlikely(&susfs_vold_enabled))
+		return false;
+	if (uid < 10000)
+		return false;
+	if (!susfs_vold_dentry_is_child(dentry))
+		return false;
+
+	len = dentry->d_name.len;
+	if (!susfs_vold_valid_name(dentry->d_name.name, len))
+		return false;
+
+	key = susfs_vold_hash(dentry->d_name.name, len);
+	rcu_read_lock();
+	hash_for_each_possible_rcu(SUSFS_VOLD_HLIST, entry, node, key) {
+		if (entry->len == len && !memcmp(entry->name, dentry->d_name.name, len)) {
+			found = true;
+			owner = READ_ONCE(entry->uid);
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	if (!found)
+		return false;
+	/* Unresolved owner: fail open, never break the owner app. */
+	if (!owner)
+		return false;
+	if (owner == uid)
+		return false;
+
+	/* Second exemption: live inode owner.  Keeps the owner visible even if
+	 * the uid recorded at boot is stale (reinstall / clone). */
+	inode = d_inode(dentry);
+	if (inode && (inode->i_uid.val % 100000) == uid)
+		return false;
+
+	return true;
+}
+
+/* readdir: hide a dirent of '<...>/Android/(data|media)' by name. */
+bool susfs_should_hide_vold_name(const char *name, int namlen)
+{
+	struct susfs_vold_entry *entry = NULL;
+	uid_t uid = current_uid().val % 100000;
+	uid_t owner = 0;
+	u32 key;
+	bool found = false;
+
+	if (!static_branch_unlikely(&susfs_vold_enabled))
+		return false;
+	if (uid < 10000 || !name || namlen <= 0)
+		return false;
+	if (!susfs_vold_valid_name(name, (unsigned int)namlen))
+		return false;
+
+	key = susfs_vold_hash(name, namlen);
+	rcu_read_lock();
+	hash_for_each_possible_rcu(SUSFS_VOLD_HLIST, entry, node, key) {
+		if (entry->len == (u16)namlen && !memcmp(entry->name, name, namlen)) {
+			found = true;
+			owner = READ_ONCE(entry->uid);
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	if (!found || !owner || owner == uid)
+		return false;
+	return true;
 }
 #endif // #ifdef CONFIG_KSU_SUSFS_SUS_PATH
 
