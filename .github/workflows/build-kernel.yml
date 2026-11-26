@@ -3,7 +3,7 @@ name: build-dijun-kernel
 on:
   workflow_dispatch:
   push:
-    branches: [main, finasu-native]
+    branches: [main, finasu-native, ksu-official]
 
 concurrency:
   group: build-dijun-${{ github.ref }}
@@ -13,25 +13,25 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
-    # 一次构建同时出两个内核：SukiSU 管理器版 + FinaSU 管理器版。
-    # 两个 job 各自拉源码、集成对应 KSU、编译、打包，互不干扰。
+    # 本分支（ksu-official）只出一种内核：原版 KernelSU 管理器版。
     strategy:
       fail-fast: false
       matrix:
-        ksu_variant: [sukisu, finasu]
+        ksu_variant: [sukisu]
     env:
       # 正式版：恢复 CONFIG_PANIC_ON_OOPS 默认（y）
       DIAG_NO_PANIC: "0"
       # upstream-align：SUSFS 走官方 v2.4.0 实现（自研阶段由 SUSFS_UPSTREAM=1 关闭）
       SUSFS_UPSTREAM: "1"
-      # 由矩阵注入：sukisu=内核默认槽（SukiSU-Nova），finasu=FinaSU 本体 + 签名注入。
-      # integrate.sh 检测到 finasu 会转交给 ci/integrate_finasu.sh。
+      # 内核侧 KSU 实现。official = tiann/KernelSU 原版（管理器 me.weishu.kernelsu），
+      # ci/integrate.sh 据此改为从 tiann/KernelSU 克隆并跳过 SukiSU 专属步骤。
+      KSU_IMPL: "official"
+      # 走内核默认槽，不注入任何签名覆盖 —— 原版内核默认就信任官方发布签名的
+      # 管理器（KSU_EXPECTED_HASH 是官方 release key）。
       KSU_VARIANT: ${{ matrix.ksu_variant }}
-      # main 同步 SukiSU 官方 Release 版（tag v3.0.0，commit c60f21b9），
-      # 不再跟随 main 分支 HEAD（CI 滚动版）。CI 适配版保留在 ci 分支。
-      # 仅 sukisu job 生效：integrate.sh 用 ${KSU_BRANCH:-main} 传给 setup.sh checkout；
-      # finasu job 走 integrate_finasu.sh，克隆 FinaSU 自己的仓库，不受此变量影响。
-      KSU_BRANCH: v3.0.0
+      # 原版 KernelSU 拉 main HEAD：G4/G5/G6 依赖的 my_inode_setxattr /
+      # keep_backup / selinux_hide_init_setxattr 都在 v3.3.1 之后才加入。
+      KSU_BRANCH: main
 
     steps:
       - uses: actions/checkout@v4
@@ -184,7 +184,7 @@ jobs:
           set -o pipefail
           bash ci/fetch-kernel.sh 2>&1 | tee kernel-fetch.log
 
-      - name: 集成 SukiSU(built-in) + SUSFS SELinux 隐藏
+      - name: 集成 KernelSU + SUSFS SELinux 隐藏
         run: |
           set -o pipefail
           mkdir -p out
@@ -311,7 +311,11 @@ jobs:
           cp "$GITHUB_WORKSPACE/out/Image" /tmp/ak3/Image
           cp "$GITHUB_WORKSPACE/ak3/anykernel.sh" /tmp/ak3/anykernel.sh
 
-          if [ "${KSU_VARIANT}" = "finasu" ]; then
+          if [ "${KSU_IMPL:-sukisu}" = "official" ]; then
+            # 原版 KernelSU（管理器 me.weishu.kernelsu）
+            AK3_NAME="ak3-xring-o1-6.18-ksu-official-susfs2.4-gki553682993.zip"
+            sed -i 's|kernel.string=.*|kernel.string=xring-o1 6.18.21-abogki553682993 + KernelSU (official) + SELinux Hide + susfs v2.4|' /tmp/ak3/anykernel.sh
+          elif [ "${KSU_VARIANT}" = "finasu" ]; then
             # finasu：包名带管理器版本号（取自 releases/latest 抓到的 tag），升级后自动跟随
             # ${MANAGER_TAG#v} 去掉前缀 v：finasu1.6.4
             FINASU_VER="${MANAGER_TAG#v}"
@@ -336,7 +340,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: dijun-kernel-${{ matrix.ksu_variant }}-${{ github.run_number }}
+          name: dijun-kernel-${{ env.KSU_IMPL }}-${{ github.run_number }}
           path: |
             out/
             kernel-fetch.log

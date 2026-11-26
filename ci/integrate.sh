@@ -18,6 +18,10 @@ set -euo pipefail
 SRC="$(cd "${SRC:-kernel}" && pwd)"
 KSU_BRANCH="${KSU_BRANCH:-main}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# 内核侧 KSU 实现：
+#   sukisu   默认，SukiSU-Nova（管理器 com.sukisu.nova）
+#   official tiann/KernelSU 原版（管理器 me.weishu.kernelsu）
+KSU_IMPL="${KSU_IMPL:-sukisu}"
 
 # finasu-native：走 LyraVoid/FinaSU 原生内核集成，与下面的 SukiSU 路径互斥。
 if [ "${KSU_VARIANT:-sukisu}" = "finasu" ]; then
@@ -52,19 +56,26 @@ clone_ksu_repo() {
 }
 
 KSU_CLONED=0
-for ksu_url in \
-    "https://github.com/SukiSU-Nova/SukiSU-Nova" \
-    "https://git.zako.shirkneko.top:20004/shirkneko/SukiSU"; do
+if [ "$KSU_IMPL" = "official" ]; then
+    # 原版只认 tiann/KernelSU 一个源；setup.sh 也取原版仓库的。
+    KSU_SOURCES="https://github.com/tiann/KernelSU"
+    KSU_SETUP_URL="https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh"
+else
+    KSU_SOURCES="https://github.com/SukiSU-Nova/SukiSU-Nova https://git.zako.shirkneko.top:20004/shirkneko/SukiSU"
+    KSU_SETUP_URL="https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nova/main/kernel/setup.sh"
+fi
+
+for ksu_url in $KSU_SOURCES; do
     if clone_ksu_repo "$ksu_url"; then
         echo "    KernelSU 已从 $ksu_url 克隆"
         KSU_CLONED=1
         break
     fi
 done
-[ "$KSU_CLONED" = "1" ] || { echo "!! KernelSU 克隆失败：2 个源 x 3 次全部失败"; exit 1; }
+[ "$KSU_CLONED" = "1" ] || { echo "!! KernelSU 克隆失败（$KSU_IMPL）"; exit 1; }
 
-curl -LSs "https://raw.githubusercontent.com/SukiSU-Nova/SukiSU-Nova/main/kernel/setup.sh" \
-    | bash -s "$KSU_BRANCH"
+echo "    setup.sh: $KSU_SETUP_URL"
+curl -LSs "$KSU_SETUP_URL" | bash -s "$KSU_BRANCH"
 
 echo "==> B symlink 换成实目录"
 # setup.sh 用 ln -s 链过去。打 SUSFS 补丁会污染上游仓库，而且 kbuild 在
@@ -77,6 +88,7 @@ if [ -L "$SRC/drivers/kernelsu" ]; then
 fi
 [ -d "$SRC/drivers/kernelsu" ] || { echo "!! drivers/kernelsu 不存在"; exit 1; }
 
+if [ "$KSU_IMPL" != "official" ]; then
 echo "==> B2 finasu: 让 get_info 上报 hook 类型"
 # FinaSU 管理器的「钩子类型」来自 ksu_get_info_cmd.flags 的 1<<6 / 1<<7 / 1<<8，
 # SukiSU-Nova 完全没有这几个位，所以一直显示「旧版/未知」。
@@ -137,6 +149,7 @@ if "KSU_GET_INFO_FLAG_HOOK_TRACEPOINT" not in s:
     open(p, "w").write(s)
     print("    dispatch.c: hook 类型上报已注入 %d 处" % n)
 PYEOF
+fi
 
 echo "==> C 注册 CONFIG_KSU_SUSFS"
 # 上游没有 SUSFS 开关，补一个。放 drivers/Kconfig 而非 kernelsu 的 Kconfig，
@@ -232,6 +245,7 @@ open(p, "w").write(s)
 print("    已导出 4 个符号")
 PYEOF
 
+if [ "$KSU_IMPL" != "official" ]; then
 echo "==> G 固定 KSU 版本串"
 # Kbuild 里 KSU_VERSION_FULL 靠 git describe 拼，分支名会是 main。
 # 用户要 @shushu，直接写死；sha 和 tag 从 setup.sh 克隆的仓库里读。
@@ -251,6 +265,9 @@ echo "==> G3 版本号对齐发布的管理器（35000）"
 # KSU_VERSION_FULL 保持 v3.0.0-<sha>@shushu 不变。
 sed -i 's|^KSU_VERSION     := .*|KSU_VERSION     := 35000|' "$SRC/drivers/kernelsu/Kbuild"
 grep -n '^KSU_VERSION' "$SRC/drivers/kernelsu/Kbuild"
+else
+echo "==> G 原版 KernelSU：没有 KSU_VERSION_FULL，版本码由上游 Kbuild 自动计算"
+fi
 
 echo "==> G-fix 让版本号走上游自动计算（补齐浅克隆历史，不写死）"
 # 上游 Kbuild 在构建时自动算版本码，公式随上游版本演进：
@@ -279,8 +296,10 @@ if [ -d "$KSU_REPO/.git" ] || [ -f "$KSU_REPO/.git" ]; then
         echo "    drivers/.git -> $KSU_REPO/.git"
     fi
 fi
-# 原样保留上游 Kbuild 的 KSU_VERSION 计算逻辑，不做任何 sed 覆盖
-grep -nE 'VERSION_BASE|VERSION_OFFSET|KSU_VERSION[[:space:]]*:=' "$SRC/drivers/kernelsu/Kbuild" | head -8
+# 原样保留上游 Kbuild 的 KSU_VERSION 计算逻辑，不做任何 sed 覆盖。
+# 原版 KernelSU 的 Kbuild 没有 VERSION_BASE/VERSION_OFFSET 行，grep 会返回 1，
+# 这里必须兜住，否则 set -e 直接中断构建。
+grep -nE 'VERSION_BASE|VERSION_OFFSET|KSU_VERSION[[:space:]]*:=' "$SRC/drivers/kernelsu/Kbuild" | head -8 || true
 
 echo "==> G2 让 KSU 的 selinux_hide 不再运行期改 write_op[]"
 # ksu_selinux_hide_enable() 会往 selinuxfs 的 write_op[] 里塞函数指针，
@@ -655,6 +674,45 @@ t = t.replace(hk_anchor, handle + hk_anchor, 1)
 t = t.replace(mount, "\tLSM_HOOK_INIT(inode_setxattr, handle_selinux_inode_setxattr),", 1)
 open(hk, "w").write(t)
 print("    hooks.c: inode_setxattr 挂载点切到 G6 handle")
+PYEOF
+
+echo "==> G7 原版管理器没有 selinux_hide 开关：SUSFS 构建下自动启用"
+# SukiSU 管理器会通过 KSU feature 开关调用 selinux_hide 的 set_handler 打开它；
+# 原版 KernelSU 管理器（me.weishu.kernelsu）没有这个功能项，ksu_selinux_hide_running
+# 会一直是 false，导致 G4/G5/G6 的编译期包装（以及 SELinux 补丁里的 selinuxfs 分支）
+# 全部走不到。这里在 post-fs-data 阶段自动启用一次，行为等价于手动打开开关：
+#   - G2 已把 enable() 改成只保留 backup_sepolicy 并立即返回 0，不碰只读数据；
+#   - G6 的 inode_setxattr 包装内部会 lazy 补跑 selinux_hide_init_setxattr()。
+python3 - "$SRC/drivers/kernelsu/feature/selinux_hide.c" <<'PYEOF'
+import sys
+
+p = sys.argv[1]
+s = open(p).read()
+mark = "selinux_hide: auto-enabled for official manager"
+if mark in s:
+    print("    已注入过")
+    raise SystemExit(0)
+
+anchor = "void ksu_selinux_hide_handle_post_fs_data()\n{\n"
+assert s.count(anchor) == 1, "selinux_hide_handle_post_fs_data 锚点没匹配上"
+block = (
+    "#ifdef CONFIG_KSU_SUSFS\n"
+    "    /* 官方 KernelSU 管理器没有 selinux_hide 开关，SUSFS 构建下在这里自动启用。\n"
+    "     * 幂等：SukiSU 管理器已打开时 running 已为 true，不会重复进入。 */\n"
+    "    if (!ksu_selinux_hide_running && backup_sepolicy) {\n"
+    "        if (!ksu_selinux_hide_enable()) {\n"
+    "            ksu_selinux_hide_enabled = true;\n"
+    "            ksu_selinux_hide_running = true;\n"
+    "            pr_info(\"" + mark + "\\n\");\n"
+    "        } else {\n"
+    "            pr_err(\"selinux_hide: auto-enable failed\\n\");\n"
+    "        }\n"
+    "    }\n"
+    "#endif\n"
+)
+s = s.replace(anchor, anchor + block, 1)
+open(p, "w").write(s)
+print("    selinux_hide.c: post-fs-data 自动启用已注入")
 PYEOF
 
 if [ "${SUSFS_UPSTREAM:-0}" = "1" ]; then
